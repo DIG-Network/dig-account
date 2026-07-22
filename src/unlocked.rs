@@ -19,6 +19,16 @@ use crate::wallet::authorizer::WalletOps;
 ///
 /// Obtained from [`AccountSession::unlock`](crate::session::AccountSession::unlock). Dropping it (or
 /// calling [`lock`](Self::lock)) drops the seed, relocking the account.
+///
+/// # Idle-relock (Phase-1 status)
+///
+/// This handle relocks on drop / [`lock`](Self::lock) but does NOT auto-relock on idle. The
+/// idle-relock lifecycle primitive ships as [`UnlockGate`](crate::auth::policy::UnlockGate) — a host
+/// that needs an idle window today holds the seed through it. Wiring idle-relock directly onto this
+/// capability lifecycle (making [`signer`](Self::signer) / [`wallet_ops`](Self::wallet_ops) /
+/// [`dek`](Self::dek) re-check the idle window and fail once expired) is a deferred v0.1.x follow-up:
+/// it turns those accessors fallible and is a deliberate, tested lifecycle change rather than a rushed
+/// one in a custody crate. See `SPEC.md` §4.1.
 pub struct UnlockedAccount {
     account: AccountId,
     seed: Arc<UnlockedMasterSeed>,
