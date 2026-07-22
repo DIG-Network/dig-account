@@ -75,7 +75,12 @@ impl AccountStore {
     /// Fails with [`AccountStoreError::AlreadyExists`] if `id` already has a seed blob — a guard so
     /// re-enrolment can never overwrite (destroy) an existing custody root. Use
     /// [`unlock`](Self::unlock) to re-open an existing account.
-    pub fn enroll(
+    ///
+    /// `pub(crate)`: it returns a raw [`UnlockedMasterSeed`], so it never crosses the public API. The
+    /// public enrolment path is [`AccountSession::enroll`](crate::session::AccountSession::enroll),
+    /// which wraps the seed in an [`UnlockedAccount`](crate::unlocked::UnlockedAccount) that never
+    /// hands the raw seed back.
+    pub(crate) fn enroll(
         &self,
         id: &AccountId,
         password: Password,
@@ -97,7 +102,12 @@ impl AccountStore {
     /// Returns [`AccountStoreError::NotFound`] if the account was never enrolled, and a
     /// [`AccountStoreError::Session`] (fail-closed, no handle) if the password is wrong or the
     /// ciphertext is tampered.
-    pub fn unlock(&self, id: &AccountId, password: Password) -> Result<UnlockedMasterSeed> {
+    ///
+    /// `pub(crate)`: it returns a raw [`UnlockedMasterSeed`], so the raw seed never crosses the public
+    /// API. The ONLY public unlock path is
+    /// [`AccountSession::unlock`](crate::session::AccountSession::unlock), which returns an
+    /// [`UnlockedAccount`](crate::unlocked::UnlockedAccount) holding the seed `pub(crate)`.
+    pub(crate) fn unlock(&self, id: &AccountId, password: Password) -> Result<UnlockedMasterSeed> {
         if !self.exists(id)? {
             return Err(AccountStoreError::NotFound(id.clone()));
         }

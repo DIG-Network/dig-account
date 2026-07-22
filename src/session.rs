@@ -40,6 +40,30 @@ impl AccountSession {
         }
     }
 
+    /// Enrol a NEW account and return it already unlocked.
+    ///
+    /// Seals `seed` under `password` via `store` (fail-closed if the account already exists — never
+    /// clobbers an existing custody root) and returns a live [`UnlockedAccount`]. The raw master seed
+    /// is never returned: it lives `pub(crate)` inside the handle. This is the public counterpart to
+    /// [`AccountStore::enroll`](crate::store::AccountStore::enroll), which is `pub(crate)` precisely so
+    /// no raw seed crosses the public API.
+    pub fn enroll(
+        store: Arc<AccountStore>,
+        account: AccountId,
+        password: dig_session::Password,
+        seed: &[u8; dig_session::SEED_LEN],
+        default_profile_ix: ProfileIx,
+    ) -> Result<UnlockedAccount> {
+        let seed = store
+            .enroll(&account, password, seed)
+            .map_err(|why| AccountError::Keystore(why.to_string()))?;
+        Ok(UnlockedAccount::new(
+            account,
+            Arc::new(seed),
+            default_profile_ix,
+        ))
+    }
+
     /// The account this session refers to.
     pub fn account_id(&self) -> &AccountId {
         &self.account
@@ -138,6 +162,27 @@ mod tests {
         let session = AccountSession::new(store, id.clone(), ProfileIx::ROOT);
         assert!(session.is_locked());
         assert_eq!(session.account_id(), &id);
+    }
+
+    #[test]
+    fn enroll_creates_and_returns_a_live_account_without_a_raw_seed() {
+        let store = Arc::new(AccountStore::new(Arc::new(MemoryBackend::new())));
+        let id = AccountId::new("fresh");
+        // The public enrol path returns an UnlockedAccount (never a raw UnlockedMasterSeed).
+        let acct = AccountSession::enroll(
+            store.clone(),
+            id.clone(),
+            Password::new(PW),
+            &SEED,
+            ProfileIx::ROOT,
+        )
+        .unwrap();
+        assert_eq!(acct.account_id(), &id);
+        // A second enrol fails-closed rather than clobbering the custody root.
+        assert!(matches!(
+            AccountSession::enroll(store, id, Password::new(PW), &SEED, ProfileIx::ROOT),
+            Err(AccountError::Keystore(_))
+        ));
     }
 
     #[tokio::test]
