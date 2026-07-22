@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege: CI only reads the checked-out repo (GHAS/CodeQL requirement).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # nextest runs each test as its own process and natively detects+reports
+      # flaky tests (failed-then-passed-on-retry) instead of silently hiding
+      # them. `--test-threads=1` mirrors the prior serial run (some integration
+      # tests assume serial execution).
+      - name: Run tests (nextest, flaky-aware)
+        run: cargo nextest run --all-features --retries 2 --test-threads=1
+
+      # nextest does NOT run doctests, so the headline `lib.rs` example is ungated
+      # by the step above. Run it explicitly so a doc example can never rot.
+      - name: Run doctests
+        run: cargo test --doc --all-features
+
+      - name: Check documentation
+        run: cargo doc --no-deps --all-features
+
+  coverage:
+    name: Coverage (>=80% lines, gated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Measure line coverage and FAIL the build if it drops below 80%.
+      # `cargo llvm-cov nextest` runs the flaky-aware nextest runner under
+      # coverage instrumentation so coverage is still collected (running
+      # `cargo nextest run` and `cargo llvm-cov` as separate steps collects
+      # zero coverage and always fails the gate). `--test-threads 1` mirrors
+      # the serial run used by the test suite (some integration tests assume
+      # serial execution) — passed as a native nextest flag, NOT after `--`
+      # (nextest rejects `--test-threads=1` forwarded to the test binary). A
+      # summary report is printed; the gate is enforced by
+      # `--fail-under-lines 80`.
+      - name: Run coverage with 80% line gate
+        run: cargo llvm-cov nextest --all-features --workspace --fail-under-lines 80 --retries 2 --test-threads 1
