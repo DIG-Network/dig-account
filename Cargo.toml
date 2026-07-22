@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -15,7 +15,10 @@ include = ["src/**/*.rs", "tests/**/*.rs", "SPEC.md", "Cargo.toml", "Cargo.lock"
 
 [dependencies]
 dig-social-profile = "0.2"
-# dig-wallet-backend (money-signer LocalSigner, #1058 gate) is added in a follow-up phase once its 0.14.0 publishes to crates.io.
+# The canonical money signer + independent spend verification live in dig-wallet-backend's `client`
+# seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
+# key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
+dig-wallet-backend = { version = "0.16", default-features = false, features = ["client"] }
 dig-session = "0.4"
 dig-identity = "0.5"
 dig-keystore = "0.4.1"
