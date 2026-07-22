@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -26,9 +26,14 @@ chia-protocol = "0.26"
 chia-puzzle-types = "0.26"
 chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
 thiserror = "2"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+zeroize = "1"
 
 [dev-dependencies]
 anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt"] }
+serde_json = "1"
 
 [lints.rust]
 unsafe_code = "forbid"
