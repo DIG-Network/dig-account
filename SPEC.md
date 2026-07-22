@@ -117,14 +117,18 @@ inside the `UnlockedAccount` returned by a successful unlock/enrol.
   seed; `master_seed()` is `pub(crate)`. `lock(self)` relocks immediately by dropping the handle.
 
 Idle-relock (Phase-1 status): the idle-relock LIFECYCLE PRIMITIVE ships as
-`auth::policy::UnlockGate` — a clock-injected holder that runs the `AuthPolicy` + keystore unlock, hands
-the seed out via `access()` only while unlocked AND within the idle window (refreshing the deadline),
-relocks (drops + zeroizes) after the idle window, and supports explicit `lock()`. A host that needs
-idle-relock today MUST hold the seed through an `UnlockGate`. Wiring idle-relock directly onto the
-`UnlockedAccount` capability lifecycle (so `signer()`/`wallet_ops()`/`dek()` re-check the idle window and
-return locked once expired) is a deferred v0.1.x follow-up: it changes those accessors to fallible and is
-a deliberate, tested lifecycle change rather than a rushed one in a custody crate. Until then,
-`UnlockedAccount` relocks on drop/`lock()` but does NOT auto-relock on idle.
+`auth::policy::UnlockGate` — a clock-injected holder that runs the `AuthPolicy` + keystore unlock and,
+while unlocked AND within the idle window, hands out a live `UnlockedAccount` via `unlock()` / `access()`
+(refreshing the deadline), relocks (drops + zeroizes the seed) after the idle window, and supports
+explicit `lock()`. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
+`Arc<UnlockedMasterSeed>` lives only in its private state, and both `unlock()` and `access()` return
+`UnlockedAccount` (the same shape as `AccountSession`). A host that needs idle-relock today holds the
+account through an `UnlockGate`. Wiring idle-relock directly onto the `UnlockedAccount` capability
+lifecycle (so `signer()`/`wallet_ops()`/`dek()` re-check the idle window and return locked once expired)
+is a deferred v0.1.x follow-up: it changes those accessors to fallible and is a deliberate, tested
+lifecycle change rather than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained
+directly from `AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained
+via `UnlockGate::access()` is idle-bounded by the gate.
 
 ### 4.2 AuthPolicy / SecondFactor evaluation (pure, in-crate)
 

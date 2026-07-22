@@ -118,6 +118,72 @@ pub struct AccountRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chia_wallet_sdk::utils::Address;
+    use dig_social_profile::{
+        Bytes32, Coin, Did, IdentityProfile, IdentitySingleton, Profile as Metadata,
+        SingletonLineage, StoreRecord, DID_CHIA_PREFIX,
+    };
+
+    /// Build a minimal, pairing-valid [`Profile`] at `ix` for model-level tests.
+    ///
+    /// It resolves a real [`IdentityProfile`] over synthetic-but-consistent records: a store whose
+    /// description IS the DID string (discovery) and whose launcher parent is a member of the DID's
+    /// lineage (authority) — the exact predicate `IdentityProfile::resolve` enforces.
+    fn profile_at(ix: ProfileIx) -> Profile {
+        let launcher = Bytes32::new([0x42; 32]);
+        let did_str = Address::new(launcher, DID_CHIA_PREFIX.to_string())
+            .encode()
+            .unwrap();
+        let did = Did::parse(&did_str).unwrap();
+        let did_coin_id = Bytes32::new([0x11; 32]);
+        let singleton = IdentitySingleton {
+            did,
+            lineage: SingletonLineage::new(did_coin_id, [did_coin_id]),
+        };
+        let store = StoreRecord {
+            description: did_str,
+            launcher_coin: Coin {
+                parent_coin_info: did_coin_id,
+                puzzle_hash: Bytes32::new([0u8; 32]),
+                amount: 1,
+            },
+        };
+        let identity = IdentityProfile::resolve(singleton, store, Metadata::new()).unwrap();
+        Profile::new(ix, identity)
+    }
+
+    #[test]
+    fn set_default_profile_switches_to_a_present_profile() {
+        let mut account = Account::new(
+            AccountId::new("a"),
+            vec![profile_at(ProfileIx::ROOT), profile_at(ProfileIx(1))],
+            ProfileIx::ROOT,
+        )
+        .unwrap();
+
+        account.set_default_profile(ProfileIx(1)).unwrap();
+        assert_eq!(account.default_profile().ix(), ProfileIx(1));
+    }
+
+    #[test]
+    fn set_default_profile_rejects_an_absent_index_and_leaves_the_default_unchanged() {
+        // SPEC §2.1 fail-closed MUST: an absent target index is refused and the previous default
+        // stands (no partial mutation).
+        let mut account = Account::new(
+            AccountId::new("a"),
+            vec![profile_at(ProfileIx::ROOT)],
+            ProfileIx::ROOT,
+        )
+        .unwrap();
+
+        let result = account.set_default_profile(ProfileIx(9));
+        assert!(matches!(result, Err(AccountError::ProfileNotFound(_))));
+        assert_eq!(
+            account.default_profile().ix(),
+            ProfileIx::ROOT,
+            "a rejected switch must not disturb the existing default"
+        );
+    }
 
     #[test]
     fn account_requires_at_least_one_profile() {

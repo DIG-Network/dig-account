@@ -34,8 +34,9 @@ use dig_session::UnlockedMasterSeed;
 
 use super::factors::AuthFactors;
 use super::second_factor::SecondFactor;
-use crate::id::AccountId;
+use crate::id::{AccountId, ProfileIx};
 use crate::store::{AccountStore, AccountStoreError};
+use crate::unlocked::UnlockedAccount;
 
 /// Why an unlock was refused.
 #[derive(Debug, thiserror::Error)]
@@ -115,24 +116,32 @@ impl Clock for SystemClock {
 /// Holds one account's live master seed and relocks it after an idle window.
 ///
 /// Constructed locked. [`unlock`](Self::unlock) runs the [`AuthPolicy`] then the keystore unlock and
-/// starts holding the seed. [`access`](Self::access) hands out the seed IF still unlocked and within
-/// the idle window (refreshing the deadline), else relocks and returns `None`. [`lock`](Self::lock)
-/// relocks immediately (e.g. on an OS session-lock signal). Dropping the gate drops the seed.
+/// starts holding the seed. [`access`](Self::access) hands out a live [`UnlockedAccount`] IF still
+/// unlocked and within the idle window (refreshing the deadline), else relocks and returns `None`.
+/// [`lock`](Self::lock) relocks immediately (e.g. on an OS session-lock signal). Dropping the gate
+/// drops the seed.
+///
+/// The raw `Arc<UnlockedMasterSeed>` lives ONLY in the private `live` field (it is what backs the
+/// idle-relock lifecycle); the gate hands OUT only [`UnlockedAccount`], so the raw seed never crosses
+/// the public API (SPEC §8) — the same shape as [`AccountSession`](crate::session::AccountSession).
 pub struct UnlockGate {
     account: AccountId,
+    default_profile_ix: ProfileIx,
     store: AccountStore,
     policy: Box<dyn AuthPolicy>,
     clock: Box<dyn Clock>,
     idle_timeout: Duration,
-    /// The live seed + the instant it was last accessed. `None` when locked.
+    /// The live seed + the instant it was last accessed. `None` when locked. Private: only the
+    /// in-crate lifecycle reads it, and only ever to build an [`UnlockedAccount`] to hand out.
     live: Option<(Arc<UnlockedMasterSeed>, std::time::Instant)>,
 }
 
 impl UnlockGate {
-    /// Build a locked gate for `account`, unlocking through `store`, gated by `policy`, relocking
-    /// after `idle_timeout` of inactivity, timed by `clock`.
+    /// Build a locked gate for `account` (defaulting to `default_profile_ix`), unlocking through
+    /// `store`, gated by `policy`, relocking after `idle_timeout` of inactivity, timed by `clock`.
     pub fn new(
         account: AccountId,
+        default_profile_ix: ProfileIx,
         store: AccountStore,
         policy: Box<dyn AuthPolicy>,
         idle_timeout: Duration,
@@ -140,6 +149,7 @@ impl UnlockGate {
     ) -> Self {
         Self {
             account,
+            default_profile_ix,
             store,
             policy,
             clock,
@@ -156,24 +166,30 @@ impl UnlockGate {
         }
     }
 
+    /// A live [`UnlockedAccount`] over the currently-held seed (never exposes the raw seed).
+    fn account_handle(&self, seed: Arc<UnlockedMasterSeed>) -> UnlockedAccount {
+        UnlockedAccount::new(self.account.clone(), seed, self.default_profile_ix)
+    }
+
     /// Authorize + unlock the account. Runs the [`AuthPolicy`] first (fail-closed on refusal), then
-    /// the password keystore unlock; on success starts holding the seed and returns a handle to it.
-    pub fn unlock(&mut self, factors: AuthFactors) -> Result<Arc<UnlockedMasterSeed>, UnlockError> {
+    /// the password keystore unlock; on success starts holding the seed and returns a live
+    /// [`UnlockedAccount`] (the raw seed stays in the private `live` field).
+    pub fn unlock(&mut self, factors: AuthFactors) -> Result<UnlockedAccount, UnlockError> {
         self.policy.authorize(&factors)?;
         let seed = Arc::new(self.store.unlock(&self.account, factors.password)?);
         self.live = Some((seed.clone(), self.clock.now()));
-        Ok(seed)
+        Ok(self.account_handle(seed))
     }
 
-    /// Hand out the live seed if still unlocked within the idle window, refreshing the deadline. If
-    /// the idle window has elapsed the seed is relocked (dropped) and `None` is returned
+    /// Hand out a live [`UnlockedAccount`] if still unlocked within the idle window, refreshing the
+    /// deadline. If the idle window has elapsed the seed is relocked (dropped) and `None` is returned
     /// (fail-closed).
-    pub fn access(&mut self) -> Option<Arc<UnlockedMasterSeed>> {
+    pub fn access(&mut self) -> Option<UnlockedAccount> {
         let now = self.clock.now();
         match self.live.take() {
             Some((seed, last)) if now.duration_since(last) < self.idle_timeout => {
                 self.live = Some((seed.clone(), now));
-                Some(seed)
+                Some(self.account_handle(seed))
             }
             // Idle window elapsed (or already locked): drop the seed, stay locked.
             _ => None,
@@ -249,20 +265,23 @@ mod tests {
     fn gate_with(policy: Box<dyn AuthPolicy>, idle: Duration, clock: TestClock) -> UnlockGate {
         let id = AccountId::new("acct");
         let ks = enrolled_store(&id);
-        UnlockGate::new(id, ks, policy, idle, Box::new(clock))
+        UnlockGate::new(id, ProfileIx::ROOT, ks, policy, idle, Box::new(clock))
     }
 
     #[test]
-    fn password_only_unlock_yields_the_seed() {
+    fn password_only_unlock_yields_an_unlocked_account_not_a_raw_seed() {
         let mut gate = gate_with(
             Box::new(PasswordOnlyPolicy),
             Duration::from_secs(60),
             TestClock::new(),
         );
-        let seed = gate
+        // A successful unlock crosses the public API as an UnlockedAccount ONLY — never a raw seed
+        // (SPEC §8). The gate keeps the Arc<UnlockedMasterSeed> in its private `live` field for
+        // idle-relock; there is no public path from the returned handle back to the raw 32 bytes.
+        let account = gate
             .unlock(AuthFactors::password_only(Password::new(PW)))
             .unwrap();
-        assert_eq!(*seed.master_seed(), SEED);
+        assert_eq!(account.account_id(), &AccountId::new("acct"));
         assert!(gate.is_unlocked());
     }
 
@@ -287,25 +306,24 @@ mod tests {
         let mut gate = gate_with(Box::new(policy), Duration::from_secs(60), TestClock::new());
 
         // Missing TOTP → refused, fail-closed, no unlock attempted.
-        let err = gate
-            .unlock(AuthFactors {
-                password: Password::new(PW),
-                totp: None,
-                passkey: None,
-            })
-            .unwrap_err();
-        assert!(matches!(err, UnlockError::Unauthorized(_)));
+        let refused = gate.unlock(AuthFactors {
+            password: Password::new(PW),
+            totp: None,
+            passkey: None,
+        });
+        assert!(matches!(refused, Err(UnlockError::Unauthorized(_))));
         assert!(!gate.is_unlocked());
 
-        // Correct TOTP + password → unlocked.
-        let seed = gate
+        // Correct TOTP + password → unlocked (yields a live account handle, not a raw seed).
+        let account = gate
             .unlock(AuthFactors {
                 password: Password::new(PW),
                 totp: Some("123456".into()),
                 passkey: None,
             })
             .unwrap();
-        assert_eq!(*seed.master_seed(), SEED);
+        assert_eq!(account.account_id(), &AccountId::new("acct"));
+        assert!(gate.is_unlocked());
     }
 
     #[test]
