@@ -1010,6 +1010,7 @@ dependencies = [
  "chia-protocol",
  "chia-puzzle-types",
  "chia-wallet-sdk",
+ "clvmr",
  "dig-constants 0.7.0",
  "dig-identity 0.5.0",
  "dig-ipc-protocol",

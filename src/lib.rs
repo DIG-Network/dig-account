@@ -24,10 +24,12 @@
 //!
 //! ## Phase 1 status
 //!
-//! This is the PUBLIC TYPE SURFACE cut: the object model, keystore (`store`), and unlock policy
-//! (`auth::policy`) carry real, tested implementations ported from the harness-validated drafts;
-//! the signer/wallet/key/mint modules expose their FINAL public signatures with `todo!()` bodies,
-//! filled in Phase 2.
+//! This is the PUBLIC TYPE SURFACE cut: the object model, keystore (`store`), unlock policy
+//! (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` — the canonical
+//! `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner) over
+//! `dig-wallet-backend`'s `LocalSigner`, with the structured [`SpendSummary`](wallet::summary::SpendSummary))
+//! carry real, tested implementations. The identity-signer and mint modules still expose their FINAL
+//! public signatures with `todo!()` bodies, filled in a later phase.
 
 // Phase 1 stubs: several modules expose final signatures with `todo!()`/`unimplemented!()` bodies.
 #![allow(clippy::todo)]
@@ -59,5 +61,6 @@ pub use signer::ProfileSigner;
 pub use store::{AccountStore, AccountStoreError};
 pub use unlocked::UnlockedAccount;
 pub use wallet::authorizer::{SpendAuthorizer, WalletOps};
-pub use wallet::money_signer::MoneySigner;
+pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};
 pub use wallet::policy::{CustodyPolicy, HotWallet, Vault};
+pub use wallet::summary::{SpendRecipient, SpendSummary, SpendTier};

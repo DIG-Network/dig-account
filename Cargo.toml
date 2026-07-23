@@ -28,6 +28,7 @@ chia-bls = "0.26"
 chia-protocol = "0.26"
 chia-puzzle-types = "0.26"
 chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
+clvmr = "0.14"
 thiserror = "2"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }

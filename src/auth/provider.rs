@@ -8,6 +8,7 @@
 use crate::auth::factors::AuthFactors;
 use crate::error::Result;
 use crate::id::{AccountId, ProfileIx};
+use crate::wallet::summary::SpendSummary;
 
 /// A request for the user to authenticate an unlock of `account`.
 ///
@@ -42,8 +43,20 @@ pub struct SpendConfirmRequest {
     pub account: AccountId,
     /// The profile whose wallet key would sign.
     pub profile: ProfileIx,
-    /// A human-readable one-line summary of what is being spent (amount, recipient, purpose).
-    pub summary: String,
+    /// The structured, independently re-derived effect of the spend (recipients, fee, custody tier)
+    /// the harness renders for the user. Its [`Display`](std::fmt::Display) gives a one-line form.
+    pub summary: SpendSummary,
+}
+
+impl SpendConfirmRequest {
+    /// A spend-confirm request for `account`/`profile` describing `summary`.
+    pub fn new(account: AccountId, profile: ProfileIx, summary: SpendSummary) -> Self {
+        Self {
+            account,
+            profile,
+            summary,
+        }
+    }
 }
 
 /// The user's ruling on a [`SpendConfirmRequest`].
@@ -81,13 +94,20 @@ mod tests {
 
     #[test]
     fn spend_confirm_request_holds_its_context() {
-        let req = SpendConfirmRequest {
-            account: AccountId::new("acct"),
-            profile: ProfileIx::ROOT,
-            summary: "send 1 XCH to xch1…".to_string(),
-        };
+        use crate::wallet::summary::{SpendRecipient, SpendTier};
+        let summary = SpendSummary::new(
+            SpendTier::Confirm,
+            vec![SpendRecipient {
+                address: "xch1recipient".into(),
+                amount_mojos: 1_000_000_000_000,
+                asset_id: None,
+            }],
+            0,
+        );
+        let req = SpendConfirmRequest::new(AccountId::new("acct"), ProfileIx::ROOT, summary);
         assert_eq!(req.profile, ProfileIx::ROOT);
-        assert!(req.summary.contains("XCH"));
+        assert_eq!(req.summary.recipients.len(), 1);
+        assert!(req.summary.to_string().contains("XCH"));
     }
 
     #[test]

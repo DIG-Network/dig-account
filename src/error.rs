@@ -31,6 +31,12 @@ pub enum AccountError {
     /// Authentication or unlock-policy evaluation rejected the attempt.
     #[error("authentication failed: {0}")]
     Auth(String),
+
+    /// A money-path spend operation failed — spend verification, summary derivation, or signing
+    /// was refused. Fail-closed: the money signer surfaces every rejection here rather than
+    /// producing a signature it could not fully account for.
+    #[error("spend refused: {0}")]
+    Spend(String),
 }
 
 #[cfg(test)]

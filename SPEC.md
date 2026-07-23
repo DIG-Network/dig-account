@@ -150,19 +150,31 @@ identity path ONLY (session-attach challenges, `dign sign`, directed-message aut
 ### 5.2 Money signer (v0.1.1: dig-wallet-backend LocalSigner)
 
 `MoneySigner` is the trait that signs verified coin spends and returns the aggregate BLS signature. Its
-sole concrete implementation (v0.1.1, routing through `dig-wallet-backend`'s `LocalSigner`, constructed
-INSIDE dig-account so the money key never leaves the crate) MUST:
+sole concrete implementation, `LocalMoneySigner`, routes through `dig-wallet-backend`'s `LocalSigner`
+constructed via `LocalSigner::new_canonical` (the CANONICAL
+`master_to_wallet_unhardened(seed, ix).derive_synthetic()` money-key scheme — the derivation funds
+actually live at, byte-identical to `WalletKey`; the legacy `m/44'` profile scheme MUST NOT be used, as it
+controls a distinct never-funded key set and would fund-lock coins). It is constructed INSIDE dig-account
+so the money key never leaves the crate, and MUST:
 
 1. Re-derive every required signature from the VERIFIED `coin_spends` — never sign caller-supplied opaque
-   bytes.
+   bytes. An engine-supplied required-signature list is UNTRUSTED (cross-checked against the re-derived
+   set, never the signing source), so it cannot be used as a signing oracle.
 2. Be `AGG_SIG_ME`-only and fail-closed: refuse (error on the whole bundle) any `AGG_SIG_UNSAFE` /
    non-coin-bound required signature (the signing-oracle guard), and any condition it cannot fully
    account for.
 3. Require the quote-form delegated puzzle `(q . conditions)` so the signed message is a pinned,
-   inspectable condition set, not arbitrary CLVM.
+   inspectable condition set, not a solution-malleable puzzle.
 
-There MUST be no bespoke hand-rolled spend-signer path. Until v0.1.1 the crate ships only the trait + the
-`NotYetWired` stub, which MUST panic rather than return a bogus signature.
+There MUST be no bespoke hand-rolled spend-signer path: the verify + sign core is `dig-wallet-backend`'s
+vetted `client` seam, and dig-account only wires it to the canonical money key. All refusals surface as
+`AccountError::Spend`.
+
+`SpendSummary` is the structured, independently re-derived effect of a spend the confirm ceremony renders:
+`{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id}>, fee }`. It is built
+from the coin spends alone via `dig-wallet-backend`'s `client::verify::derive_summary` (never an
+engine-supplied claim); `SpendTier` (`AutoSend` / `Confirm` / `Vault`) classifies the spend under the
+profile's `CustodyPolicy`.
 
 ### 5.3 Domain-separation tags
 
@@ -181,10 +193,11 @@ follow-ups (#1503/#1504/#1505/#1398).
 
 `WalletOps` is the per-profile money-path handle. Its public surface exposes ONLY the wallet's public
 identifiers (`public_key`, `puzzle_hash`, `address`); `wallet_key()` (which holds the raw synthetic
-secret) is `pub(crate)` (§8). `SpendAuthorizer::authorize(summary) -> Result<()>` is the custody gate: a
-spend MUST be authorized (`Ok`) before it is signed, and dig-account MUST fail-closed (never sign) on
-`Err`. The invariants of §5.2 are the binding contract for the v0.1.1 signing path that funnels through
-this seam.
+secret) is `pub(crate)` (§8). `WalletOps::money_signer(network) -> LocalMoneySigner` builds the concrete
+canonical-wallet signer, and `WalletOps::summarize(coin_spends, policy) -> SpendSummary` re-derives + tiers
+a spend. `SpendAuthorizer::authorize(&SpendSummary) -> Result<()>` is the custody gate: a spend MUST be
+authorized (`Ok`) before it is signed, and dig-account MUST fail-closed (never sign) on `Err`. The
+invariants of §5.2 are the binding contract for the v0.1.1 signing path that funnels through this seam.
 
 ### 6.3 Spend branding memo (NC-11)
 
@@ -195,6 +208,8 @@ the concrete memo wiring lands with the spend-building path.
 
 The host harness implements `AuthProvider`: `collect_factors(UnlockRequest) -> AuthFactors` (the unlock
 ceremony) and `confirm_spend(SpendConfirmRequest) -> SpendDecision` (the spend-confirm ceremony).
+`SpendConfirmRequest` carries the structured `SpendSummary` (§5.2) so the harness renders the exact
+recipients + amounts + custody tier the signature will authorize.
 dig-account calls back through this seam for every unlock and every spend confirmation. The provider
 supplies factor VALUES and a confirm/deny decision only; it MUST NOT receive a seed or a private key, and
 the policy/crypto evaluation stays in-crate (§4.2).
@@ -217,7 +232,8 @@ the policy/crypto evaluation stays in-crate (§4.2).
 ## 9. Error model
 
 `AccountError` (`#[non_exhaustive]`) is the single public error type: `Locked`, `ProfileNotFound`,
-`DefaultProfileInvariant`, `Keystore`, `Auth`. Every fallible public operation returns
+`DefaultProfileInvariant`, `Keystore`, `Auth`, `Spend` (money-path verification/derivation/signing
+refusals, fail-closed). Every fallible public operation returns
 `Result<T, AccountError>`. Error `Display` strings MUST NOT contain secret material.
 
 ## 10. Versioning & back-compat
