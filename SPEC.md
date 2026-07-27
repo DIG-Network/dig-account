@@ -217,6 +217,15 @@ derived from the coins being spent, and this specification does not claim otherw
   spend it can verify (§5.2). dig-account does NOT compose a send path that forces a spend through the
   gate, so a caller that uses the signer directly is bound by §5.2 only. A host that wants these rules
   enforced MUST route every spend through a `PolicyAuthorizer` before signing.
+- **The authorization is not bound to the signed bytes.** The gate decides over a `SpendSummary` while
+  the money signer signs over `[CoinSpend]`, and `SpendSummary::new` is public, so a caller can have a
+  one-mojo summary authorized and then sign a spend of any size; the signer re-derives its own summary
+  and checks it against itself, which catches a malformed spend but not a mismatched authorization.
+  **A host MUST pass the `SpendSummary::from_coin_spends`-derived summary of the EXACT coin spends it
+  is about to sign, and MUST NOT hand-construct one.** THIS CRATE DOES NOT AND CANNOT CHECK THAT
+  OBLIGATION — it is a host requirement, not a guarantee. Closing it requires a shape change
+  (authorizing over the coin spends, or issuing an approval token the signer demands) and is tracked
+  separately as a blocker on the money-send wire contract.
 - **Only HINTED value is visible to the amount bounds** (§6.4). An un-hinted output is change and is
   excluded from `SpendSummary::recipients`, so no limit here weighs it; §5.2's change-ownership check
   bounds where such value may go (a puzzle hash under the same seed) but does not subject it to any
@@ -230,8 +239,10 @@ identifiers (`public_key`, `puzzle_hash`, `address`); `wallet_key()` (which hold
 secret) is `pub(crate)` (§8). `WalletOps::money_signer(network) -> LocalMoneySigner` builds the concrete
 canonical-wallet signer, and `WalletOps::summarize(coin_spends, policy) -> SpendSummary` re-derives + tiers
 a spend. `SpendAuthorizer::authorize(&SpendSummary) -> Result<()>` is the custody gate: a spend MUST be
-authorized (`Ok`) before it is signed, and dig-account MUST fail-closed (never sign) on `Err`. The
-invariants of §5.2 are the binding contract for the signing path that funnels through this seam.
+authorized (`Ok`) before it is signed, and a host MUST fail-closed (never sign) on `Err`. **This MUST
+binds the HOST and has no enforcement point inside this crate** (§6.1.1): `LocalMoneySigner` consults
+no authorizer, so the invariants of §5.2 — independent re-derivation, value conservation, wallet-owned
+change, quote-form delegated puzzles — are the only checks that apply unconditionally to a signature.
 
 `PolicyAuthorizer` is the crate's concrete ENFORCING implementation of that seam (§6.4).
 
@@ -252,9 +263,18 @@ approved one.
 ### 6.4 Auto-send policy enforcement (`PolicyAuthorizer`)
 
 `PolicyAuthorizer` holds the profile's `CustodyPolicy`, its `AutoSendPolicy`, the profile's own
-hot-wallet address, and a clock. All four MUST be fixed at construction from PERSISTED user
-configuration — never supplied per request by a dapp or IPC peer, which could otherwise raise its own
-limit.
+hot-wallet address, and a clock. All four are constructor arguments and MUST be read from PERSISTED
+user configuration — never supplied per request by a dapp or IPC peer, which could otherwise raise its
+own limit.
+
+**A host MUST hold exactly ONE long-lived `PolicyAuthorizer` per profile.** The rolling-period ledger
+is in-memory and per-instance, so constructing an authorizer per request DESTROYS the period cap: each
+new instance starts with an empty ledger, and N requests against N fresh gates move up to
+N x `per_tx_limit_mojos` instead of `period_cap_mojos`, silently reducing three bounds to two. Reading
+the policy from persisted configuration is about where the policy COMES FROM; it is not licence to
+build a gate per spend. The cap is also per-process-lifetime rather than per-wall-clock-period — a
+restart re-earns the full allowance — so a host MUST NOT present it to a user as a durable daily
+limit. Persisting the ledger is tracked separately.
 
 `authorize_op(&SpendSummary, SpendOpClass) -> Result<()>` decides, in order:
 
@@ -275,8 +295,12 @@ limit.
    amount is not counted by `native_total_mojos()`, so no mojo limit can bound it.
 7. **Per-transaction limit.** The checked native total (amounts PLUS fee) MUST be `<=`
    `per_tx_limit_mojos`, else `RequireAuth`.
-8. **Rolling period cap.** The sum of approvals inside the last `period_seconds` plus this spend MUST be
-   `<= period_cap_mojos`, else `RequireAuth`. An approval recorded at `t` MUST still count at
+8. **Rolling period cap.** `period_seconds` MUST be non-zero, else `PolicyIndeterminate`: a
+   zero-length window contains no spend, so obeying it would discard every record on every call and
+   degrade the cap into a second per-transaction limit with no bound on how often it applies. The sum
+   of approvals inside the last `period_seconds` plus this spend MUST be `<= period_cap_mojos`, else
+   `RequireAuth`. Only a NON-ZERO charge is recorded, so repeated zero-value approvals cannot grow the
+   ledger without bound. An approval recorded at `t` MUST still count at
    `t + period_seconds - 1` and MUST have expired at `t + period_seconds`. Only an APPROVED spend is
    recorded; a refused spend MUST NOT consume the allowance. An unreadable clock is
    `PolicyIndeterminate` — never an empty window.
@@ -291,6 +315,15 @@ small allowance while the spend moves an enormous amount) and MUST NOT panic (`f
 `SpendSummary::native_total_mojos()` SATURATES at `u64::MAX` so no caller can observe a wrapped figure;
 `checked_native_total_mojos()` is the form every custody decision MUST use.
 
+**Known shape gap — an undeclared intent is not escalatable while auto-send is ON.** With the global
+switch off, everything yields `RequireAuth`, which routes to the human. With it on, an undeclared
+intent yields `PolicyIndeterminate`, which §6.3 defines as not escalatable. A dapp-originated spend
+request has inherently undeclared intent, so it meets a non-escalatable refusal precisely when the user
+has enabled auto-send. Neither tempting remedy is acceptable: letting a dapp declare an op class hands
+the intent model to the attacker, and collapsing the two refusals destroys the distinction §6.3 exists
+to draw. The correct shape is a THIRD outcome — escalatable, "no intent supplied, route to the human" —
+and it is tracked against the money-send wire contract rather than introduced here.
+
 `SpendSummary` accounts for HINTED outputs plus the fee, so no bound here can see an un-hinted output.
 The complementary invariant — un-hinted value MUST NOT leave the wallet — is enforced by the money
 signer's change-ownership check (§5.2). Both layers are required.
@@ -301,17 +334,22 @@ A vault outflow is built as a `VaultMove`: the chia-wallet-sdk `ClawbackV2` prim
 the vault puzzle hash as sender, the hot-wallet puzzle hash as receiver, and an ABSOLUTE settlement
 timestamp of `now + clawback_seconds`. dig-account MUST NOT hand-roll the puzzle or the spend bundle.
 
-**`now` MUST come from the `Clock` seam, never from a caller-supplied timestamp.** The settlement
-condition is absolute, so a move planned against a stale `now` produces a coin whose window has ALREADY
-elapsed — vault funds reaching the hot wallet with no delay and nothing to reverse, while the funding
-spend still looks correct. `to_hot_wallet` MUST therefore refuse any move whose deadline is not strictly
-in the future (`settles_at_unix <= now`), stated over that class rather than over `clawback_seconds == 0`,
-and MUST refuse when the clock cannot be read (`PolicyIndeterminate`). A shorter window weakens the
-protection proportionally; `Vault::default()` is the canonical 24 hours, and no policy minimum is imposed.
+**`now` MUST come from the `Clock` seam, never from a caller-supplied timestamp.** `ClawbackV2` curries
+`ASSERT_BEFORE_SECONDS_ABSOLUTE` into the sender's recover path and `ASSERT_SECONDS_ABSOLUTE` into the
+receiver's claim path, so a deadline already in the PAST does not merely settle early: the receiver —
+and, via push-through, anyone — may take the coin immediately, while the vault's own cancel asserts a
+before-time that has elapsed and can therefore NEVER be satisfied. The cancel path is destroyed, not
+weakened, and the funding spend still looks correct. `to_hot_wallet` MUST therefore read `now` from a
+`Clock` and MUST refuse when it cannot be read (`PolicyIndeterminate`).
+
+**The clawback window MUST be at least `MIN_CLAWBACK_SECONDS` (24 hours, #1504).** The window is worth
+exactly the time it gives the user to notice and cancel, so the rule is stated over the CLASS of
+too-short windows: a one-second window satisfies "the deadline is in the future" and is just as useless
+as a zero-second one. Longer windows are permitted. `Vault::default()` sits exactly on the floor.
 
 - `to_hot_wallet` is the ONLY constructor and takes no arbitrary destination, so a vault to third-party
-  move is not expressible. It MUST refuse a non-future deadline, a zero amount, a hot wallet equal to the
-  vault's own puzzle hash, and a window that overflows the absolute timestamp.
+  move is not expressible. It MUST refuse a window below the floor, a zero amount, a hot wallet equal to
+  the vault's own puzzle hash, and a window that overflows the absolute timestamp.
 - `funding_conditions` creates the time-locked coin (never a coin paying the hot wallet directly) and
   carries the receiver puzzle hash plus the clawback parameters as its memo.
 - `cancel` returns the funds to the vault and is valid only BEFORE settlement, for the vault key.
@@ -320,6 +358,12 @@ protection proportionally; `Vault::default()` is the canonical 24 hours, and no 
   unless the reconstruction reproduces the coin's own puzzle hash.
 - The SDK's sender-side "force" path, which would deliver to the receiver BEFORE settlement, MUST NOT be
   exposed: it would bypass the window this type exists to impose.
+
+This flow is NOT yet reachable end to end, and that is fail-closed rather than a defect: a real funding
+spend pays the time-locked coin, so §6.4's recipient rule refuses it, and a vault coin is not decodable
+by the §5.2 re-derivation. Making it reachable MUST be done by teaching the gate to recognise a clawback
+coin whose receiver is the hot wallet. Widening what counts as the hot wallet is FORBIDDEN — it would
+reopen the vault-to-third-party path the rule exists to close.
 
 ### 6.6 Spend branding memo (NC-11)
 

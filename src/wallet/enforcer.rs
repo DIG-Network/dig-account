@@ -43,6 +43,18 @@
 //! send path in this crate that forces a spend through this gate, so a caller that goes straight to
 //! the signer never meets a limit.
 //!
+//! **This gate does not know WHICH coin spends it authorized.** It decides over a
+//! [`SpendSummary`], while [`LocalMoneySigner`](crate::wallet::money_signer::LocalMoneySigner) signs
+//! over `&[CoinSpend]`, and nothing in this crate proves the one describes the other —
+//! [`SpendSummary::new`] is public, so a caller can hand the gate a summary of a one-mojo tip and
+//! then sign a spend of a billion. The signer re-derives its own summary and checks it against
+//! itself, which catches a malformed spend but not a mismatched authorization. A host MUST therefore
+//! pass the summary produced by
+//! [`SpendSummary::from_coin_spends`](crate::wallet::summary::SpendSummary::from_coin_spends) over
+//! **the exact coin spends it is about to sign**, and MUST NOT construct one by hand. That obligation
+//! is the host's; this crate cannot check it, and closing the gap needs a shape change (authorizing
+//! over the coin spends, or an approval token the signer demands) tracked separately.
+//!
 //! **A [`SpendSummary`] accounts only for HINTED outputs plus the fee.** An un-hinted output is
 //! change, which `dig-wallet-backend`'s re-derivation excludes from the recipient list, so no amount
 //! limit here can see it. That invariant is held one layer down by
@@ -83,6 +95,23 @@ struct AutoSendRecord {
 /// user configuration — never from a dapp, an IPC peer, or a per-request argument (#1560). A caller
 /// that could supply the policy alongside the spend could raise its own limit and walk through the
 /// gate.
+///
+/// # The host MUST hold exactly ONE long-lived authorizer per profile
+///
+/// The rolling-period ledger lives in this struct and nowhere else. It is in-memory and per-instance,
+/// so:
+///
+/// - **Constructing an authorizer per request destroys the period cap.** Each new instance starts
+///   with an empty ledger, so N requests against N fresh gates move up to N × `per_tx_limit_mojos`
+///   rather than `period_cap_mojos`. Three advertised bounds silently become two. "Fixed at
+///   construction from persisted configuration" describes where the POLICY comes from — it is not an
+///   instruction to build a gate per spend.
+/// - **The cap is per-process-lifetime, not per-wall-clock-day.** A restart re-earns the full
+///   allowance. Persisting the ledger is tracked separately; until then a host MUST NOT present the
+///   cap to a user as a durable daily limit.
+///
+/// A `PolicyAuthorizer` is `Send + Sync` and takes `&self`, so one instance per profile can be shared
+/// for the process's lifetime.
 #[derive(Debug)]
 pub struct PolicyAuthorizer {
     /// Which tier governs this profile's money path. The authorizer RE-CLASSIFIES every spend under
@@ -281,6 +310,13 @@ impl PolicyAuthorizer {
     /// The charge is recorded only on approval, and only once — a refused spend must not consume the
     /// user's allowance.
     fn charge_the_rolling_period_cap(&self, total: u64) -> Result<()> {
+        if self.auto_send.period_seconds == 0 {
+            return Err(AccountError::PolicyIndeterminate(
+                "the auto-send period is zero seconds long, so no window exists to measure the cap \
+                 over; the cap cannot be evaluated"
+                    .to_string(),
+            ));
+        }
         let now = self.clock.now_unix()?;
         let mut recent = self.recent.lock().map_err(|_| {
             AccountError::PolicyIndeterminate(
@@ -312,10 +348,15 @@ impl PolicyAuthorizer {
             )));
         }
 
-        recent.push_back(AutoSendRecord {
-            at_unix: now,
-            mojos: total,
-        });
+        // A zero-value approval consumes none of the cap, so recording it would grow the ledger
+        // without ever being self-limiting — an unbounded allocation reachable by repeated no-value
+        // requests. Only charges that actually move the total are worth remembering.
+        if total > 0 {
+            recent.push_back(AutoSendRecord {
+                at_unix: now,
+                mojos: total,
+            });
+        }
         Ok(())
     }
 }
@@ -1094,10 +1135,19 @@ mod tests {
             "saturating biases the unchecked accessor toward refusal"
         );
 
+        // The MESSAGE matters, not just the variant: routing the decision through the SATURATING
+        // accessor also yields `PolicyIndeterminate`, but by way of a tier disagreement after the
+        // clamp — a different bug wearing the same error. Naming the overflow is what distinguishes
+        // "this total cannot be computed" from "this total disagrees with the declared tier", and
+        // without it the checked-vs-saturating choice on the decision path is pinned by nothing.
         let err = gate
             .authorize_op(&overflowing, SpendOpClass::Tip)
             .unwrap_err();
         assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+        assert!(
+            err.to_string().contains("overflow"),
+            "the refusal must name the overflow, not a tier disagreement: {err}"
+        );
     }
 
     /// The fee is part of the same sum, so it overflows the same way and must refuse the same way.
@@ -1114,6 +1164,71 @@ mod tests {
             .authorize_op(&overflowing, SpendOpClass::Tip)
             .unwrap_err();
         assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+        assert!(err.to_string().contains("overflow"), "{err}");
+    }
+
+    /// A zero-length rolling window cannot contain a spend, so the cap measured over it cannot be
+    /// evaluated. Obeying it literally would drop every record on every call, degrading the cap into a
+    /// second per-transaction limit applicable an unlimited number of times — while the user believes a
+    /// daily cap is in force. The control proves the very same spend passes once the window is real,
+    /// so this is the zero being refused rather than the gate refusing everything.
+    #[test]
+    fn a_zero_length_rolling_period_cannot_be_evaluated_and_is_refused() {
+        let policy = AutoSendPolicy {
+            enabled: true,
+            tip: OpClassLimits::enabled_up_to(1_000),
+            period_seconds: 0,
+            period_cap_mojos: 1_000,
+            ..AutoSendPolicy::default()
+        };
+        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 100)], 0);
+
+        let err = gate_with(hot_custody(), policy)
+            .authorize_op(&summary, SpendOpClass::Tip)
+            .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+
+        gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                period_seconds: 1,
+                ..policy
+            },
+        )
+        .authorize_op(&summary, SpendOpClass::Tip)
+        .expect("control: the same spend passes once the window has a length");
+    }
+
+    /// A zero-value approval consumes none of the cap, so remembering it could only grow the ledger
+    /// without bound — repeated no-value requests would allocate for ever while never being
+    /// self-limiting. They must leave no record, and must not eat into the real allowance.
+    #[test]
+    fn repeated_zero_value_approvals_neither_accumulate_nor_consume_the_allowance() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000),
+                period_cap_mojos: 1_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+        let nothing = summary_under(&hot_custody(), vec![xch(&third_party_address(), 0)], 0);
+        assert_eq!(nothing.native_total_mojos(), 0);
+
+        for _ in 0..1_000 {
+            gate.authorize_op(&nothing, SpendOpClass::Tip).unwrap();
+        }
+        assert_eq!(
+            gate.recent.lock().unwrap().len(),
+            0,
+            "a zero charge must leave no record behind"
+        );
+
+        let full_allowance =
+            summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_000)], 0);
+        gate.authorize_op(&full_allowance, SpendOpClass::Tip)
+            .expect("the whole allowance must still be available");
     }
 
     /// The layered invariant this gate deliberately does NOT hold alone: an un-hinted output is

@@ -25,6 +25,19 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   (`u64::MAX - 100` plus `1_000` reading as `899` mojos, inside a small allowance) and panicked in
   debug builds on caller-supplied coin spends; `checked_native_total_mojos` refuses, and
   `native_total_mojos` saturates instead of wrapping
+- **wallet:** `MIN_CLAWBACK_SECONDS` (24h, #1504) floors the vault clawback window. The previous
+  guard refused only a zero-second window, so a one-second window passed while giving the user no
+  opportunity to cancel
+- **wallet:** a zero-length `period_seconds` is `PolicyIndeterminate` rather than silently
+  discarding every ledger record, which degraded the rolling cap into an unlimited-count
+  per-transaction limit
+- **wallet:** zero-value approvals are no longer recorded, so repeated no-value requests cannot grow
+  the ledger without bound
+
+### Breaking-by-omission (pre-adoption, no released consumer)
+- **wallet:** `SpendOpClass` no longer derives `Serialize`/`Deserialize`. The intent model depends on
+  the op class never crossing a trust boundary, and the derives made "a dapp declares `Tip` over a
+  drain" a one-line change in a consumer. The type system now holds that boundary
 
 ### Additive API
 - `AccountError::RequireAuth`, `::PolicyDenied`, `::PolicyIndeterminate` — escalatable refusal,

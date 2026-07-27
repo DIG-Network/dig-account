@@ -73,8 +73,17 @@ pub struct SpendSummary {
 }
 
 impl SpendSummary {
-    /// Assemble a summary from its parts. Prefer [`from_coin_spends`](Self::from_coin_spends), which
-    /// re-derives the recipients + fee from the coin spends rather than trusting a caller's claim.
+    /// Assemble a summary from its parts.
+    ///
+    /// # This constructor is not safe to authorize against
+    ///
+    /// A hand-built summary describes whatever its caller says it describes, and nothing connects it
+    /// to any coin spend. A custody gate that authorizes one of these has approved a FICTION: the
+    /// money signer signs `[CoinSpend]`, re-derives its own summary, and checks it against itself, so
+    /// a one-mojo summary can be authorized and a billion-mojo spend signed with every advertised
+    /// bound satisfied. Use [`from_coin_spends`](Self::from_coin_spends) — over the EXACT coin spends
+    /// about to be signed — for anything a policy will judge; this constructor is for tests and for
+    /// rendering a summary that was derived elsewhere.
     pub fn new(tier: SpendTier, recipients: Vec<SpendRecipient>, fee: u64) -> Self {
         Self {
             tier,

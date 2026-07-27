@@ -27,7 +27,14 @@ pub const DEFAULT_PERIOD_SECONDS: u64 = 24 * 60 * 60;
 /// re-derived fact, so a hostile source could otherwise relabel a drain as a tip. The amount bounds
 /// are what actually bound the value moved; the op class only narrows WHICH bounded flows may run
 /// unattended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// # Deliberately NOT serializable
+///
+/// This type carries no `Serialize`/`Deserialize`, and MUST NOT gain them. It is not a field of any
+/// persisted type, so the derives would buy nothing — while making "a dapp declares `Tip` over a
+/// drain" a one-line change in a consumer. Leaving the type unserializable puts the trust boundary in
+/// the type system instead of in this comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpendOpClass {
     /// Coin management within the wallet's own puzzle hash — splitting or combining coins (#1503).
     Rebalance,
@@ -92,6 +99,11 @@ pub struct AutoSendPolicy {
     /// Bounds for small everyday sends.
     pub small_send: OpClassLimits,
     /// The rolling window, in seconds, the period cap is measured over. Default 24 hours.
+    ///
+    /// MUST be non-zero. A zero-length window contains no spend, so the cap would silently degrade
+    /// into a second per-transaction limit with no bound on how many times it applies — while the
+    /// user believes a daily cap is set. The gate treats zero as
+    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) rather than obeying it.
     pub period_seconds: u64,
     /// The total native mojos (amounts plus fees) that may auto-send within any
     /// `period_seconds`-long window, summed across ALL op classes. Default `0`.
