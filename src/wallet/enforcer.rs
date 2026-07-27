@@ -5,10 +5,11 @@
 //!
 //! | Situation | Outcome |
 //! |---|---|
+//! | The summary's native total cannot be summed in a `u64` | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
 //! | The summary's declared tier disagrees with the profile's [`CustodyPolicy`] | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
 //! | A vault outflow paying anything but the profile's own hot wallet | [`PolicyDenied`](AccountError::PolicyDenied) |
 //! | A vault outflow to the hot wallet | [`RequireAuth`](AccountError::RequireAuth) — always, at any amount |
-//! | Any tier other than [`SpendTier::AutoSend`] | [`RequireAuth`](AccountError::RequireAuth) |
+//! | A [`Confirm`](SpendTier::Confirm)-tier spend | [`RequireAuth`](AccountError::RequireAuth) |
 //! | Auto-send globally off, or off for this op class | [`RequireAuth`](AccountError::RequireAuth) |
 //! | An undeclared op class, or value in units no mojo limit can bound | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
 //! | Over the per-transaction limit, or over the rolling period cap | [`RequireAuth`](AccountError::RequireAuth) |
@@ -22,20 +23,34 @@
 //! ([`PolicyIndeterminate`](AccountError::PolicyIndeterminate)) are distinct outcomes, because a
 //! caller that cannot tell them apart will escalate a forbidden spend into an approved one.
 //!
-//! The permit path is reached only by an explicit equality test against [`SpendTier::AutoSend`], never
-//! by a fall-through arm, so a [`SpendTier`] variant added in future is refused without this file
-//! changing.
+//! Every [`SpendTier`] gets exactly one arm of one wildcard-free `match`, so a tier added in future
+//! is a COMPILE error here rather than a variant that quietly inherits some other tier's decision
+//! (see [`authorize_op`](PolicyAuthorizer::authorize_op)).
 //!
-//! # What this gate does NOT bound (and what does)
+//! # What this gate does NOT protect — read before relying on it
 //!
-//! A [`SpendSummary`] accounts for HINTED outputs plus the fee. An UN-hinted output is change, and
-//! `dig-wallet-backend`'s re-derivation deliberately excludes it from the recipient list — so no
-//! amount limit here can see it. The invariant that un-hinted value cannot leave the wallet is held
-//! one layer down, by [`LocalMoneySigner`](crate::wallet::money_signer::LocalMoneySigner), which
-//! refuses to sign any spend with a change output the wallet does not own. The two layers compose:
-//! this gate bounds what leaves openly, the signer forbids what would leave silently. Neither alone
-//! is sufficient, and `refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves`
-//! pins the composition.
+//! **The tier follows the profile's CONFIGURATION, not the coins being spent.** A
+//! [`PolicyAuthorizer`] holds one [`CustodyPolicy`] fixed at construction, and
+//! [`SpendTier::classify`] weighs only the spend's native total against it. **Nothing here inspects
+//! the spend's input coins.** A profile configured [`Hot`](CustodyPolicy::Hot) that spends a
+//! vault-held coin is therefore treated as a hot-wallet spend: the vault refusal, the destination
+//! rule, and the clawback window do not run, and this gate has no way to notice. Vault protection is
+//! a property of the AUTHORIZER THE CALLER BUILT, not a property of the funds — the caller MUST
+//! construct the authorizer that matches the coins it is about to spend.
+//!
+//! **Enforcement is opt-in.** [`WalletOps::money_signer`](crate::wallet::authorizer::WalletOps::money_signer)
+//! is public and returns a signer that will sign anything it can verify. There is no composed
+//! send path in this crate that forces a spend through this gate, so a caller that goes straight to
+//! the signer never meets a limit.
+//!
+//! **A [`SpendSummary`] accounts only for HINTED outputs plus the fee.** An un-hinted output is
+//! change, which `dig-wallet-backend`'s re-derivation excludes from the recipient list, so no amount
+//! limit here can see it. That invariant is held one layer down by
+//! [`LocalMoneySigner`](crate::wallet::money_signer::LocalMoneySigner), which refuses to sign a spend
+//! with a change output the wallet does not own — which bounds where such value can GO (somewhere
+//! under the same seed) but not that it obeyed a policy.
+//! `refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves` pins the
+//! composition.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -118,25 +133,34 @@ impl PolicyAuthorizer {
     /// This is the full gate. The [`SpendAuthorizer`] trait impl delegates here with
     /// [`SpendOpClass::Undeclared`], which can never auto-approve — so a caller that reaches this
     /// authorizer through the untyped seam always escalates.
+    ///
+    /// # One arm per tier, no wildcard
+    ///
+    /// Two properties follow from that shape, and both are load-bearing:
+    ///
+    /// - **A `SpendTier` variant added later fails to COMPILE here**, forcing its author to state the
+    ///   new tier's rule. A wildcard arm — even one that refuses — would instead let a new tier
+    ///   silently inherit a decision nobody chose for it.
+    /// - **No two arms can decide the same tier.** An earlier `if tier == Vault { … }` followed by a
+    ///   catch-all `if tier != AutoSend { … }` looked equivalent but was not: both returned
+    ///   `RequireAuth` for a vault spend, so deleting the vault arm changed nothing observable and the
+    ///   vault-escalation rule was pinned by no test at all. One arm per tier makes that mutant a
+    ///   compile error rather than a silent equivalence.
     pub fn authorize_op(&self, summary: &SpendSummary, op_class: SpendOpClass) -> Result<()> {
-        let tier = self.reclassify(summary)?;
-
-        if tier == SpendTier::Vault {
-            self.reject_vault_outflow_to_anyone_but_the_hot_wallet(summary)?;
-            return Err(AccountError::RequireAuth(
-                "a vault spend always requires the full authorization ceremony, at any amount"
+        match self.reclassify(summary)? {
+            SpendTier::Vault => {
+                self.reject_vault_outflow_to_anyone_but_the_hot_wallet(summary)?;
+                Err(AccountError::RequireAuth(
+                    "a vault spend always requires the full authorization ceremony, at any amount"
+                        .to_string(),
+                ))
+            }
+            SpendTier::Confirm => Err(AccountError::RequireAuth(
+                "a spend over this profile's auto-send allowance requires explicit confirmation"
                     .to_string(),
-            ));
+            )),
+            SpendTier::AutoSend => self.check_auto_send(summary, op_class),
         }
-
-        // Allow-list, not a fall-through: only this one tier continues toward a possible approval.
-        if tier != SpendTier::AutoSend {
-            return Err(AccountError::RequireAuth(format!(
-                "the {tier:?} tier is never auto-approved"
-            )));
-        }
-
-        self.check_auto_send(summary, op_class)
     }
 
     /// Re-derive the spend's tier from the profile's OWN custody policy and require the summary to
@@ -148,7 +172,9 @@ impl PolicyAuthorizer {
     /// disagreement is INDETERMINATE rather than denied: the two sides used different policies, so
     /// the correct answer is unknown, and confirming it away would hide the misconfiguration.
     fn reclassify(&self, summary: &SpendSummary) -> Result<SpendTier> {
-        let derived = SpendTier::classify(&self.custody, summary.native_total_mojos());
+        // Checked, not saturating: a spend whose native total cannot be summed must be refused for
+        // that reason, not clamped to `u64::MAX` and then tiered as though the clamp were its value.
+        let derived = SpendTier::classify(&self.custody, summary.checked_native_total_mojos()?);
         if derived != summary.tier {
             return Err(AccountError::PolicyIndeterminate(format!(
                 "the summary declares the {:?} tier but this profile's custody policy classifies \
@@ -210,7 +236,7 @@ impl PolicyAuthorizer {
 
         self.reject_amounts_no_mojo_limit_can_bound(summary)?;
 
-        let total = summary.native_total_mojos();
+        let total = summary.checked_native_total_mojos()?;
         if total > limits.per_tx_limit_mojos {
             return Err(AccountError::RequireAuth(format!(
                 "{total} mojos exceeds the {} mojo per-transaction auto-send limit for {op_class:?}",
@@ -958,6 +984,136 @@ mod tests {
                 "address {address:?}: {err}"
             );
         }
+    }
+
+    /// GATING: the vault-ESCALATION rule needs its own witness.
+    ///
+    /// `Vault` and `Confirm` both refuse with `RequireAuth`, so a test that only checks the variant
+    /// cannot tell which arm fired — and the earlier `if tier == Vault { … }` / `if tier != AutoSend
+    /// { … }` shape meant deleting the vault arm changed nothing observable. One arm per tier now
+    /// makes that mutant a compile error, and this test additionally pins that the two refusals are
+    /// DISTINGUISHABLE, so the vault path cannot silently become the generic one.
+    #[test]
+    fn a_vault_refusal_names_the_vault_and_is_not_the_generic_over_allowance_refusal() {
+        let vault_gate = gate_with(vault_custody(), permissive_auto_send());
+        let hot_gate = gate_with(hot_custody(), permissive_auto_send());
+
+        let vault_spend = summary_under(&vault_custody(), vec![xch(&hot_wallet_address(), 1)], 0);
+        let over_allowance = summary_under(
+            &hot_custody(),
+            vec![xch(&third_party_address(), CUSTODY_AUTO_SEND_CEILING + 1)],
+            0,
+        );
+
+        let vault_refusal = vault_gate
+            .authorize_op(&vault_spend, SpendOpClass::Tip)
+            .unwrap_err()
+            .to_string();
+        let confirm_refusal = hot_gate
+            .authorize_op(&over_allowance, SpendOpClass::Tip)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            vault_refusal.contains("vault"),
+            "the vault refusal must say so: {vault_refusal}"
+        );
+        assert!(
+            !confirm_refusal.contains("vault"),
+            "the over-allowance refusal is not a vault refusal: {confirm_refusal}"
+        );
+        assert_ne!(vault_refusal, confirm_refusal);
+    }
+
+    /// GATING: the rolling cap pinned at the bound, not only over it. A spend that brings the window
+    /// total to EXACTLY the cap must be permitted; one mojo more must not. Without the lower half, a
+    /// `>=` comparison would refuse the last honest mojo of the user's allowance and no test would
+    /// notice.
+    #[test]
+    fn a_spend_that_brings_the_rolling_total_exactly_to_the_cap_is_permitted_and_one_more_is_not() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000),
+                period_cap_mojos: 1_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+        let six_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 600)], 0);
+        let four_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 400)], 0);
+        let one = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1)], 0);
+
+        gate.authorize_op(&six_hundred, SpendOpClass::Tip).unwrap();
+        gate.authorize_op(&four_hundred, SpendOpClass::Tip)
+            .expect("600 + 400 is exactly the 1000 cap, which is within it");
+
+        let err = gate.authorize_op(&one, SpendOpClass::Tip).unwrap_err();
+        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+    }
+
+    /// GATING: a native total that cannot be summed in a `u64` must be REFUSED, not wrapped.
+    ///
+    /// `u64::MAX - 100` plus `1_000` wraps to `899` — a number that sails under a 1_000 mojo
+    /// per-transaction limit and a 1_000 mojo period cap while the spend actually moves more value
+    /// than exists. The test asserts the total is NOT the wrapped value, so it fails on a wrapping
+    /// implementation rather than merely on a refusing one, and by completing at all it proves the
+    /// summation does not panic in a debug build.
+    #[test]
+    fn a_native_total_that_overflows_u64_is_refused_and_never_reported_as_its_wrapped_value() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000),
+                period_cap_mojos: 1_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+        let overflowing = SpendSummary::new(
+            SpendTier::AutoSend,
+            vec![
+                xch(&third_party_address(), u64::MAX - 100),
+                xch(&third_party_address(), 1_000),
+            ],
+            0,
+        );
+
+        assert!(
+            overflowing.checked_native_total_mojos().is_err(),
+            "the total is not representable"
+        );
+        assert_ne!(
+            overflowing.native_total_mojos(),
+            899,
+            "the wrapped total would pass every limit"
+        );
+        assert_eq!(
+            overflowing.native_total_mojos(),
+            u64::MAX,
+            "saturating biases the unchecked accessor toward refusal"
+        );
+
+        let err = gate
+            .authorize_op(&overflowing, SpendOpClass::Tip)
+            .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+    }
+
+    /// The fee is part of the same sum, so it overflows the same way and must refuse the same way.
+    #[test]
+    fn a_fee_that_overflows_the_native_total_is_refused() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let overflowing = SpendSummary::new(
+            SpendTier::AutoSend,
+            vec![xch(&third_party_address(), u64::MAX)],
+            1,
+        );
+        assert!(overflowing.checked_native_total_mojos().is_err());
+        let err = gate
+            .authorize_op(&overflowing, SpendOpClass::Tip)
+            .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
     }
 
     /// The layered invariant this gate deliberately does NOT hold alone: an un-hinted output is

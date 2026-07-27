@@ -115,21 +115,51 @@ impl SpendSummary {
     /// (XCH moved plus fee) against the profile's custody policy.
     pub fn classified(coin_spends: &[CoinSpend], policy: &CustodyPolicy) -> Result<Self> {
         let mut summary = Self::from_coin_spends(coin_spends, SpendTier::Confirm)?;
-        summary.tier = SpendTier::classify(policy, summary.native_total_mojos());
+        summary.tier = SpendTier::classify(policy, summary.checked_native_total_mojos()?);
         Ok(summary)
     }
 
     /// The total NATIVE value the spend moves (XCH recipient amounts plus fee), in mojos — the figure
     /// [`SpendTier::classify`] weighs against a hot-wallet allowance. CAT outputs are excluded (their
     /// base units are not XCH mojos).
+    ///
+    /// **Saturates at [`u64::MAX`] rather than wrapping or panicking.** A summary whose native
+    /// amounts cannot be summed in a `u64` has no honest total, and the two silent alternatives are
+    /// both dangerous: wrapping would report a small total for an enormous spend (`u64::MAX - 100`
+    /// plus `1_000` reads as `899` mojos, comfortably inside a small allowance), and panicking would
+    /// abort on attacker-supplied coin spends. Saturating biases the answer toward refusal, since
+    /// `u64::MAX` exceeds every configurable limit.
+    ///
+    /// Every path that makes a CUSTODY DECISION uses
+    /// [`checked_native_total_mojos`](Self::checked_native_total_mojos) instead, so an unsummable
+    /// spend is refused explicitly rather than clamped and then judged.
     pub fn native_total_mojos(&self) -> u64 {
-        let native_out: u64 = self
+        self.checked_native_total_mojos().unwrap_or(u64::MAX)
+    }
+
+    /// The total NATIVE value the spend moves, or an error if it cannot be represented in a `u64`.
+    ///
+    /// This is the form a custody gate MUST use: "this spend's value cannot be computed" is a
+    /// different answer from any number, and collapsing it into one loses the only signal that the
+    /// figure being compared against a limit is fiction.
+    pub fn checked_native_total_mojos(&self) -> Result<u64> {
+        let native_out = self
             .recipients
             .iter()
             .filter(|recipient| recipient.asset_id.is_none())
-            .map(|recipient| recipient.amount_mojos)
-            .sum();
-        native_out.saturating_add(self.fee)
+            .try_fold(0u64, |sum, recipient| {
+                sum.checked_add(recipient.amount_mojos)
+            })
+            .ok_or_else(|| Self::unsummable("the native recipient amounts"))?;
+        native_out
+            .checked_add(self.fee)
+            .ok_or_else(|| Self::unsummable("the native recipient amounts plus the fee"))
+    }
+
+    fn unsummable(what: &str) -> AccountError {
+        AccountError::PolicyIndeterminate(format!(
+            "{what} overflow u64, so this spend has no native total to weigh against a limit"
+        ))
     }
 }
 

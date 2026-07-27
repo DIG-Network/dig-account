@@ -192,13 +192,36 @@ A `Vault` carries a clawback window (`clawback_seconds`, default 24h). A `HotWal
 `auto_send_limit`, the native total below which a spend is classified `SpendTier::AutoSend`; it defaults
 to `0`, so an unconfigured hot wallet auto-sends nothing.
 
-**Funds leave the vault by exactly one route.** A vault outflow MUST be a `VaultMove` to the profile's
-OWN hot wallet, time-locked for the vault's clawback window; a vault spend to any other destination MUST
-be refused (§6.5). A vault outflow is therefore always delayed and always reversible by the vault key
-inside the window, and any onward payment is governed by the hot wallet's own rules.
+**A vault-tier spend leaves the vault by exactly one route.** When a spend is classified `Vault`, it
+MUST be a `VaultMove` to the profile's OWN hot wallet, time-locked for the vault's clawback window; a
+vault-tier spend to any other destination MUST be refused (§6.5). Such an outflow is therefore always
+delayed and always reversible by the vault key inside the window, and any onward payment is governed by
+the hot wallet's own rules.
 
 **The vault tier never auto-approves.** Every vault-tier spend MUST require the full authorization
 ceremony, at any amount, under any auto-send configuration.
+
+### 6.1.1 What the tier is, and what it is NOT (scope of these guarantees)
+
+The tier is derived from the profile's CUSTODY CONFIGURATION and the spend's native total. It is NOT
+derived from the coins being spent, and this specification does not claim otherwise:
+
+- **There is no coin-to-tier linkage.** No part of dig-account inspects a spend's INPUT coins. A
+  `PolicyAuthorizer` holds one `CustodyPolicy` fixed at construction and classifies by amount alone, so a
+  profile configured `Hot` that spends a vault-held coin is treated as a hot-wallet spend — the vault
+  refusal, the destination rule, and the clawback window do not run, and the gate cannot detect the
+  mismatch. **The caller MUST construct the authorizer that matches the coins it is spending.**
+- **Vault protection is a property of the AUTHORIZER, not of the funds.** An implementation MUST NOT
+  present these rules to a user as protection that attaches to money held in a vault.
+- **Enforcement is opt-in.** `WalletOps::money_signer` is public and returns a signer that signs any
+  spend it can verify (§5.2). dig-account does NOT compose a send path that forces a spend through the
+  gate, so a caller that uses the signer directly is bound by §5.2 only. A host that wants these rules
+  enforced MUST route every spend through a `PolicyAuthorizer` before signing.
+- **Only HINTED value is visible to the amount bounds** (§6.4). An un-hinted output is change and is
+  excluded from `SpendSummary::recipients`, so no limit here weighs it; §5.2's change-ownership check
+  bounds where such value may go (a puzzle hash under the same seed) but does not subject it to any
+  policy. A future tier-to-coin linkage and a composed, gate-enforcing send path are both tracked
+  separately; until they exist, the guarantees above are the whole of what this layer provides.
 
 ### 6.2 WalletOps + SpendAuthorizer seam + money-signer invariants
 
@@ -236,20 +259,21 @@ limit.
 `authorize_op(&SpendSummary, SpendOpClass) -> Result<()>` decides, in order:
 
 1. **Re-classify.** The tier is re-derived from the profile's own `CustodyPolicy` over
-   `native_total_mojos()`; a summary whose declared `tier` disagrees is `PolicyIndeterminate`. The tier a
-   summary carries MUST NOT be trusted as a permission.
+   `checked_native_total_mojos()`; a summary whose declared `tier` disagrees is `PolicyIndeterminate`.
+   The tier a summary carries MUST NOT be trusted as a permission.
 2. **Vault.** Every recipient MUST be the hot wallet's puzzle hash, else `PolicyDenied`; a recipient
    address that cannot be decoded is `PolicyIndeterminate`. A vault-tier spend then always returns
    `RequireAuth`.
-3. **Tier allow-list.** Only `SpendTier::AutoSend` may proceed. The permitted tier MUST be matched by
-   explicit equality, never reached by a fall-through arm, so a `SpendTier` variant added later is
-   refused rather than silently permitted.
+3. **One arm per tier.** Only `SpendTier::AutoSend` may proceed. Every tier MUST be decided by
+   exactly one arm of a wildcard-free match, so (a) a `SpendTier` variant added later is a compile error
+   rather than a variant inheriting some other tier's decision, and (b) no two guards can produce the
+   same outcome for one tier — which would leave the narrower rule pinned by nothing.
 4. **Global switch.** `AutoSendPolicy::enabled == false` implies `RequireAuth` for everything.
 5. **Op class.** `SpendOpClass::Undeclared` implies `PolicyIndeterminate` (the untyped `SpendAuthorizer`
    seam supplies `Undeclared`, so it can never auto-approve). A disabled class implies `RequireAuth`.
 6. **Boundable units.** Any recipient with an `asset_id` (a CAT) implies `PolicyIndeterminate`: its
    amount is not counted by `native_total_mojos()`, so no mojo limit can bound it.
-7. **Per-transaction limit.** `native_total_mojos()` (amounts PLUS fee) MUST be `<=`
+7. **Per-transaction limit.** The checked native total (amounts PLUS fee) MUST be `<=`
    `per_tx_limit_mojos`, else `RequireAuth`.
 8. **Rolling period cap.** The sum of approvals inside the last `period_seconds` plus this spend MUST be
    `<= period_cap_mojos`, else `RequireAuth`. An approval recorded at `t` MUST still count at
@@ -259,6 +283,13 @@ limit.
 
 `AutoSendPolicy::default()` MUST auto-approve nothing: global switch off, every op class disabled, every
 bound zero. A partially-loaded or empty persisted policy therefore refuses.
+
+**Amount arithmetic MUST be checked.** A native total that cannot be represented in a `u64` MUST yield
+`PolicyIndeterminate`; it MUST NOT wrap (`u64::MAX - 100` plus `1_000` wrapping to `899` would pass a
+small allowance while the spend moves an enormous amount) and MUST NOT panic (`from_coin_spends` and
+`classified` accept caller-supplied coin spends, and the crate is fail-closed by returning errors, §8).
+`SpendSummary::native_total_mojos()` SATURATES at `u64::MAX` so no caller can observe a wrapped figure;
+`checked_native_total_mojos()` is the form every custody decision MUST use.
 
 `SpendSummary` accounts for HINTED outputs plus the fee, so no bound here can see an un-hinted output.
 The complementary invariant — un-hinted value MUST NOT leave the wallet — is enforced by the money
@@ -270,9 +301,17 @@ A vault outflow is built as a `VaultMove`: the chia-wallet-sdk `ClawbackV2` prim
 the vault puzzle hash as sender, the hot-wallet puzzle hash as receiver, and an ABSOLUTE settlement
 timestamp of `now + clawback_seconds`. dig-account MUST NOT hand-roll the puzzle or the spend bundle.
 
+**`now` MUST come from the `Clock` seam, never from a caller-supplied timestamp.** The settlement
+condition is absolute, so a move planned against a stale `now` produces a coin whose window has ALREADY
+elapsed — vault funds reaching the hot wallet with no delay and nothing to reverse, while the funding
+spend still looks correct. `to_hot_wallet` MUST therefore refuse any move whose deadline is not strictly
+in the future (`settles_at_unix <= now`), stated over that class rather than over `clawback_seconds == 0`,
+and MUST refuse when the clock cannot be read (`PolicyIndeterminate`). A shorter window weakens the
+protection proportionally; `Vault::default()` is the canonical 24 hours, and no policy minimum is imposed.
+
 - `to_hot_wallet` is the ONLY constructor and takes no arbitrary destination, so a vault to third-party
-  move is not expressible. It MUST refuse a zero window, a zero amount, a hot wallet equal to the vault's
-  own puzzle hash, and a window that overflows the absolute timestamp.
+  move is not expressible. It MUST refuse a non-future deadline, a zero amount, a hot wallet equal to the
+  vault's own puzzle hash, and a window that overflows the absolute timestamp.
 - `funding_conditions` creates the time-locked coin (never a coin paying the hot wallet directly) and
   carries the receiver puzzle hash plus the clawback parameters as its memo.
 - `cancel` returns the funds to the vault and is valid only BEFORE settlement, for the vault key.

@@ -16,6 +16,16 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   `ClawbackV2` primitive, with cancel + settle paths and no third-party destination (#1504)
 - **wallet:** `Clock` seam so an unreadable clock refuses a spend instead of resetting the rolling cap
 
+### Fixes
+- **wallet:** `VaultMove::to_hot_wallet` sources `now` from the `Clock` seam and refuses any move
+  whose deadline is not strictly in the future. A caller-supplied `now_unix` allowed a full 24-hour
+  window to be planned against a stale clock, producing an immediately-settleable coin — vault funds
+  reaching the hot wallet with no delay and nothing to reverse
+- **wallet:** `SpendSummary` native-total arithmetic is checked. The unchecked sum could wrap
+  (`u64::MAX - 100` plus `1_000` reading as `899` mojos, inside a small allowance) and panicked in
+  debug builds on caller-supplied coin spends; `checked_native_total_mojos` refuses, and
+  `native_total_mojos` saturates instead of wrapping
+
 ### Additive API
 - `AccountError::RequireAuth`, `::PolicyDenied`, `::PolicyIndeterminate` — escalatable refusal,
   outright refusal, and could-not-evaluate kept distinct
