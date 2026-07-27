@@ -1,0 +1,623 @@
+//! [`VaultMove`] — the ONE way funds leave the vault: a time-locked, reversible move to the
+//! profile's own hot wallet (#1504).
+//!
+//! # Why the vault has exactly one exit
+//!
+//! An attacker who compromises a running wallet can, at worst, do what the wallet can do. If the
+//! vault could pay a third party, that would be "settle the user's savings somewhere unrecoverable,
+//! immediately". Because the vault's only outflow is a 24-hour clawback move to the user's OWN hot
+//! wallet, the worst an attacker can do is start a countdown the user can cancel — and only then
+//! face the hot wallet's own limits (#1505). The delay is not a speed bump on the theft; it is the
+//! window in which the theft is undone.
+//!
+//! That guarantee depends entirely on the settlement deadline being in the FUTURE. `ClawbackV2`
+//! curries `ASSERT_BEFORE_SECONDS_ABSOLUTE` into the sender's recover path and
+//! `ASSERT_SECONDS_ABSOLUTE` into the receiver's claim path, so a deadline already in the past does
+//! not merely settle early: the receiver — and, via push-through, anyone at all — can take the coin
+//! immediately, while the vault's own `cancel` asserts a before-time that has already elapsed and can
+//! therefore NEVER be satisfied. The cancel path is not weakened, it is destroyed. That is why the
+//! deadline is derived from a [`Clock`] and floored at [`MIN_CLAWBACK_SECONDS`] rather than trusted
+//! from a caller.
+//!
+//! Two separate mechanisms hold that property, and both are needed:
+//!
+//! 1. **Structurally, here.** [`VaultMove::to_hot_wallet`] is the only constructor and takes the hot
+//!    wallet's puzzle hash. There is no parameter for an arbitrary destination, so a vault →
+//!    third-party move is not something this type can express.
+//! 2. **At the gate.** [`PolicyAuthorizer`](crate::wallet::enforcer::PolicyAuthorizer) refuses any
+//!    vault-tier spend that pays anything but the hot wallet, catching a spend built by some other
+//!    route.
+//!
+//! # The puzzle is not ours
+//!
+//! The time lock is `chia-wallet-sdk`'s vetted [`ClawbackV2`] primitive — a `p2_1_of_n` over three
+//! merkle paths (sender-recovers-before, receiver-claims-after, anyone-pushes-through-after).
+//! dig-account constructs no puzzle and hand-rolls no spend bundle; it chooses the parameters and
+//! calls the driver.
+//!
+//! ## One SDK path is deliberately not exposed
+//!
+//! [`ClawbackV2::force_spend`] lets the SENDER push funds to the receiver BEFORE the window elapses.
+//! For a vault → hot move that is a bypass of the very delay this type exists to impose, so no
+//! wrapper for it is offered here. Only [`cancel`](VaultMove::cancel) (before the window, back to the
+//! vault) and [`settle`](VaultMove::settle) (after the window, to the hot wallet) are reachable.
+//!
+//! # This path is not yet reachable end to end — and MUST NOT be made reachable by loosening a check
+//!
+//! A real funding spend built from [`funding_conditions`](VaultMove::funding_conditions) pays the
+//! TIME-LOCKED coin, so [`PolicyAuthorizer`](crate::wallet::enforcer::PolicyAuthorizer) sees a
+//! recipient that is not the hot wallet and refuses it; a vault coin is not decodable by
+//! `dig-wallet-backend`'s `analyze` either. Both refusals are fail-closed and therefore correct as
+//! they stand. Making the flow work MUST be done by teaching the gate to recognise a clawback coin
+//! whose receiver is the hot wallet — NEVER by widening what counts as the hot wallet, which would
+//! reopen the vault → third-party path the gate exists to forbid.
+
+use chia_protocol::{Bytes32, Coin};
+use chia_wallet_sdk::driver::{ClawbackV2, SpendContext, SpendWithConditions};
+use chia_wallet_sdk::prelude::ToTreeHash;
+use chia_wallet_sdk::types::Conditions;
+
+use crate::error::{AccountError, Result};
+use crate::wallet::clock::Clock;
+use crate::wallet::policy::Vault;
+
+/// The shortest clawback window a vault move may use: 24 hours (#1504).
+///
+/// The window is the ONLY thing standing between a compromised wallet and settled funds, and it is
+/// worth exactly as much time as it actually gives the user to notice and cancel. A one-second window
+/// satisfies "the deadline is in the future" while offering no practical opportunity to react, so the
+/// floor is stated over the CLASS of too-short windows rather than over the single obvious value of
+/// zero. Longer windows are permitted; shorter ones are refused.
+pub const MIN_CLAWBACK_SECONDS: u64 = 24 * 60 * 60;
+
+/// A pending vault → hot-wallet move: the parameters of a time-locked coin the vault can reclaim
+/// until it settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VaultMove {
+    clawback: ClawbackV2,
+}
+
+impl VaultMove {
+    /// Plan a move of `amount_mojos` from the vault to the profile's own hot wallet, reversible for
+    /// `vault.clawback_seconds` from now.
+    ///
+    /// # Why the time comes from a [`Clock`] and not from the caller
+    ///
+    /// `ClawbackV2` enforces an ABSOLUTE settlement timestamp, so the whole protection is only worth
+    /// the "now" it was planned against. An earlier revision of this function took `now_unix: u64`
+    /// directly, which meant `to_hot_wallet(&Vault { clawback_seconds: 86_400 }, .., 0)` passed every
+    /// refusal and produced a coin settleable at 1970-01-02 — a 24-hour window that had already
+    /// elapsed, delivering vault funds to the hot wallet with no delay at all, while the funding
+    /// spend still looked correct. Sourcing the time from the same [`Clock`] seam the rest of the
+    /// crate uses makes "the deadline is in the future" hold by construction rather than by the
+    /// caller remembering to pass a real timestamp.
+    ///
+    /// # Refusals
+    ///
+    /// - **A window shorter than [`MIN_CLAWBACK_SECONDS`]**, which covers both a window that has
+    ///   already elapsed and one too short to react to. A zero-second window is only the most obvious
+    ///   member of that class; a one-second window is just as useless to the user, so the rule is
+    ///   stated over the class and not over the one value.
+    /// - A zero amount is not a move.
+    /// - A hot wallet at the SAME puzzle hash as the vault collapses the recover and claim paths onto
+    ///   one key, so cancelling and settling would be equally available to whoever holds it.
+    /// - A window that would overflow the absolute timestamp cannot be represented on chain.
+    /// - A clock that cannot be read yields [`PolicyIndeterminate`](AccountError::PolicyIndeterminate):
+    ///   without a trustworthy now there is no way to know whether the deadline is in the future.
+    ///
+    /// [`Vault::default`] is the canonical 24 hours, which is also the enforced floor; a user may
+    /// choose a LONGER window for more safety.
+    pub fn to_hot_wallet(
+        vault: &Vault,
+        vault_puzzle_hash: Bytes32,
+        hot_wallet_puzzle_hash: Bytes32,
+        amount_mojos: u64,
+        clock: &dyn Clock,
+    ) -> Result<Self> {
+        if amount_mojos == 0 {
+            return Err(AccountError::PolicyDenied(
+                "a vault move must move a non-zero amount".to_string(),
+            ));
+        }
+        if hot_wallet_puzzle_hash == vault_puzzle_hash {
+            return Err(AccountError::PolicyDenied(
+                "the hot wallet must be a different puzzle hash from the vault, or the cancel and \
+                 settle paths would be controlled by the same key"
+                    .to_string(),
+            ));
+        }
+
+        if vault.clawback_seconds < MIN_CLAWBACK_SECONDS {
+            return Err(AccountError::PolicyDenied(format!(
+                "a vault move needs at least a {MIN_CLAWBACK_SECONDS}s clawback window for the user \
+                 to notice and cancel it, but this one is {}s",
+                vault.clawback_seconds
+            )));
+        }
+
+        let now_unix = clock.now_unix()?;
+        let settles_at_unix = now_unix
+            .checked_add(vault.clawback_seconds)
+            .ok_or_else(|| {
+                AccountError::PolicyIndeterminate(
+                    "the clawback window overflows the absolute on-chain timestamp".to_string(),
+                )
+            })?;
+
+        Ok(Self {
+            clawback: ClawbackV2::new(
+                vault_puzzle_hash,
+                hot_wallet_puzzle_hash,
+                settles_at_unix,
+                amount_mojos,
+                // Hinted, so the hot wallet can discover the incoming coin by its own puzzle hash.
+                true,
+            ),
+        })
+    }
+
+    /// The puzzle hash of the time-locked coin this move creates.
+    pub fn puzzle_hash(&self) -> Bytes32 {
+        Bytes32::new(self.clawback.tree_hash().to_bytes())
+    }
+
+    /// The absolute UNIX second from which the move may settle — and until which it may be cancelled.
+    pub fn settles_at_unix(&self) -> u64 {
+        self.clawback.seconds
+    }
+
+    /// The amount, in mojos, the move carries.
+    pub fn amount_mojos(&self) -> u64 {
+        self.clawback.amount
+    }
+
+    /// The vault the funds return to if the move is cancelled.
+    pub fn vault_puzzle_hash(&self) -> Bytes32 {
+        self.clawback.sender_puzzle_hash
+    }
+
+    /// The hot wallet the funds reach once the move settles.
+    pub fn hot_wallet_puzzle_hash(&self) -> Bytes32 {
+        self.clawback.receiver_puzzle_hash
+    }
+
+    /// The conditions the VAULT coin's own spend must carry in order to create this move's coin.
+    ///
+    /// The memo carries the hot-wallet puzzle hash plus the clawback parameters, which is what makes
+    /// a pending move re-discoverable from the chain alone — see [`parse_pending`](Self::parse_pending).
+    pub fn funding_conditions(&self, ctx: &mut SpendContext) -> Result<Conditions> {
+        // The on-chain memo shape the SDK's `ClawbackV2::from_memo` reader expects: the receiver's
+        // puzzle hash followed by the clawback parameters, as a CLVM list.
+        let memos = ctx
+            .memos(&(
+                self.clawback.receiver_puzzle_hash,
+                (self.clawback.memo(), ()),
+            ))
+            .map_err(|e| {
+                AccountError::Spend(format!("cannot allocate the vault-move memo: {e:?}"))
+            })?;
+        Ok(Conditions::new().create_coin(self.puzzle_hash(), self.amount_mojos(), memos))
+    }
+
+    /// The coin this move creates, given the id of the vault coin that funds it.
+    pub fn coin(&self, funding_coin_id: Bytes32) -> Coin {
+        Coin::new(funding_coin_id, self.puzzle_hash(), self.amount_mojos())
+    }
+
+    /// CANCEL the move: return the funds to the vault. Valid only BEFORE
+    /// [`settles_at_unix`](Self::settles_at_unix), and only for the vault's own key.
+    ///
+    /// This is the user-facing "cancel pending move" action. `vault_layer` is the vault key's inner
+    /// spend layer; `extra` lets the caller attach a fee or other conditions to the same spend.
+    pub fn cancel<I>(
+        &self,
+        ctx: &mut SpendContext,
+        coin: Coin,
+        vault_layer: &I,
+        extra: Conditions,
+    ) -> Result<()>
+    where
+        I: SpendWithConditions,
+    {
+        self.clawback
+            .recover_coin_spend(ctx, coin, vault_layer, extra)
+            .map_err(|e| AccountError::Spend(format!("cannot build the vault-move cancel: {e:?}")))
+    }
+
+    /// SETTLE the move: deliver the funds to the hot wallet. Valid only AFTER
+    /// [`settles_at_unix`](Self::settles_at_unix), and only for the hot wallet's own key.
+    pub fn settle<I>(
+        &self,
+        ctx: &mut SpendContext,
+        coin: Coin,
+        hot_wallet_layer: &I,
+        extra: Conditions,
+    ) -> Result<()>
+    where
+        I: SpendWithConditions,
+    {
+        self.clawback
+            .finish_coin_spend(ctx, coin, hot_wallet_layer, extra)
+            .map_err(|e| {
+                AccountError::Spend(format!("cannot build the vault-move settlement: {e:?}"))
+            })
+    }
+
+    /// Recover a pending move from the memo of an observed coin, so the wallet can offer "cancel" on
+    /// a move it did not plan in this process.
+    ///
+    /// Returns `None` unless the memo reconstructs to EXACTLY `coin.puzzle_hash` — the memo is
+    /// untrusted chain data, and the puzzle hash is what the coin actually commits to, so agreement
+    /// between them is the only evidence that the parameters are the real ones.
+    pub fn parse_pending(
+        allocator: &clvmr::Allocator,
+        memo: clvmr::NodePtr,
+        coin: Coin,
+        hot_wallet_puzzle_hash: Bytes32,
+    ) -> Option<Self> {
+        ClawbackV2::from_memo(
+            allocator,
+            memo,
+            hot_wallet_puzzle_hash,
+            coin.amount,
+            true,
+            coin.puzzle_hash,
+        )
+        .map(|clawback| Self { clawback })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::clock::{FixedClock, UnreadableClock};
+    use chia_wallet_sdk::driver::StandardLayer;
+    use chia_wallet_sdk::prelude::ToClvm;
+    use chia_wallet_sdk::test::{expect_spend, Simulator};
+    use clvmr::Allocator;
+    use std::slice;
+
+    const VAULT_PH: Bytes32 = Bytes32::new([0x11; 32]);
+    const HOT_PH: Bytes32 = Bytes32::new([0x22; 32]);
+    /// A pinned "now" so the settlement timestamp — and the puzzle hash derived from it — is fixed.
+    const NOW: u64 = 1_800_000_000;
+
+    /// A clock reading the pinned present.
+    fn at_now() -> FixedClock {
+        FixedClock::new(NOW)
+    }
+
+    fn move_of(amount: u64) -> VaultMove {
+        VaultMove::to_hot_wallet(&Vault::default(), VAULT_PH, HOT_PH, amount, &at_now()).unwrap()
+    }
+
+    fn window(clawback_seconds: u64) -> Vault {
+        Vault { clawback_seconds }
+    }
+
+    /// The default vault window is 24 hours, and the on-chain condition is the ABSOLUTE second it
+    /// elapses — `now + 86400`, not a relative offset the chain would have to interpret.
+    #[test]
+    fn a_default_vault_move_settles_exactly_24_hours_after_it_is_planned() {
+        let planned = move_of(1_000);
+        assert_eq!(planned.settles_at_unix(), NOW + 24 * 60 * 60);
+        assert_eq!(planned.amount_mojos(), 1_000);
+        assert_eq!(planned.vault_puzzle_hash(), VAULT_PH);
+        assert_eq!(planned.hot_wallet_puzzle_hash(), HOT_PH);
+    }
+
+    /// GOLDEN: the time-locked coin's puzzle hash for fully pinned parameters. The window, the
+    /// amount, and both puzzle hashes are inputs to this hash, so a change to how the move is
+    /// constructed — a different primitive, an un-hinted coin, a relative instead of absolute
+    /// timestamp — changes it. A pending move already on chain can only ever be cancelled by
+    /// reproducing this exact puzzle, so the value is a compatibility contract, not a snapshot.
+    #[test]
+    fn the_time_locked_coin_puzzle_hash_is_a_pinned_golden() {
+        assert_eq!(
+            hex::encode(move_of(1_000).puzzle_hash()),
+            "1667a84d17199928961692f271826c5c7c28d559f0380e4ad0a91a2d4069de65"
+        );
+    }
+
+    #[test]
+    fn a_different_window_amount_or_destination_yields_a_different_locked_coin() {
+        let base = move_of(1_000).puzzle_hash();
+        assert_ne!(base, move_of(1_001).puzzle_hash());
+        assert_ne!(
+            base,
+            VaultMove::to_hot_wallet(
+                &Vault::default(),
+                VAULT_PH,
+                HOT_PH,
+                1_000,
+                &FixedClock::new(NOW + 1)
+            )
+            .unwrap()
+            .puzzle_hash()
+        );
+        assert_ne!(
+            base,
+            VaultMove::to_hot_wallet(
+                &window(MIN_CLAWBACK_SECONDS + 1),
+                VAULT_PH,
+                HOT_PH,
+                1_000,
+                &at_now()
+            )
+            .unwrap()
+            .puzzle_hash()
+        );
+        assert_ne!(
+            base,
+            VaultMove::to_hot_wallet(
+                &Vault::default(),
+                VAULT_PH,
+                Bytes32::new([0x33; 32]),
+                1_000,
+                &at_now()
+            )
+            .unwrap()
+            .puzzle_hash()
+        );
+    }
+
+    /// The clawback floor, pinned from BOTH sides: every window under [`MIN_CLAWBACK_SECONDS`] is
+    /// refused, exactly at the floor is allowed. A test that only checked zero would pass on the
+    /// original guard, which refused `0` and happily accepted a one-second window — the recorded
+    /// anti-pattern of a rule justified by one attacker value and bypassed by the one-off variant.
+    #[test]
+    fn every_window_shorter_than_the_floor_is_refused_and_exactly_the_floor_is_not() {
+        for too_short in [0, 1, 60, MIN_CLAWBACK_SECONDS - 1] {
+            let err =
+                VaultMove::to_hot_wallet(&window(too_short), VAULT_PH, HOT_PH, 1_000, &at_now())
+                    .unwrap_err();
+            assert!(
+                matches!(err, AccountError::PolicyDenied(_)),
+                "a {too_short}s window must be refused: {err}"
+            );
+        }
+
+        let planned = VaultMove::to_hot_wallet(
+            &window(MIN_CLAWBACK_SECONDS),
+            VAULT_PH,
+            HOT_PH,
+            1_000,
+            &at_now(),
+        )
+        .expect("exactly the floor is a valid window");
+        assert_eq!(planned.settles_at_unix(), NOW + MIN_CLAWBACK_SECONDS);
+    }
+
+    /// The floor is the window #1504 specifies, and the default vault sits exactly on it.
+    #[test]
+    fn the_floor_is_24_hours_and_the_default_vault_uses_it() {
+        assert_eq!(MIN_CLAWBACK_SECONDS, 24 * 60 * 60);
+        assert_eq!(Vault::default().clawback_seconds, MIN_CLAWBACK_SECONDS);
+    }
+
+    /// The regression that the caller-supplied `now_unix` parameter allowed: a full 24-hour window
+    /// planned against a stale clock produced a coin that was ALREADY settleable, so vault funds
+    /// reached the hot wallet with no delay and nothing to cancel. Every honest window is now
+    /// measured from a clock, and a clock stuck in the past cannot manufacture a past deadline
+    /// because the deadline is always `that same now` plus the window.
+    #[test]
+    fn a_planned_move_always_settles_after_the_clock_it_was_planned_against() {
+        for now in [0, 1, NOW, u64::MAX - MIN_CLAWBACK_SECONDS] {
+            let planned = VaultMove::to_hot_wallet(
+                &Vault::default(),
+                VAULT_PH,
+                HOT_PH,
+                1_000,
+                &FixedClock::new(now),
+            )
+            .unwrap();
+            assert!(
+                planned.settles_at_unix() > now,
+                "a move planned at {now} settles at {}",
+                planned.settles_at_unix()
+            );
+            assert_eq!(planned.settles_at_unix(), now + 24 * 60 * 60);
+        }
+    }
+
+    /// Without a trustworthy now there is no way to know whether the deadline is in the future, so the
+    /// move is refused rather than planned against a guess.
+    #[test]
+    fn a_move_cannot_be_planned_against_an_unreadable_clock() {
+        let err =
+            VaultMove::to_hot_wallet(&Vault::default(), VAULT_PH, HOT_PH, 1_000, &UnreadableClock)
+                .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+    }
+
+    #[test]
+    fn a_zero_amount_move_is_refused() {
+        let err = VaultMove::to_hot_wallet(&Vault::default(), VAULT_PH, HOT_PH, 0, &at_now())
+            .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyDenied(_)), "{err}");
+    }
+
+    /// A hot wallet at the vault's own puzzle hash would put the cancel path and the settle path
+    /// behind the SAME key, so whoever could settle could also cancel — the two-tier separation
+    /// would exist only on paper.
+    #[test]
+    fn a_hot_wallet_at_the_vaults_own_puzzle_hash_is_refused() {
+        let err = VaultMove::to_hot_wallet(&Vault::default(), VAULT_PH, VAULT_PH, 1_000, &at_now())
+            .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyDenied(_)), "{err}");
+    }
+
+    #[test]
+    fn a_window_that_overflows_the_absolute_timestamp_is_indeterminate() {
+        let err = VaultMove::to_hot_wallet(
+            &Vault::default(),
+            VAULT_PH,
+            HOT_PH,
+            1_000,
+            &FixedClock::new(u64::MAX - 5),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+    }
+
+    /// The funding spend pays the time-locked coin, not the hot wallet directly: the hot wallet's
+    /// puzzle hash must NOT appear as the created coin's target, or the funds would arrive
+    /// immediately and un-reversibly.
+    #[test]
+    fn the_funding_spend_pays_the_time_locked_coin_and_not_the_hot_wallet() {
+        let planned = move_of(1_000);
+        let mut ctx = SpendContext::new();
+        let conditions = planned.funding_conditions(&mut ctx).unwrap();
+
+        let created: Vec<_> = conditions
+            .into_iter()
+            .filter_map(|condition| condition.into_create_coin())
+            .collect();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].puzzle_hash, planned.puzzle_hash());
+        assert_eq!(created[0].amount, 1_000);
+        assert_ne!(
+            created[0].puzzle_hash, HOT_PH,
+            "the funds must land in the time lock, never straight in the hot wallet"
+        );
+    }
+
+    /// A pending move is re-discoverable from chain data, but ONLY when the memo reconstructs to the
+    /// coin's own puzzle hash. A memo claiming a different window (which would let an attacker
+    /// convince the wallet a move settles later, or is already settleable) does not reconstruct, and
+    /// is rejected.
+    #[test]
+    fn a_pending_move_parses_from_its_memo_only_when_it_matches_the_coins_puzzle_hash() {
+        let planned = move_of(1_000);
+        let coin = planned.coin(Bytes32::new([0x99; 32]));
+
+        let mut allocator = Allocator::new();
+        let honest = planned.clawback.memo().to_clvm(&mut allocator).unwrap();
+        assert_eq!(
+            VaultMove::parse_pending(&allocator, honest, coin, HOT_PH),
+            Some(planned)
+        );
+
+        let lying = ClawbackV2::new(
+            VAULT_PH,
+            HOT_PH,
+            NOW + MIN_CLAWBACK_SECONDS + 1,
+            1_000,
+            true,
+        )
+        .memo()
+        .to_clvm(&mut allocator)
+        .unwrap();
+        assert_eq!(
+            VaultMove::parse_pending(&allocator, lying, coin, HOT_PH),
+            None,
+            "a memo that does not reconstruct the coin's puzzle hash proves nothing"
+        );
+    }
+
+    /// A simulated chain starts its clock at the epoch, so the epoch IS the honest "now" for a move
+    /// planned against it, and the deadline is still a full window in. This is NOT the stale-clock
+    /// hazard the constructor guards against — do not copy this clock into a test against a real chain.
+    fn simulated_chain_genesis_clock() -> FixedClock {
+        FixedClock::new(0)
+    }
+
+    /// On-chain semantics, in the simulator: the VAULT can cancel BEFORE the window elapses and
+    /// CANNOT once it has. Both halves are asserted, because a lock that never expires and a lock
+    /// that never binds both pass a one-sided test.
+    #[test]
+    fn the_vault_can_cancel_before_the_window_elapses_and_not_after() {
+        for elapsed in [false, true] {
+            let mut sim = Simulator::new();
+            let mut ctx = SpendContext::new();
+            // Planned at the simulated chain's genesis, so the absolute deadline is exactly one
+            // full clawback window in.
+            let window_ends_at = MIN_CLAWBACK_SECONDS;
+            if elapsed {
+                sim.set_next_timestamp(window_ends_at).unwrap();
+            }
+
+            let vault = sim.bls(1);
+            let vault_layer = StandardLayer::new(vault.pk);
+            let hot = sim.bls(0);
+
+            // Planned against a clock at the epoch, so the absolute deadline equals the window and
+            // stays in the simulator's own timestamp range.
+            let planned = VaultMove::to_hot_wallet(
+                &window(window_ends_at),
+                vault.puzzle_hash,
+                hot.puzzle_hash,
+                1,
+                &simulated_chain_genesis_clock(),
+            )
+            .unwrap();
+            assert_eq!(planned.settles_at_unix(), window_ends_at);
+
+            let funding = planned.funding_conditions(&mut ctx).unwrap();
+            vault_layer.spend(&mut ctx, vault.coin, funding).unwrap();
+            let locked = planned.coin(vault.coin.coin_id());
+            sim.spend_coins(ctx.take(), slice::from_ref(&vault.sk))
+                .unwrap();
+
+            planned
+                .cancel(&mut ctx, locked, &vault_layer, Conditions::new())
+                .unwrap();
+            expect_spend(sim.spend_coins(ctx.take(), &[vault.sk]), !elapsed);
+
+            if !elapsed {
+                let returned = Coin::new(locked.coin_id(), vault.puzzle_hash, 1);
+                assert!(
+                    sim.coin_state(returned.coin_id()).is_some(),
+                    "cancelling must return the funds to the vault"
+                );
+            }
+        }
+    }
+
+    /// The mirror image: the HOT wallet can settle only AFTER the window, never before.
+    #[test]
+    fn the_hot_wallet_can_settle_after_the_window_elapses_and_not_before() {
+        for elapsed in [false, true] {
+            let mut sim = Simulator::new();
+            let mut ctx = SpendContext::new();
+            let window_ends_at = MIN_CLAWBACK_SECONDS;
+
+            let vault = sim.bls(1);
+            let vault_layer = StandardLayer::new(vault.pk);
+            let hot = sim.bls(0);
+            let hot_layer = StandardLayer::new(hot.pk);
+
+            let planned = VaultMove::to_hot_wallet(
+                &window(window_ends_at),
+                vault.puzzle_hash,
+                hot.puzzle_hash,
+                1,
+                &simulated_chain_genesis_clock(),
+            )
+            .unwrap();
+
+            let funding = planned.funding_conditions(&mut ctx).unwrap();
+            vault_layer.spend(&mut ctx, vault.coin, funding).unwrap();
+            let locked = planned.coin(vault.coin.coin_id());
+            sim.spend_coins(ctx.take(), slice::from_ref(&vault.sk))
+                .unwrap();
+
+            if elapsed {
+                sim.set_next_timestamp(window_ends_at).unwrap();
+            }
+
+            planned
+                .settle(&mut ctx, locked, &hot_layer, Conditions::new())
+                .unwrap();
+            expect_spend(sim.spend_coins(ctx.take(), &[hot.sk]), elapsed);
+
+            if elapsed {
+                let delivered = Coin::new(locked.coin_id(), hot.puzzle_hash, 1);
+                assert!(
+                    sim.coin_state(delivered.coin_id()).is_some(),
+                    "settling must deliver the funds to the hot wallet"
+                );
+            }
+        }
+    }
+}
