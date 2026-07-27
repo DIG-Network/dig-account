@@ -1,8 +1,11 @@
 //! Two-tier custody policy types: a cold [`Vault`] with a clawback window vs a warm [`HotWallet`]
 //! with an auto-send allowance.
 //!
-//! Phase 1 defines the shape of the policy; the enforcement (wiring these into the
-//! [`SpendAuthorizer`](super::authorizer::SpendAuthorizer)) lands in Phase 2.
+//! These types describe the tiers; they decide nothing. Classification lives in
+//! [`SpendTier::classify`](super::summary::SpendTier::classify) and ENFORCEMENT in
+//! [`PolicyAuthorizer`](super::enforcer::PolicyAuthorizer), which refuses every vault spend outright
+//! and bounds hot-wallet auto-sends. The one route out of the vault is a
+//! [`VaultMove`](super::vault_move::VaultMove).
 
 /// A cold, high-value custody tier: spends are clawback-protected for a delay window before they
 /// settle, so an unauthorized spend can be reversed within `clawback_seconds`.

@@ -11,6 +11,12 @@ This crate owns the object model, unlock policy + keystore crypto, the in-proces
 signer, per-profile key/DEK derivation, the DID+dig-store mint, and all wallet ops. It never draws
 UI — the host harness (dig-app) injects a UI/auth provider that this crate calls back through.
 
+Spends are gated before they are signed. `PolicyAuthorizer` enforces the two-tier custody
+policy and the user's auto-send policy: a vault spend always requires a full authorization ceremony
+and may only ever pay the profile's own hot wallet (via `VaultMove`, a 24-hour clawback the user can
+cancel); a hot-wallet spend auto-signs only within its op class, its per-transaction limit, and a
+rolling period cap. Every default refuses.
+
 See [`SPEC.md`](./SPEC.md) for the normative contract. Consumed by `dig-app`.
 
 ## License
