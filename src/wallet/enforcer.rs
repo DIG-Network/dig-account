@@ -176,7 +176,8 @@ impl PolicyAuthorizer {
     ///   vault-escalation rule was pinned by no test at all. One arm per tier makes that mutant a
     ///   compile error rather than a silent equivalence.
     pub fn authorize_op(&self, summary: &SpendSummary, op_class: SpendOpClass) -> Result<()> {
-        match self.reclassify(summary)? {
+        let (tier, native_total_mojos) = self.reclassify(summary)?;
+        match tier {
             SpendTier::Vault => {
                 self.reject_vault_outflow_to_anyone_but_the_hot_wallet(summary)?;
                 Err(AccountError::RequireAuth(
@@ -188,22 +189,32 @@ impl PolicyAuthorizer {
                 "a spend over this profile's auto-send allowance requires explicit confirmation"
                     .to_string(),
             )),
-            SpendTier::AutoSend => self.check_auto_send(summary, op_class),
+            SpendTier::AutoSend => self.check_auto_send(summary, op_class, native_total_mojos),
         }
     }
 
     /// Re-derive the spend's tier from the profile's OWN custody policy and require the summary to
-    /// agree.
+    /// agree, returning the tier ALONGSIDE the total it was derived from.
     ///
     /// The tier on a [`SpendSummary`] is only as trustworthy as whoever built it. Re-classifying
     /// here means a summary hand-labelled `AutoSend` for a spend this profile's policy would tier
     /// `Confirm` (or `Vault`) is refused — it cannot borrow a permission by asserting one. A
     /// disagreement is INDETERMINATE rather than denied: the two sides used different policies, so
     /// the correct answer is unknown, and confirming it away would hide the misconfiguration.
-    fn reclassify(&self, summary: &SpendSummary) -> Result<SpendTier> {
-        // Checked, not saturating: a spend whose native total cannot be summed must be refused for
-        // that reason, not clamped to `u64::MAX` and then tiered as though the clamp were its value.
-        let derived = SpendTier::classify(&self.custody, summary.checked_native_total_mojos()?);
+    ///
+    /// # Why the total is returned rather than recomputed downstream
+    ///
+    /// This is the ONE place the native total is computed for a custody decision, and it is computed
+    /// CHECKED — a spend whose amounts cannot be summed is refused for that reason rather than clamped
+    /// to `u64::MAX` and then tiered as though the clamp were its value. Handing the figure onward
+    /// means no later step can quietly recompute it a different way. When the per-transaction check
+    /// summed it a second time, the two computations could disagree while every test stayed green,
+    /// because this check refuses an unsummable spend first and the second one was therefore
+    /// unreachable — a guard that cannot be reached cannot be tested, so the honest fix is to not have
+    /// it rather than to pretend it is verified.
+    fn reclassify(&self, summary: &SpendSummary) -> Result<(SpendTier, u64)> {
+        let native_total_mojos = summary.checked_native_total_mojos()?;
+        let derived = SpendTier::classify(&self.custody, native_total_mojos);
         if derived != summary.tier {
             return Err(AccountError::PolicyIndeterminate(format!(
                 "the summary declares the {:?} tier but this profile's custody policy classifies \
@@ -211,7 +222,7 @@ impl PolicyAuthorizer {
                 summary.tier
             )));
         }
-        Ok(derived)
+        Ok((derived, native_total_mojos))
     }
 
     /// A vault outflow may pay ONE destination: the profile's own hot wallet (#1504).
@@ -249,7 +260,16 @@ impl PolicyAuthorizer {
     }
 
     /// Evaluate the auto-send policy for an [`AutoSend`](SpendTier::AutoSend)-tier spend.
-    fn check_auto_send(&self, summary: &SpendSummary, op_class: SpendOpClass) -> Result<()> {
+    ///
+    /// `native_total_mojos` is the checked total [`reclassify`](Self::reclassify) already derived, not
+    /// a fresh sum: the value a limit is compared against MUST be the same value the tier was decided
+    /// from, or the two could disagree.
+    fn check_auto_send(
+        &self,
+        summary: &SpendSummary,
+        op_class: SpendOpClass,
+        native_total_mojos: u64,
+    ) -> Result<()> {
         if !self.auto_send.enabled {
             return Err(AccountError::RequireAuth(
                 "auto-send is switched off for this account".to_string(),
@@ -265,15 +285,15 @@ impl PolicyAuthorizer {
 
         self.reject_amounts_no_mojo_limit_can_bound(summary)?;
 
-        let total = summary.checked_native_total_mojos()?;
-        if total > limits.per_tx_limit_mojos {
+        if native_total_mojos > limits.per_tx_limit_mojos {
             return Err(AccountError::RequireAuth(format!(
-                "{total} mojos exceeds the {} mojo per-transaction auto-send limit for {op_class:?}",
+                "{native_total_mojos} mojos exceeds the {} mojo per-transaction auto-send limit for \
+                 {op_class:?}",
                 limits.per_tx_limit_mojos
             )));
         }
 
-        self.charge_the_rolling_period_cap(total)
+        self.charge_the_rolling_period_cap(native_total_mojos)
     }
 
     /// Refuse any spend whose value is denominated in units the configured limits cannot bound.
@@ -1148,6 +1168,50 @@ mod tests {
             err.to_string().contains("overflow"),
             "the refusal must name the overflow, not a tier disagreement: {err}"
         );
+    }
+
+    /// The custody decision MUST use the CHECKED total, and this is the fixture that can tell.
+    ///
+    /// The earlier overflow tests declare `AutoSend`, which makes them blind to the choice: with the
+    /// saturating accessor the total clamps to `u64::MAX`, the policy classifies that `Confirm`, the
+    /// declared tier disagrees, and the TIER-MISMATCH branch returns `PolicyIndeterminate` — the very
+    /// outcome those tests assert. Both call sites could be reverted to the saturating form and nothing
+    /// went red.
+    ///
+    /// Declaring `Confirm` removes the mismatch, so the two computations diverge observably:
+    ///
+    /// - saturating: total clamps to `u64::MAX`, classifies `Confirm`, agrees with the declared tier,
+    ///   and the `Confirm` arm returns `RequireAuth` — an escalatable refusal for a spend whose value
+    ///   is not even computable.
+    /// - checked: the sum fails first, so the answer is `PolicyIndeterminate`.
+    ///
+    /// A `RequireAuth` here would mean the gate had formed an opinion about a figure it never had.
+    #[test]
+    fn an_unsummable_total_is_indeterminate_and_not_merely_escalated_to_a_confirmation() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let overflowing = SpendSummary::new(
+            SpendTier::Confirm,
+            vec![
+                xch(&third_party_address(), u64::MAX - 100),
+                xch(&third_party_address(), 1_000),
+            ],
+            0,
+        );
+        // The saturating reading of this summary agrees with the declared tier, so the tier-mismatch
+        // guard cannot fire and this test sees only the arithmetic.
+        assert_eq!(
+            SpendTier::classify(&hot_custody(), overflowing.native_total_mojos()),
+            SpendTier::Confirm,
+        );
+
+        let err = gate
+            .authorize_op(&overflowing, SpendOpClass::Tip)
+            .unwrap_err();
+        assert!(
+            matches!(err, AccountError::PolicyIndeterminate(_)),
+            "an uncomputable total must be indeterminate, not escalated: {err}"
+        );
+        assert!(err.to_string().contains("overflow"), "{err}");
     }
 
     /// The fee is part of the same sum, so it overflows the same way and must refuse the same way.

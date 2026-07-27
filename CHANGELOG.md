@@ -33,6 +33,10 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   per-transaction limit
 - **wallet:** zero-value approvals are no longer recorded, so repeated no-value requests cannot grow
   the ledger without bound
+- **wallet:** the native total is computed ONCE, checked, and handed to the per-transaction check
+  instead of being summed a second time. The second computation was unreachable (the first refuses an
+  unsummable spend), so no test could pin it — both call sites could be reverted to the saturating
+  accessor with the suite green
 
 ### Breaking-by-omission (pre-adoption, no released consumer)
 - **wallet:** `SpendOpClass` no longer derives `Serialize`/`Deserialize`. The intent model depends on
