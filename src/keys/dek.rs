@@ -33,9 +33,22 @@ mod tests {
     ///
     /// The HKDF construction is unchanged; its INPUT scalar moved, because the account root is now
     /// the BIP-39-EXPANDED seed rather than the raw entropy. That is a §5.1-class change to a
-    /// stored-secret derivation and was only permissible because the exposed population was zero (no
-    /// deployed account store, money path unmerged). It MUST NOT happen a second time: any future
-    /// change to this value needs an explicit migration, not a re-pin.
+    /// stored-secret derivation, and the reason it was permissible is narrower than "nobody had an
+    /// account" — **accounts DO exist in the field.** The published dig-session 0.4 / dig-account 0.1
+    /// line auto-enrolled an account at first boot with no user action, and such blobs have been
+    /// verified on real hosts.
+    ///
+    /// What is actually absent is any sealed ARTIFACT keyed by the old derivation: no sealed profile
+    /// blobs, no wallet store, no funded account (the money path is unmerged). So nothing that was
+    /// *encrypted* under the old DEK became unreadable, which is the only thing re-pinning a DEK can
+    /// break. That — not an empty population — is why this was a re-pin rather than a migration.
+    ///
+    /// It MUST NOT happen a second time: any future change to this value needs an explicit migration,
+    /// not a re-pin. And note the corollary, which is a real obligation on this crate's consumers —
+    /// an existing legacy account is WEDGED (`SessionError::LegacySeedFormat` on unlock,
+    /// `AlreadyExists` on re-enrolment at the same key), so adopting this version REQUIRES a
+    /// legacy-detection-and-re-enrolment path that PRESERVES the old sealed blob. See `SPEC.md` §10
+    /// and dig-session's `LegacySeedFormat` docs.
     const GOLDEN_DEK0: [u8; 32] =
         hex_literal_dek("55d71eb769eae86ae13467e03e3735c17f21c59885f2daf5438fdad3aa010f5c");
 

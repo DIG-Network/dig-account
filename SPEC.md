@@ -433,11 +433,37 @@ in CI.
 
 **The one break that happened, and must not happen again.** In 0.2.0 the account root changed from a raw
 seed to BIP-39 entropy expanded per §2.0. The HKDF/DEK construction itself is unchanged, but its input
-scalar moved, so the frozen profile-DEK golden vector was RE-PINNED rather than migrated. That was
-permissible solely because the exposed population was zero — no deployed account store, no funded
-account, the money path unmerged — and because the alternative was shipping a recovery phrase that
-silently resolves to the wrong account in every other wallet. Any FURTHER change to a stored-secret
-derivation requires a migration path, not a re-pin.
+scalar moved, so the frozen profile-DEK golden vector was RE-PINNED rather than migrated.
+
+The reason that was permissible is narrower than "nobody had an account", and the difference matters
+because the next such decision will be measured against it:
+
+- **Legacy accounts DO exist in the field.** The published dig-session 0.4 / dig-account 0.1 line
+  auto-enrolled an account at first boot with **no user action**, and such blobs have been verified on
+  real hosts. Any claim that the exposed population is zero is FALSE and MUST NOT be relied on.
+- **What is absent is any sealed ARTIFACT keyed by the old derivation:** no sealed profile blobs, no
+  wallet store, no funded account (money path unmerged). Nothing *encrypted* under the old DEK became
+  unreadable — which is the only thing re-pinning a DEK can break — and nothing on chain moved.
+- The alternative was shipping a recovery phrase that silently resolves to the wrong account in every
+  other Chia wallet, which is strictly worse.
+
+Any FURTHER change to a stored-secret derivation requires a migration path, not a re-pin.
+
+**Adopting 0.2.0 REQUIRES a legacy-detection-and-re-enrolment path in the host (normative).** An
+existing legacy account is WEDGED, not merely unreadable: `AccountSession::unlock` surfaces
+dig-session's `LegacySeedFormat` and never yields an `UnlockedAccount`, and
+`enroll` / `enroll_from_recovery_phrase` at the same `AccountId` return `AlreadyExists` because
+enrolment refuses to overwrite a custody root. No pre-0.2 release exposed `recovery_phrase()`, so the
+user was never shown 24 words either. A host MUST therefore:
+
+1. detect that specific error — a catch-all log line leaves the account permanently and silently
+   without a signer;
+2. **preserve** the old sealed blob rather than deleting it. It is password-sealed, its password may
+   live in an OS credential store neither crate can read, and a balance cannot be ruled out —
+   deleting it can destroy the only copy of a funded key;
+3. surface the situation in the UI, stating that the account must be re-created and that the preserved
+   file is the only copy of the old key;
+4. re-enrol and show the new recovery phrase.
 
 Conformance for §2.0 and the phrase API MUST prove, using TWO accounts with unrelated entropy:
 

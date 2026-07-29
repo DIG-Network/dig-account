@@ -33,6 +33,13 @@ other conforming wallet — and a phrase exported from Sage restores here.
 - `AccountSession::enroll_from_recovery_phrase(...)` — the restore-on-a-new-machine counterpart.
   Fail-closed on an existing account and on an invalid phrase.
 
+**Adopting 0.2.0 requires a legacy-account path.** Accounts enrolled by the 0.1 line hold a
+pre-envelope sealed seed and are **wedged**: unlock surfaces `LegacySeedFormat` and never yields an
+`UnlockedAccount`, and re-enrolling at the same `AccountId` returns `AlreadyExists`. A host must detect
+that specific error, **preserve** (never delete) the old sealed blob — it may hold value and its
+password may live in an OS credential store — surface it in the UI, then re-enrol and show the new
+phrase. `SPEC.md` §10 states the obligation.
+
 See [`SPEC.md`](./SPEC.md) for the normative contract. Consumed by `dig-app`.
 
 ## License
