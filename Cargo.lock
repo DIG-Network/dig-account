@@ -1186,6 +1186,8 @@ dependencies = [
 [[package]]
 name = "dig-session"
 version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecb21cf421c5f2b1d6e43b35592f71767c72526b4ccf5e7552352c0162ed4ded"
 dependencies = [
  "bip39",
  "dig-constants 0.7.0",
