@@ -25,6 +25,17 @@ Out of scope: chain I/O / broadcast, DID resolution transport, and the concrete 
 
 ## 2. Object model
 
+### 2.0 The account root is BIP-39 entropy (normative)
+
+An account's root secret is **32 bytes of BIP-39 entropy** — exactly what a 24-word English mnemonic
+encodes. Before ANY key derivation it MUST be expanded to the 64-byte HD seed the standard Chia way
+(`entropy -> mnemonic -> to_seed("")`, empty passphrase), which `dig-session` performs; dig-account
+consumes the already-expanded seed via `UnlockedMasterSeed::master_seed()` and MUST NOT re-derive or
+feed entropy to `SecretKey::from_seed` itself. This is what makes the 24 words a user backs up restore
+to the same addresses in Sage and every other conforming wallet (dig_ecosystem #1759). The full
+contract, the versioned at-rest envelope, and the fail-closed legacy rule live in `dig-session`
+`SPEC.md` §3.3.0/§3.4.
+
 ### 2.1 Account (master seed + profiles; exactly-one-default invariant)
 
 An `Account` is one `AccountId` + one-or-more `Profile`s + a `default_profile_ix`. Construction
@@ -110,8 +121,16 @@ inside the `UnlockedAccount` returned by a successful unlock/enrol.
   collect `AuthFactors` via the injected `provider` (§7) → run `policy.authorize` (fail-closed on
   refusal, before any keystore work) → keystore unlock. Any failure yields an `AccountError` and NO key
   material.
-- `AccountSession::enroll(store, id, password, seed, default_ix) -> UnlockedAccount` is the public
-  create-and-unlock path; it never returns a raw seed.
+- `AccountSession::enroll(store, id, password, entropy, default_ix) -> UnlockedAccount` is the public
+  create-and-unlock path; `entropy` is 32 bytes of BIP-39 entropy (§2.0) and it never returns a raw seed.
+- `AccountSession::enroll_from_recovery_phrase(store, id, password, phrase, default_ix) -> UnlockedAccount`
+  is the public RESTORE path. It MUST be fail-closed on an already-enrolled account (never clobbering a
+  live custody root) and on an invalid phrase, producing no key material in either case. Restoring the
+  phrase reported by `UnlockedAccount::recovery_phrase` MUST reproduce the identical account: same
+  wallet addresses, same identity keys, same per-profile DEKs.
+- `UnlockedAccount::recovery_phrase(&self) -> Zeroizing<String>` — the 24 words. It MUST take `&self`:
+  showing a user their backup MUST NOT consume or relock the account. This is the ONE secret the public
+  API deliberately exposes, because a backup the user cannot see is not a backup; it MUST NOT be logged.
 - `UnlockedAccount` holds the seed behind `Arc<UnlockedMasterSeed>` whose `Debug` redacts and whose drop
   zeroizes. It hands out capability handles (`ProfileSigner`, `WalletOps`) and DEKs derived from the
   seed; `master_seed()` is `pub(crate)`. `lock(self)` relocks immediately by dropping the handle.
@@ -389,7 +408,8 @@ the policy/crypto evaluation stays in-crate (§4.2).
   `WalletOps::wallet_key` are `pub(crate)`; the public surface exposes only public identifiers. Signing
   flows only through the in-crate `MoneySigner` seam.
 - No public getter, `Debug`, `Serialize`, error `Display`, or panic message exposes a seed or a derived
-  private key. (The per-profile DEK is intentionally returned to the consumer for at-rest decryption;
+  private key. The single, deliberate exception is `UnlockedAccount::recovery_phrase`, whose whole
+  purpose is to let the user back the account up; it returns `Zeroizing<String>` and MUST NOT be logged. (The per-profile DEK is intentionally returned to the consumer for at-rest decryption;
   zeroizing the returned DEK buffer is a tracked follow-up.)
 - Every unlock/auth/custody decision is fail-closed: ambiguity resolves to an error, never a silent
   success.
@@ -410,6 +430,23 @@ MUST read every older sealed blob and derive every key byte-identically. Changes
 methods/fields/indices), never a redefinition of an existing derivation or format. A break, if ever
 unavoidable, is a major, explicitly-versioned, migrating event. Golden vectors (§3.2, §3.3) enforce this
 in CI.
+
+**The one break that happened, and must not happen again.** In 0.2.0 the account root changed from a raw
+seed to BIP-39 entropy expanded per §2.0. The HKDF/DEK construction itself is unchanged, but its input
+scalar moved, so the frozen profile-DEK golden vector was RE-PINNED rather than migrated. That was
+permissible solely because the exposed population was zero — no deployed account store, no funded
+account, the money path unmerged — and because the alternative was shipping a recovery phrase that
+silently resolves to the wrong account in every other wallet. Any FURTHER change to a stored-secret
+derivation requires a migration path, not a re-pin.
+
+Conformance for §2.0 and the phrase API MUST prove, using TWO accounts with unrelated entropy:
+
+- Each account sits at the **hardcoded literal** bech32m address a standard Chia wallet derives from its
+  phrase (produced independently via `chia-wallet-sdk`; both sides MUST NOT be computed live).
+- Each account's reported phrase restores THAT account's address and DEK, not another's. A
+  single-account round-trip is insufficient: an implementation that ignored the live root would return a
+  self-consistent phrase for the WRONG account and still pass.
+- `recovery_phrase()` does not consume or relock the account, and the account remains usable after.
 
 ## 11. Conformance (cross-references SYSTEM.md + docs.dig.net)
 
