@@ -18,18 +18,39 @@ pub fn profile_dek(seed: &UnlockedMasterSeed, ix: ProfileIx) -> [u8; 32] {
 mod tests {
     use super::*;
     use dig_keystore::{BackendKey, MemoryBackend};
-    use dig_session::{Password, Session, SEED_LEN};
+    use dig_session::{Password, Session, ENTROPY_LEN};
     use std::sync::Arc;
 
-    const SEED: [u8; SEED_LEN] = [0x11; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0x11; ENTROPY_LEN];
 
-    /// The default-profile DEK for the all-`0x11` seed, pinned byte-for-byte. This freezes the
+    /// The default-profile DEK for the all-`0x11` **entropy**, pinned byte-for-byte. This freezes the
     /// at-rest KDF contract: `HKDF-SHA256(salt = DEK_SALT, ikm = IDENTITY_IKM_VERSION || scalar,
     /// info = PROFILE_DEK_LABEL)` as implemented by `dig-session`. If any of the frozen inputs
     /// (salt/ikm-version/label) ever changes, this vector breaks — which is exactly the §5.1
     /// back-compat guard, since a changed DEK makes every already-sealed profile blob unreadable.
+    ///
+    /// # This literal MOVED once, deliberately (dig_ecosystem #1759)
+    ///
+    /// The HKDF construction is unchanged; its INPUT scalar moved, because the account root is now
+    /// the BIP-39-EXPANDED seed rather than the raw entropy. That is a §5.1-class change to a
+    /// stored-secret derivation, and the reason it was permissible is narrower than "nobody had an
+    /// account" — **accounts DO exist in the field.** The published dig-session 0.4 / dig-account 0.1
+    /// line auto-enrolled an account at first boot with no user action, and such blobs have been
+    /// verified on real hosts.
+    ///
+    /// What is actually absent is any sealed ARTIFACT keyed by the old derivation: no sealed profile
+    /// blobs, no wallet store, no funded account (the money path is unmerged). So nothing that was
+    /// *encrypted* under the old DEK became unreadable, which is the only thing re-pinning a DEK can
+    /// break. That — not an empty population — is why this was a re-pin rather than a migration.
+    ///
+    /// It MUST NOT happen a second time: any future change to this value needs an explicit migration,
+    /// not a re-pin. And note the corollary, which is a real obligation on this crate's consumers —
+    /// an existing legacy account is WEDGED (`SessionError::LegacySeedFormat` on unlock,
+    /// `AlreadyExists` on re-enrolment at the same key), so adopting this version REQUIRES a
+    /// legacy-detection-and-re-enrolment path that PRESERVES the old sealed blob. See `SPEC.md` §10
+    /// and dig-session's `LegacySeedFormat` docs.
     const GOLDEN_DEK0: [u8; 32] =
-        hex_literal_dek("3285f67598f3a4671ea2226ca9ef990cabe5e7374cad5fe29b81ab7be8d7f543");
+        hex_literal_dek("55d71eb769eae86ae13467e03e3735c17f21c59885f2daf5438fdad3aa010f5c");
 
     /// Compile-time hex → 32-byte array (avoids a dev-dependency just for a fixture).
     const fn hex_literal_dek(s: &str) -> [u8; 32] {

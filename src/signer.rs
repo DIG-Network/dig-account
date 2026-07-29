@@ -75,9 +75,9 @@ impl SessionSigner for ProfileSigner {
 mod tests {
     use super::*;
     use dig_keystore::{BackendKey, MemoryBackend};
-    use dig_session::{Password, Session, SEED_LEN};
+    use dig_session::{Password, Session, ENTROPY_LEN};
 
-    const SEED: [u8; SEED_LEN] = [0x7E; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0x7E; ENTROPY_LEN];
 
     fn seed() -> Arc<UnlockedMasterSeed> {
         Arc::new(

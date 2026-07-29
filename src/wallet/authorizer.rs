@@ -100,9 +100,9 @@ impl WalletOps {
 mod tests {
     use super::*;
     use dig_keystore::{BackendKey, MemoryBackend};
-    use dig_session::{Password, Session, SEED_LEN};
+    use dig_session::{Password, Session, ENTROPY_LEN};
 
-    const SEED: [u8; SEED_LEN] = [0x33; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0x33; ENTROPY_LEN];
 
     fn seed() -> Arc<UnlockedMasterSeed> {
         Arc::new(

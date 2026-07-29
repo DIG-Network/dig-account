@@ -22,6 +22,24 @@ does not compose a send path: the money signer is reachable without the gate, an
 authorization to the coin spends that get signed. `SPEC.md` §6.1.1 states the obligations a host
 takes on, and exactly which of them this crate can and cannot check.
 
+## The recovery phrase
+
+An account root is 32 bytes of BIP-39 entropy, expanded to the 64-byte HD seed the standard Chia way
+before any key is derived. So the 24 words a user writes down restore the same addresses in Sage and any
+other conforming wallet — and a phrase exported from Sage restores here.
+
+- `UnlockedAccount::recovery_phrase()` — the 24 words, over `&self`, so showing a user their backup does
+  not cost them their session. This is the one secret the public API deliberately exposes; never log it.
+- `AccountSession::enroll_from_recovery_phrase(...)` — the restore-on-a-new-machine counterpart.
+  Fail-closed on an existing account and on an invalid phrase.
+
+**Adopting 0.2.0 requires a legacy-account path.** Accounts enrolled by the 0.1 line hold a
+pre-envelope sealed seed and are **wedged**: unlock surfaces `LegacySeedFormat` and never yields an
+`UnlockedAccount`, and re-enrolling at the same `AccountId` returns `AlreadyExists`. A host must detect
+that specific error, **preserve** (never delete) the old sealed blob — it may hold value and its
+password may live in an OS credential store — surface it in the UI, then re-enrol and show the new
+phrase. `SPEC.md` §10 states the obligation.
+
 See [`SPEC.md`](./SPEC.md) for the normative contract. Consumed by `dig-app`.
 
 ## License
