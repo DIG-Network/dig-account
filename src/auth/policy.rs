@@ -211,9 +211,9 @@ mod tests {
     use std::time::Instant;
 
     use dig_keystore::MemoryBackend;
-    use dig_session::{Password, SEED_LEN};
+    use dig_session::{Password, ENTROPY_LEN};
 
-    const SEED: [u8; SEED_LEN] = [0xC3; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0xC3; ENTROPY_LEN];
     const PW: &str = "correct horse battery staple";
 
     /// A manually-advanced clock: `now()` returns `base + advanced` millis.

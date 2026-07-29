@@ -13,7 +13,11 @@
 
 use std::sync::Arc;
 
-use dig_session::{BackendKey, KeychainBackend, Password, Session, UnlockedMasterSeed, SEED_LEN};
+#[cfg(test)]
+use dig_session::MASTER_SEED_LEN;
+use dig_session::{
+    BackendKey, KeychainBackend, Password, Session, UnlockedMasterSeed, ENTROPY_LEN,
+};
 
 use crate::id::AccountId;
 
@@ -84,7 +88,7 @@ impl AccountStore {
         &self,
         id: &AccountId,
         password: Password,
-        seed: &[u8; SEED_LEN],
+        entropy: &[u8; ENTROPY_LEN],
     ) -> Result<UnlockedMasterSeed> {
         if self.exists(id)? {
             return Err(AccountStoreError::AlreadyExists(id.clone()));
@@ -93,7 +97,29 @@ impl AccountStore {
             self.backend.clone(),
             Self::blob_key(id),
             password,
-            seed,
+            entropy,
+        )?)
+    }
+
+    /// Enrol `id` from an existing 24-word recovery `phrase` — the restore-on-a-new-machine path.
+    ///
+    /// Identical to [`enroll`](Self::enroll) except that the account root comes from the phrase, so
+    /// restoring reproduces the same wallet addresses, identity key and per-profile DEKs. Guarded by
+    /// the same fail-closed `AlreadyExists` check, so a restore can never overwrite a live account.
+    pub(crate) fn enroll_from_recovery_phrase(
+        &self,
+        id: &AccountId,
+        password: Password,
+        phrase: &str,
+    ) -> Result<UnlockedMasterSeed> {
+        if self.exists(id)? {
+            return Err(AccountStoreError::AlreadyExists(id.clone()));
+        }
+        Ok(Session::enroll_from_recovery_phrase(
+            self.backend.clone(),
+            Self::blob_key(id),
+            password,
+            phrase,
         )?)
     }
 
@@ -150,8 +176,17 @@ mod tests {
     use super::*;
     use dig_keystore::MemoryBackend;
 
-    const SEED_A: [u8; SEED_LEN] = [0xAA; SEED_LEN];
-    const SEED_B: [u8; SEED_LEN] = [0xBB; SEED_LEN];
+    const ENTROPY_A: [u8; ENTROPY_LEN] = [0xAA; ENTROPY_LEN];
+    const ENTROPY_B: [u8; ENTROPY_LEN] = [0xBB; ENTROPY_LEN];
+
+    /// Independently expand BIP-39 entropy into the 64-byte master HD seed, straight from `bip39`
+    /// rather than through dig-session, so a drift on either side is caught instead of cancelling
+    /// out (dig_ecosystem #1759).
+    fn expanded(entropy: &[u8; ENTROPY_LEN]) -> [u8; MASTER_SEED_LEN] {
+        bip39::Mnemonic::from_entropy_in(bip39::Language::English, entropy)
+            .expect("32 bytes is valid 24-word BIP-39 entropy")
+            .to_seed("")
+    }
     const PW: &str = "correct horse battery staple";
 
     fn store() -> AccountStore {
@@ -167,35 +202,39 @@ mod tests {
         let ks = store();
         let acct = id("acct-1");
 
-        let enrolled = ks.enroll(&acct, Password::new(PW), &SEED_A).unwrap();
+        let enrolled = ks.enroll(&acct, Password::new(PW), &ENTROPY_A).unwrap();
         let enrolled_seed = *enrolled.master_seed();
         drop(enrolled); // lock
 
         let unlocked = ks.unlock(&acct, Password::new(PW)).unwrap();
         assert_eq!(*unlocked.master_seed(), enrolled_seed);
-        assert_eq!(*unlocked.master_seed(), SEED_A);
+        // The exposed root is the EXPANDED BIP-39 seed, not the stored entropy. Asserting both legs
+        // is what distinguishes "expanded" from "stored verbatim" — the two are otherwise
+        // indistinguishable at this seam.
+        assert_eq!(*unlocked.master_seed(), expanded(&ENTROPY_A));
+        assert_ne!(unlocked.master_seed()[..ENTROPY_LEN], ENTROPY_A[..]);
     }
 
     #[test]
     fn enroll_refuses_to_clobber_an_existing_account() {
         let ks = store();
         let acct = id("acct-1");
-        ks.enroll(&acct, Password::new(PW), &SEED_A).unwrap();
+        ks.enroll(&acct, Password::new(PW), &ENTROPY_A).unwrap();
 
         // A second enrol under the same id must fail-closed — never overwrite the custody root.
-        let err = ks.enroll(&acct, Password::new(PW), &SEED_B).unwrap_err();
+        let err = ks.enroll(&acct, Password::new(PW), &ENTROPY_B).unwrap_err();
         assert!(matches!(err, AccountStoreError::AlreadyExists(_)));
 
         // And the original seed is intact.
         let unlocked = ks.unlock(&acct, Password::new(PW)).unwrap();
-        assert_eq!(*unlocked.master_seed(), SEED_A);
+        assert_eq!(*unlocked.master_seed(), expanded(&ENTROPY_A));
     }
 
     #[test]
     fn unlock_with_a_wrong_password_fails_closed() {
         let ks = store();
         let acct = id("acct-1");
-        ks.enroll(&acct, Password::new(PW), &SEED_A).unwrap();
+        ks.enroll(&acct, Password::new(PW), &ENTROPY_A).unwrap();
 
         assert!(matches!(
             ks.unlock(&acct, Password::new("wrong")),
@@ -222,8 +261,10 @@ mod tests {
         let ks = store();
         assert!(ks.list().unwrap().is_empty());
 
-        ks.enroll(&id("bravo"), Password::new(PW), &SEED_A).unwrap();
-        ks.enroll(&id("alpha"), Password::new(PW), &SEED_B).unwrap();
+        ks.enroll(&id("bravo"), Password::new(PW), &ENTROPY_A)
+            .unwrap();
+        ks.enroll(&id("alpha"), Password::new(PW), &ENTROPY_B)
+            .unwrap();
 
         assert_eq!(ks.list().unwrap(), vec![id("alpha"), id("bravo")]);
     }
@@ -231,8 +272,10 @@ mod tests {
     #[test]
     fn delete_removes_only_the_named_account() {
         let ks = store();
-        ks.enroll(&id("keep"), Password::new(PW), &SEED_A).unwrap();
-        ks.enroll(&id("drop"), Password::new(PW), &SEED_B).unwrap();
+        ks.enroll(&id("keep"), Password::new(PW), &ENTROPY_A)
+            .unwrap();
+        ks.enroll(&id("drop"), Password::new(PW), &ENTROPY_B)
+            .unwrap();
 
         ks.delete(&id("drop")).unwrap();
 

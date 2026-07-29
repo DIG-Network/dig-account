@@ -42,7 +42,7 @@ impl AccountSession {
 
     /// Enrol a NEW account and return it already unlocked.
     ///
-    /// Seals `seed` under `password` via `store` (fail-closed if the account already exists — never
+    /// Seals `entropy` — 32 bytes of BIP-39 entropy, the account root — under `password` via `store` (fail-closed if the account already exists — never
     /// clobbers an existing custody root) and returns a live [`UnlockedAccount`]. The raw master seed
     /// is never returned: it lives `pub(crate)` inside the handle. This is the public counterpart to
     /// [`AccountStore::enroll`](crate::store::AccountStore::enroll), which is `pub(crate)` precisely so
@@ -51,11 +51,37 @@ impl AccountSession {
         store: Arc<AccountStore>,
         account: AccountId,
         password: dig_session::Password,
-        seed: &[u8; dig_session::SEED_LEN],
+        entropy: &[u8; dig_session::ENTROPY_LEN],
         default_profile_ix: ProfileIx,
     ) -> Result<UnlockedAccount> {
         let seed = store
-            .enroll(&account, password, seed)
+            .enroll(&account, password, entropy)
+            .map_err(|why| AccountError::Keystore(why.to_string()))?;
+        Ok(UnlockedAccount::new(
+            account,
+            Arc::new(seed),
+            default_profile_ix,
+        ))
+    }
+
+    /// Restore an account from its 24-word recovery phrase and return it already unlocked.
+    ///
+    /// The counterpart to [`UnlockedAccount::recovery_phrase`]: the phrase shown at creation, typed
+    /// on a new machine, reproduces the SAME account — same wallet addresses, same identity key, same
+    /// per-profile DEKs. A phrase exported from any standard Chia wallet works too, because the
+    /// derivation is the standard one.
+    ///
+    /// Fail-closed on an existing account (never clobbers a live custody root) and on an invalid
+    /// phrase, in which case no key material is produced.
+    pub fn enroll_from_recovery_phrase(
+        store: Arc<AccountStore>,
+        account: AccountId,
+        password: dig_session::Password,
+        phrase: &str,
+        default_profile_ix: ProfileIx,
+    ) -> Result<UnlockedAccount> {
+        let seed = store
+            .enroll_from_recovery_phrase(&account, password, phrase)
             .map_err(|why| AccountError::Keystore(why.to_string()))?;
         Ok(UnlockedAccount::new(
             account,
@@ -111,9 +137,9 @@ mod tests {
     use crate::auth::provider::{SpendConfirmRequest, SpendDecision};
     use crate::auth::second_factor::SecondFactor;
     use dig_keystore::MemoryBackend;
-    use dig_session::{Password, SEED_LEN};
+    use dig_session::{Password, ENTROPY_LEN};
 
-    const SEED: [u8; SEED_LEN] = [0x9C; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0x9C; ENTROPY_LEN];
     const PW: &str = "correct horse battery staple";
 
     /// A provider that hands back a fixed set of factors — the harness seam under test.

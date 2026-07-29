@@ -1002,10 +1002,11 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-account"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bip39",
  "chia-bls 0.26.0",
  "chia-protocol",
  "chia-puzzle-types",
@@ -1183,10 +1184,9 @@ dependencies = [
 
 [[package]]
 name = "dig-session"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40faf7bcc2cad224200ee5eff2f716dd01fa8e0940f8b1e1dadb9e031cee7fe4"
+version = "0.5.0"
 dependencies = [
+ "bip39",
  "dig-constants 0.7.0",
  "dig-identity 0.5.0",
  "dig-keystore",

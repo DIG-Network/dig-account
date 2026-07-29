@@ -18,18 +18,26 @@ pub fn profile_dek(seed: &UnlockedMasterSeed, ix: ProfileIx) -> [u8; 32] {
 mod tests {
     use super::*;
     use dig_keystore::{BackendKey, MemoryBackend};
-    use dig_session::{Password, Session, SEED_LEN};
+    use dig_session::{Password, Session, ENTROPY_LEN};
     use std::sync::Arc;
 
-    const SEED: [u8; SEED_LEN] = [0x11; SEED_LEN];
+    const SEED: [u8; ENTROPY_LEN] = [0x11; ENTROPY_LEN];
 
-    /// The default-profile DEK for the all-`0x11` seed, pinned byte-for-byte. This freezes the
+    /// The default-profile DEK for the all-`0x11` **entropy**, pinned byte-for-byte. This freezes the
     /// at-rest KDF contract: `HKDF-SHA256(salt = DEK_SALT, ikm = IDENTITY_IKM_VERSION || scalar,
     /// info = PROFILE_DEK_LABEL)` as implemented by `dig-session`. If any of the frozen inputs
     /// (salt/ikm-version/label) ever changes, this vector breaks — which is exactly the §5.1
     /// back-compat guard, since a changed DEK makes every already-sealed profile blob unreadable.
+    ///
+    /// # This literal MOVED once, deliberately (dig_ecosystem #1759)
+    ///
+    /// The HKDF construction is unchanged; its INPUT scalar moved, because the account root is now
+    /// the BIP-39-EXPANDED seed rather than the raw entropy. That is a §5.1-class change to a
+    /// stored-secret derivation and was only permissible because the exposed population was zero (no
+    /// deployed account store, money path unmerged). It MUST NOT happen a second time: any future
+    /// change to this value needs an explicit migration, not a re-pin.
     const GOLDEN_DEK0: [u8; 32] =
-        hex_literal_dek("3285f67598f3a4671ea2226ca9ef990cabe5e7374cad5fe29b81ab7be8d7f543");
+        hex_literal_dek("55d71eb769eae86ae13467e03e3735c17f21c59885f2daf5438fdad3aa010f5c");
 
     /// Compile-time hex → 32-byte array (avoids a dev-dependency just for a fixture).
     const fn hex_literal_dek(s: &str) -> [u8; 32] {

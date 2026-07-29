@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use dig_session::{UnlockedMasterSeed, SEED_LEN};
+use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
 use zeroize::Zeroizing;
 
 use crate::id::{AccountId, ProfileIx};
@@ -75,10 +75,26 @@ impl UnlockedAccount {
         profile_dek(&self.seed, ix)
     }
 
-    /// The raw master seed. `pub(crate)` — it never leaves dig-account; the money-signer + key
-    /// derivation paths inside the crate are its only consumers.
+    /// The 24-word BIP-39 recovery phrase for this account.
+    ///
+    /// Takes `&self`: showing a user their phrase must not cost them their session, so the account
+    /// stays unlocked afterwards. This is the ONE secret the public API deliberately exposes — a
+    /// backup the user cannot see is not a backup — and it is the counterpart to
+    /// [`AccountSession::enroll_from_recovery_phrase`](crate::session::AccountSession::enroll_from_recovery_phrase).
+    ///
+    /// The phrase is the STANDARD Chia derivation, so it also restores in Sage and any other
+    /// conforming wallet. The returned `String` is `Zeroizing`; **never log it**.
+    pub fn recovery_phrase(&self) -> Zeroizing<String> {
+        self.seed.recovery_phrase()
+    }
+
+    /// The expanded 64-byte master HD seed. `pub(crate)` — it never leaves dig-account; the
+    /// money-signer + key derivation paths inside the crate are its only consumers.
+    ///
+    /// This is the BIP-39-EXPANDED seed, not the stored entropy, so every key derived from it lands
+    /// where a standard Chia wallet expects (dig_ecosystem #1759).
     #[allow(dead_code)] // Phase 2: consumed by the money-signer path (dig-wallet-backend LocalSigner).
-    pub(crate) fn master_seed(&self) -> Zeroizing<[u8; SEED_LEN]> {
+    pub(crate) fn master_seed(&self) -> Zeroizing<[u8; MASTER_SEED_LEN]> {
         self.seed.master_seed()
     }
 
@@ -95,9 +111,10 @@ mod tests {
     use crate::keys::dek::profile_dek;
     use dig_ipc_protocol::signer::SessionSigner;
     use dig_keystore::{BackendKey, MemoryBackend};
+    use dig_session::ENTROPY_LEN;
     use dig_session::{Password, Session};
 
-    const SEED: [u8; SEED_LEN] = [0x5A; SEED_LEN];
+    const ENTROPY: [u8; ENTROPY_LEN] = [0x5A; ENTROPY_LEN];
 
     fn unlocked(default_ix: ProfileIx) -> UnlockedAccount {
         let seed = Arc::new(
@@ -105,7 +122,7 @@ mod tests {
                 Arc::new(MemoryBackend::new()),
                 BackendKey::new("k".to_string()),
                 Password::new("pw"),
-                &SEED,
+                &ENTROPY,
             )
             .unwrap(),
         );
@@ -155,6 +172,73 @@ mod tests {
         let expected =
             crate::keys::wallet_key::WalletKey::from_seed_at(&acct.master_seed()[..], ProfileIx(2));
         assert_eq!(via_ops.secret_key(), expected.secret_key());
+    }
+
+    /// The canonical public BIP-39 test mnemonic (24 words of all-zero entropy) and the address a
+    /// STANDARD Chia wallet derives from it at wallet index 0. Both frozen literals, produced
+    /// independently via `chia-wallet-sdk` — never computed live on both sides, or a dependency bump
+    /// could move them together and mask a regression (dig_ecosystem #1759).
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon art";
+    const TEST_ADDRESS_0: &str = "xch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ysuax0gy";
+
+    /// A SECOND account with unrelated entropy. [`TEST_PHRASE`] is all-ZERO entropy, which makes it
+    /// blind to any property about WHICH account is in play: a bug that ignored the live root and
+    /// derived from zeros would look correct. Every "the right account" assertion below therefore uses
+    /// two accounts and a truthful control.
+    const OTHER_PHRASE: &str =
+        "fog spot notable regret pizza coffee harvest ensure fog spot notable regret          pizza coffee harvest ensure fog spot notable regret pizza coffee harvest equal";
+    const OTHER_ADDRESS_0: &str = "xch1vpxzuu6aqfu790qcrcppcr2gmju4f5tpuuznuv2lx3g79v2jxc7qxttpzt";
+
+    fn restore(phrase: &str, id: &str) -> UnlockedAccount {
+        crate::session::AccountSession::enroll_from_recovery_phrase(
+            Arc::new(crate::store::AccountStore::new(Arc::new(
+                dig_keystore::MemoryBackend::new(),
+            ))),
+            AccountId::new(id),
+            dig_session::Password::new("pw"),
+            phrase,
+            ProfileIx::ROOT,
+        )
+        .expect("a valid phrase must restore")
+    }
+
+    fn wallet_address(acct: &UnlockedAccount) -> String {
+        crate::keys::wallet_key::WalletKey::from_seed_at(&acct.master_seed()[..], ProfileIx::ROOT)
+            .address()
+            .expect("a derived wallet key always encodes to an address")
+    }
+
+    #[test]
+    fn account_sits_at_the_standard_chia_address_for_its_phrase() {
+        // The whole point of #1759: the phrase a user backs up resolves to the SAME address in Sage.
+        assert_eq!(wallet_address(&restore(TEST_PHRASE, "a")), TEST_ADDRESS_0);
+    }
+
+    #[test]
+    fn recovery_phrase_does_not_consume_the_account() {
+        // Showing a user their backup must not cost them their session.
+        let acct = restore(TEST_PHRASE, "a");
+        let first = acct.recovery_phrase();
+        assert_eq!(first.split_whitespace().count(), 24);
+        assert_eq!(&*first, &*acct.recovery_phrase());
+        // Still fully usable afterwards.
+        assert_eq!(wallet_address(&acct), TEST_ADDRESS_0);
+    }
+
+    #[test]
+    fn each_accounts_phrase_restores_that_account_and_not_another() {
+        // Two actors: a phrase that ignored the live root would be self-consistent yet belong to the
+        // WRONG account, and a single-account round-trip cannot see that.
+        let a = restore(TEST_PHRASE, "a");
+        let b = restore(OTHER_PHRASE, "b");
+        assert_ne!(&*a.recovery_phrase(), &*b.recovery_phrase());
+
+        for (acct, expected) in [(&a, TEST_ADDRESS_0), (&b, OTHER_ADDRESS_0)] {
+            assert_eq!(wallet_address(acct), expected);
+            let again = restore(&acct.recovery_phrase(), "restored");
+            assert_eq!(wallet_address(&again), expected);
+            assert_eq!(again.dek(ProfileIx::ROOT), acct.dek(ProfileIx::ROOT));
+        }
     }
 
     #[test]

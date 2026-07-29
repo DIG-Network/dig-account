@@ -42,7 +42,7 @@ impl ProfileMinter {
 mod tests {
     use super::*;
     use dig_keystore::{BackendKey, MemoryBackend};
-    use dig_session::{Password, Session, SEED_LEN};
+    use dig_session::{Password, Session, ENTROPY_LEN};
 
     fn seed() -> Arc<UnlockedMasterSeed> {
         Arc::new(
@@ -50,7 +50,7 @@ mod tests {
                 Arc::new(MemoryBackend::new()),
                 BackendKey::new("k".to_string()),
                 Password::new("pw"),
-                &[0x21; SEED_LEN],
+                &[0x21; ENTROPY_LEN],
             )
             .unwrap(),
         )
