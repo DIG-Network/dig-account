@@ -2,4 +2,5 @@
 //! deterministically derived from the account master seed at a profile index.
 
 pub mod dek;
+pub mod sealing;
 pub mod wallet_key;
