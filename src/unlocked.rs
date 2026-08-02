@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
+use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
 use crate::signer::ProfileSigner;
 use crate::wallet::authorizer::WalletOps;
 
@@ -73,6 +74,20 @@ impl UnlockedAccount {
     /// via the frozen `dig-constants` profile-DEK contract.
     pub fn dek(&self, ix: ProfileIx) -> [u8; 32] {
         profile_dek(&self.seed, ix)
+    }
+
+    /// The per-profile X25519 **sealing secret** for profile `ix` — the private half the DIG App
+    /// uses to unseal `DIGCHAT1` messages, derived from the seed via the frozen `dig-constants`
+    /// profile-sealing contract. Deterministic, so a profile restored on another device reproduces
+    /// the identical key and keeps every message ever sealed to it openable (§5.1).
+    pub fn profile_sealing_key(&self, ix: ProfileIx) -> x25519_dalek::StaticSecret {
+        profile_sealing_secret(&self.seed, ix)
+    }
+
+    /// The per-profile X25519 **sealing public key** (32 bytes) for profile `ix` — the public half
+    /// peers seal `DIGCHAT1` messages TO. Corresponds to [`profile_sealing_key`](Self::profile_sealing_key).
+    pub fn profile_sealing_public_key(&self, ix: ProfileIx) -> [u8; 32] {
+        profile_sealing_public_key(&self.seed, ix)
     }
 
     /// The 24-word BIP-39 recovery phrase for this account.

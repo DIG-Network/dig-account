@@ -110,6 +110,24 @@ The raw `WalletKey::secret_key()` is `pub(crate)` (§8).
 NOT reimplement the KDF locally, since it is the at-rest byte contract every already-sealed profile blob
 was encrypted under. Golden (seed = all `0x11`, ix 0): `3285f675…f543`.
 
+### 3.4 Per-profile X25519 sealing keypair — HKDF via the canonical sealing label
+
+`profile_sealing_secret(seed, ix)` / `profile_sealing_public_key(seed, ix)` derive the per-profile
+X25519 **sealing** keypair — the key the DIG App uses to seal/unseal `DIGCHAT1` messages (§NC-1
+end-to-end encryption). The 32-byte input keying material MUST come from `dig-session`'s frozen
+`profile_derive_symmetric_key(ix, PROFILE_SEALING_X25519_LABEL)`
+(`HKDF-SHA256(salt = DEK_SALT, ikm = IDENTITY_IKM_VERSION || scalar, info =
+PROFILE_SEALING_X25519_LABEL)`, `info = "dig-app:profile-sealing-x25519:v1"`) — the SAME seam as the
+DEK, differing ONLY in the `info` label, which is what domain-separates the sealing key from the DEK.
+It MUST NOT reimplement the KDF. The 32 output bytes become the X25519 secret via
+`StaticSecret::from(ikm)`; X25519 clamps to a valid scalar during scalar multiplication, and the
+public key is `PublicKey::from(&secret)`. The keypair is DERIVED, never stored: a profile restored from
+its recovery phrase on any other device reproduces the identical sealing keypair, so every `DIGCHAT1`
+message ever sealed to it stays openable forever (this is the §5.1 permanence guarantee for sealed
+messages). dig-account exposes ONLY the keypair; the `DIGCHAT1` envelope + attest/seal/unseal routing
+live in dig-app. Golden KAT (entropy = all `0x42`, ix 0, public key):
+`93f1556d839a6bf56930b8a3f895ac95c34b289b3cbf55e47a78de06858bfb00`.
+
 ## 4. Unlock policy & AccountSession lifecycle
 
 ### 4.1 Locked → unlock → Unlocked; idle-relock; explicit lock()
