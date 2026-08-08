@@ -20,9 +20,14 @@
 //! # Live-key lifecycle
 //!
 //! Once unlocked, the [`UnlockedMasterSeed`] is held behind [`UnlockGate`], which **idle-relocks**:
-//! after a configured idle window with no access the seed is dropped (zeroized) and the account is
-//! sealed again. Every successful access refreshes the idle deadline. This bounds how long live key
-//! material sits in memory on an unattended tray process.
+//! after a configured idle window with no access, every capability derived from that unlock stops
+//! working and the account is sealed again. Every successful access refreshes the idle deadline. This
+//! bounds how long live key material can be USED on an unattended tray process.
+//!
+//! The deadline lives on the unlock's [`Residency`], not in [`access`](UnlockGate::access), so
+//! elapsing alone ends the session — a host that simply stops calling the gate cannot thereby extend
+//! it. The seed BYTES are dropped and zeroized at the next gate interaction; the CAPABILITY to use
+//! them dies the instant the deadline passes.
 //!
 //! The gate is clock-injected ([`Clock`]) so idle-relock is deterministically testable; production
 //! uses [`SystemClock`].
@@ -126,7 +131,8 @@ impl Clock for SystemClock {
 ///
 /// Every handle the gate hands out from one unlock shares that unlock's
 /// [`Residency`](crate::session_residency::Residency), and every relock path — [`lock`](Self::lock),
-/// idle expiry, a superseding [`unlock`](Self::unlock), `Drop` — revokes it. So a capability retained
+/// idle expiry, a superseding [`unlock`](Self::unlock), `Drop` — revokes it. Idle expiry does so
+/// without any call at all: the token holds the deadline and observes the clock itself. So a capability retained
 /// across a relock (a money signer above all) refuses with
 /// [`Locked`](crate::error::AccountError::Locked) instead of continuing to sign. Dropping the seed
 /// cannot achieve this on its own: the `Arc` is shared with every handle already issued, so the gate's
@@ -140,11 +146,13 @@ pub struct UnlockGate {
     default_profile_ix: ProfileIx,
     store: AccountStore,
     policy: Box<dyn AuthPolicy>,
-    clock: Box<dyn Clock>,
+    /// Shared with every [`Residency`] this gate mints, so the gate and the capabilities it issued
+    /// read one clock rather than two that could disagree.
+    clock: Arc<dyn Clock>,
     idle_timeout: Duration,
-    /// The live unlock: the seed, the token every capability derived from it shares, and the instant
-    /// it was last accessed. `None` when locked. Private: only the in-crate lifecycle reads it, and
-    /// only ever to build an [`UnlockedAccount`] to hand out.
+    /// The live unlock: the seed and the token every capability derived from it shares. `None` when
+    /// locked. Private: only the in-crate lifecycle reads it, and only ever to build an
+    /// [`UnlockedAccount`] to hand out.
     ///
     /// The token is held HERE rather than minted per handle because the gate — not the handle — owns
     /// when the unlock ends. Without it, [`lock`](Self::lock) dropped one reference to a seed that
@@ -156,10 +164,11 @@ pub struct UnlockGate {
 /// One live unlock held by an [`UnlockGate`].
 struct LiveUnlock {
     seed: Arc<UnlockedMasterSeed>,
-    /// The liveness shared by every [`UnlockedAccount`] this unlock produced.
+    /// The liveness shared by every [`UnlockedAccount`] this unlock produced, and the sole home of
+    /// this unlock's idle deadline. The gate deliberately keeps no second copy of that deadline: two
+    /// derivations of one window are two answers that can differ, and the one the capabilities read
+    /// is this one.
     residency: Arc<Residency>,
-    /// When a capability was last handed out; the idle window is measured from here.
-    last_access: std::time::Instant,
 }
 
 impl UnlockGate {
@@ -178,7 +187,7 @@ impl UnlockGate {
             default_profile_ix,
             store,
             policy,
-            clock,
+            clock: Arc::from(clock),
             idle_timeout,
             live: None,
         }
@@ -186,10 +195,9 @@ impl UnlockGate {
 
     /// Whether the account is currently unlocked AND still within its idle window.
     pub fn is_unlocked(&self) -> bool {
-        match &self.live {
-            Some(live) => self.clock.now().duration_since(live.last_access) < self.idle_timeout,
-            None => false,
-        }
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.residency.is_live())
     }
 
     /// A live [`UnlockedAccount`] over the currently-held seed (never exposes the raw seed), sharing
@@ -225,8 +233,10 @@ impl UnlockGate {
         self.end_unlock();
         let live = LiveUnlock {
             seed,
-            residency: Arc::new(Residency::new()),
-            last_access: self.clock.now(),
+            residency: Arc::new(Residency::idle_bounded(
+                self.clock.clone(),
+                self.idle_timeout,
+            )),
         };
         let handle = self.account_handle(&live);
         self.live = Some(live);
@@ -237,21 +247,15 @@ impl UnlockGate {
     /// deadline. If the idle window has elapsed the seed is relocked (dropped) and `None` is returned
     /// (fail-closed).
     pub fn access(&mut self) -> Option<UnlockedAccount> {
-        let now = self.clock.now();
-        let within_window = self
-            .live
-            .as_ref()
-            .is_some_and(|live| now.duration_since(live.last_access) < self.idle_timeout);
-
-        if !within_window {
-            // Idle window elapsed (or already locked): revoke what this unlock issued, drop the seed.
+        if !self.is_unlocked() {
+            // Already locked, or the idle window has lapsed — in which case the capabilities are
+            // already dead and this call is what finally drops the seed bytes.
             self.end_unlock();
             return None;
         }
 
-        let live = self.live.as_mut().expect("checked live just above");
-        live.last_access = now;
-        let live = self.live.as_ref().expect("still live");
+        let live = self.live.as_ref().expect("checked live just above");
+        live.residency.touch();
         Some(self.account_handle(live))
     }
 
@@ -607,6 +611,92 @@ mod tests {
             !residency.is_live(),
             "an idle-expired session must revoke the capabilities it issued"
         );
+    }
+
+    /// **ELAPSING alone ends the session — no gate call required.**
+    ///
+    /// [`idle_expiry_revokes_the_residency_too`] above calls `access()` after advancing the clock, so
+    /// it cannot discriminate "time revoked it" from "the next gate call revoked it" — it exercises
+    /// the revoking path and then asserts a property about time. Measured at `63d2ddf` with the clock
+    /// advanced and no gate call at all: `is_unlocked = false`, `residency.is_live = true`, and the
+    /// retained signer produced a real mainnet aggregate signature. The gate reported locked while
+    /// its capabilities kept working.
+    ///
+    /// A guarantee that depends on somebody calling the gate is not the guarantee `SPEC.md` §4.1
+    /// states, and the host that would have made that call is exactly the unattended tray process the
+    /// idle window exists to bound.
+    #[test]
+    fn elapsing_the_idle_window_revokes_without_any_gate_call() {
+        use crate::wallet::money_signer::MoneySigner;
+        use dig_wallet_backend::types::Network;
+
+        let clock = TestClock::new();
+        let mut gate = gate_with(
+            Box::new(PasswordOnlyPolicy),
+            Duration::from_secs(60),
+            clock.clone(),
+        );
+        let account = gate
+            .unlock(AuthFactors::password_only(Password::new(PW)))
+            .unwrap();
+        let residency = account.residency();
+        let signer = account.wallet_ops().money_signer(Network::Mainnet);
+
+        // The truthful control: inside the window this exact signer signs this exact spend, so the
+        // refusal below is the idle window and not some unrelated failure.
+        let bundle = signer
+            .sign_approved(approval_over(&legit_send(610, 10, 1_000)))
+            .expect("a live session must sign");
+        assert_ne!(
+            bundle.aggregated_signature,
+            chia_bls::Signature::default(),
+            "the control must be a real signature over a real spend"
+        );
+
+        // Time passes. Nothing else happens — no `access()`, no `lock()`, no drop.
+        clock.advance(Duration::from_secs(3_600));
+
+        assert!(
+            !residency.is_live(),
+            "the idle window has elapsed, so the capabilities it issued are no longer live"
+        );
+        assert!(!gate.is_unlocked(), "and the gate must agree it is locked");
+
+        let after = signer.sign_approved(approval_over(&legit_send(610, 10, 1_000)));
+        assert!(
+            matches!(after, Err(crate::error::AccountError::Locked)),
+            "a signer retained past the idle window must refuse as Locked, not sign a mainnet \
+             spend: {:?}",
+            after.map(|b| b.aggregated_signature)
+        );
+    }
+
+    /// The other half of the same bound: a session INSIDE its window keeps working, and every
+    /// `access()` pushes the deadline out. Without this, "expired" could be satisfied by a residency
+    /// that is simply never live.
+    #[test]
+    fn access_within_the_window_refreshes_the_deadline() {
+        let clock = TestClock::new();
+        let mut gate = gate_with(
+            Box::new(PasswordOnlyPolicy),
+            Duration::from_secs(60),
+            clock.clone(),
+        );
+        let residency = gate
+            .unlock(AuthFactors::password_only(Password::new(PW)))
+            .unwrap()
+            .residency();
+
+        // Three quiet periods, each under the window, totalling well over it.
+        for _ in 0..3 {
+            clock.advance(Duration::from_secs(45));
+            assert!(gate.access().is_some(), "still within the refreshed window");
+            assert!(residency.is_live(), "and its capabilities are still live");
+        }
+
+        // At the bound: the window is `< idle_timeout`, so exactly 60s of quiet is already expired.
+        clock.advance(Duration::from_secs(60));
+        assert!(!residency.is_live(), "the refreshed window has now elapsed");
     }
 
     #[test]

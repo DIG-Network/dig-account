@@ -165,7 +165,17 @@ expiry, a superseding `unlock()`, and dropping the gate MUST each REVOKE that to
 retained across any of them (a `LocalMoneySigner` in particular) fails with `Locked` rather than
 continuing to sign. Revocation is required rather than implied by dropping the seed: the seed's `Arc` is
 shared with every handle already issued, so dropping the gate's reference alone leaves those handles
-fully working. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
+fully working.
+
+**Idle expiry MUST be a property of TIME, not of calling the gate.** The `Residency` carries its own
+idle deadline, refreshed by each `access()` the gate serves; once the clock passes that deadline the
+token reports not-live and every capability derived from it refuses — with no `access()`, no `lock()`,
+and no other gate call required. Evaluating the window inside `access()` instead would make the bound
+conditional on the host that stopped calling, which is exactly the unattended process the window exists
+to bound. The seed BYTES are dropped and zeroized at the next gate interaction (`access()`, `lock()`, a
+superseding `unlock()`, or `Drop`); the CAPABILITY to use them ends the instant the deadline passes.
+`is_unlocked()` reports the same observed liveness, so the gate and its capabilities can never
+disagree. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
 `Arc<UnlockedMasterSeed>` lives only in its private state, and both `unlock()` and `access()` return
 `UnlockedAccount` (the same shape as `AccountSession`). A host that needs idle-relock today holds the
 account through an `UnlockGate`. Wiring idle-relock directly onto the `UnlockedAccount` capability
@@ -306,8 +316,13 @@ it of a host.** The enforcement is structural:
 
   The MUST is stated over the capability rather than over a parameter type or a list of visibility
   keywords deliberately. A rule spelled as a keyword list exempts, silently, every form it fails to
-  spell; the enforcing guard (`tests/the_shape_is_unwritable.rs`) therefore flags EVERY signing
-  function over coin spends and carries its single permitted exception by name.
+  spell; the enforcing guard (`tests/the_shape_is_unwritable.rs`) is therefore stated over the
+  CAPABILITY too — it flags any function whose name begins `sign` that receives coin spends in any
+  spelling (`&[CoinSpend]`, `Vec<CoinSpend>`, a generic `AsRef<[CoinSpend]>`, or the fully-qualified
+  `chia_protocol::CoinSpend`), under any visibility or none, and carries its single permitted
+  exception by exact name rather than by name prefix. The guard is a textual scan of production
+  sources, so it is a strong backstop and not a proof: a door that avoids the name `sign` or names the
+  type through an alias is outside its reach, and those remain the reviewer's job.
 - The DID mint (§6A) is the one signing path that does NOT run through a `SpendApproval`, and is the
   one exception the guard names. It builds its own spends rather than accepting a caller's, and it
   MUST gate them under its own whitelist (§6A.4) before signing. Its signing helper MUST stay

@@ -198,7 +198,11 @@ fn without_line_breaks(source: &str) -> String {
 /// invisible to it, and all of them caught before the narrowing. A named exemption can only ever be
 /// wrong about the one thing it names, and [`the_exemption_is_still_earned`] re-checks that one
 /// thing on every run.
-const EXEMPT_SIGNING_DOOR: (&str, &str) = ("src/mint/did.rs", "fn sign_mint_spends");
+/// The trailing `(` is load-bearing: without it the exemption matches by name PREFIX, and
+/// `sign_mint_spends_backdoor` / `_v2` / `_unchecked` all inherit an exemption nobody granted them.
+/// That was measured — the backdoor was injected as `pub`, type-checked from an external integration
+/// test, and the whole suite still printed `ok`. See [`the_exemption_covers_only_the_one_door_it_names`].
+const EXEMPT_SIGNING_DOOR: (&str, &str) = ("src/mint/did.rs", "fn sign_mint_spends(");
 
 /// How far back to read for a visibility modifier when deciding whether the exemption still applies.
 /// Generously wide: over-reading can only REVOKE the exemption (fail-closed), never grant it.
@@ -210,40 +214,93 @@ const VISIBILITY_LOOKBEHIND: usize = 80;
 /// the declaration and, finding any, refuses the exemption. So every form the previous rule could not
 /// spell — `pub(in …)`, `pub(self)`, `pub async`, `pub unsafe` — revokes the exemption rather than
 /// silently inheriting it.
+/// Whether the exempted door in `source` is still the ONE reviewed, module-private declaration.
+///
+/// Two conditions, both required, both fail-closed:
+///
+/// - the name is declared **exactly once** in the file. A second declaration of the exact same name
+///   later in the same file is a door nobody reviewed, and reading only the FIRST occurrence made it
+///   invisible: a `pub mod helpers { pub fn sign_mint_spends(…) }` appended to `did.rs` left every
+///   test green while being externally reachable. Zero occurrences is fine — there is nothing to
+///   exempt.
+/// - **every** occurrence is module-private, judged by looking for the substring `pub` anywhere in
+///   the run of text before it. So every form the previous rule could not spell — `pub(in …)`,
+///   `pub(self)`, `pub async`, `pub unsafe` — revokes the exemption rather than silently inheriting
+///   it.
 fn exempt_door_is_still_module_private(source: &str) -> bool {
     let normalized = without_line_breaks(source);
-    match normalized.find(EXEMPT_SIGNING_DOOR.1) {
-        None => true, // Not present at all; nothing to exempt.
-        Some(start) => {
-            let from = start.saturating_sub(VISIBILITY_LOOKBEHIND);
-            !normalized[from..start].contains("pub")
-        }
+    let declarations: Vec<usize> = normalized
+        .match_indices(EXEMPT_SIGNING_DOOR.1)
+        .map(|(start, _)| start)
+        .collect();
+
+    if declarations.len() > 1 {
+        return false;
     }
+    declarations.into_iter().all(|start| {
+        let from = start.saturating_sub(VISIBILITY_LOOKBEHIND);
+        !normalized[from..start].contains("pub")
+    })
+}
+
+/// How far past `fn` a signature may be read before the window is abandoned as runaway text.
+const MAX_SIGNATURE_SCAN: usize = 400;
+
+/// The coin-spend parameter, however it is SPELLED.
+///
+/// Stated over the type's name plus its closing bracket rather than over one borrow form, because
+/// each of `&[CoinSpend]`, `Vec<CoinSpend>`, `impl AsRef<[CoinSpend]>` and
+/// `&[chia_protocol::CoinSpend]` is the same capability — a caller handing a signer its own spends —
+/// and all four were measured passing a `&[CoinSpend]`-only needle. Matching the closing bracket is
+/// what keeps `SpendApproval` and `CoinSpendKind`-style names from matching by accident.
+const COIN_SPEND_PARAMETERS: [&str; 2] = ["CoinSpend]", "CoinSpend>"];
+
+/// `source` truncated to at most `end` bytes, never splitting a UTF-8 character.
+fn truncated(source: &str, end: usize) -> &str {
+    let mut end = end.min(MAX_SIGNATURE_SCAN).min(source.len());
+    while !source.is_char_boundary(end) {
+        end -= 1;
+    }
+    &source[..end]
+}
+
+/// The candidate signature texts for a declaration starting at `rest`.
+///
+/// A signature ends at its opening brace OR at a semicolon (a trait method has no body) — and which
+/// terminator is correct cannot be decided by taking the NEARER of the two, because a parameter type
+/// may legally contain a semicolon: `[u8; 32]`. Taking the minimum truncated
+/// `sign_with_nonce(nonce: [u8; 32], coin_spends: &[CoinSpend])` at `32` and the guard reported `ok`
+/// on it in production code. So both windows are produced and the caller flags on EITHER — reading
+/// too far can only over-report (fail-closed), whereas reading too little is the silent failure.
+fn signature_windows(rest: &str) -> [&str; 2] {
+    [
+        truncated(rest, rest.find('{').unwrap_or(rest.len())),
+        truncated(rest, rest.find(';').unwrap_or(rest.len())),
+    ]
 }
 
 /// Every function in `source` that turns loose coin spends into a signature, exempt or not.
 ///
-/// A signing door is a function whose name begins `sign` and which accepts `&[CoinSpend]`. No
-/// visibility filter: an unreachable door is excluded by NAME above, never by a guess at what
-/// "reachable" looks like in text.
+/// A signing door is a function whose name begins `sign` and which receives coin spends in any
+/// spelling. No visibility filter: an unreachable door is excluded by NAME above, never by a guess at
+/// what "reachable" looks like in text.
 fn signing_doors(source: &str) -> Vec<String> {
     let normalized = without_line_breaks(source);
     normalized
         .match_indices("fn sign")
         .filter_map(|(start, _)| {
-            // A signature ends at its opening brace, its semicolon (a trait method has no body), or
-            // its `where`; take a bounded window so a later, unrelated `&[CoinSpend]` elsewhere in
-            // the file cannot be attributed to this function.
             let rest = &normalized[start..];
-            let end = rest
-                .find(['{', ';'])
-                .unwrap_or(rest.len())
-                .min(400)
-                .min(rest.len());
-            let signature = &rest[..end];
-            signature
-                .contains("&[CoinSpend]")
-                .then(|| signature.to_string())
+            signature_windows(rest)
+                .into_iter()
+                .filter(|window| {
+                    COIN_SPEND_PARAMETERS
+                        .iter()
+                        .any(|needle| window.contains(needle))
+                })
+                // The SHORTEST matching window is the most faithful rendering of the signature; the
+                // door is flagged if either matches, so which one is reported is presentation only.
+                .min_by_key(|window| window.len())
+                .map(str::to_string)
         })
         .collect()
 }
@@ -415,6 +472,129 @@ fn the_signing_door_guard_fires_on_every_form_it_once_missed() {
         .len(),
         1,
         "a parent-visible door is still a door"
+    );
+}
+
+/// NEGATIVE CONTROLS for the forms the guard's own REWRITE missed.
+///
+/// The battery above was derived entirely from the previous guard's failure — the eight visibility
+/// forms — and a battery derived from one failure mode is blind to the ones its replacement
+/// introduces. Each shape here was injected as real, compiling code into production
+/// `money_signer.rs` and the guard printed `ok`. Two of them (the array parameter, and the owned
+/// `Vec`) are shapes the PRE-rewrite guard actually caught, so they are regressions rather than
+/// merely gaps; the rest are the parameter spellings a future author reaches for without thinking.
+///
+/// The rule these encode: a signing door is any function named `sign…` that receives coin spends AT
+/// ALL, however the type is spelled — owned, borrowed, generic, or fully qualified.
+#[test]
+fn the_signing_door_guard_fires_on_every_shape_the_rewrite_missed() {
+    let missed_forms: [(&str, &str); 4] = [
+        (
+            // REGRESSION: `[u8; 32]` contains a `;`, so a semicolon-terminated window truncates the
+            // signature before its coin-spend parameter is ever read. A nonce/salt/domain-tag-first
+            // signing helper is an ordinary thing to add.
+            "a door with an array parameter before the spends",
+            "pub fn sign_with_nonce(nonce: [u8; 32], coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a door taking the spends by value",
+            "pub fn sign_owned_spends(coin_spends: Vec<CoinSpend>) -> chia_bls::Signature {",
+        ),
+        (
+            "a door taking the spends generically",
+            "pub fn sign_generic_spends<S: AsRef<[CoinSpend]>>(coin_spends: S) -> chia_bls::Signature {",
+        ),
+        (
+            // Exactly how a module without the import would spell it — `mint/did.rs` writes
+            // `chia_protocol::CoinSpend` in places already.
+            "a door naming the fully-qualified type",
+            "pub fn sign_qualified_spends(coin_spends: &[chia_protocol::CoinSpend]) -> chia_bls::Signature {",
+        ),
+    ];
+
+    let uncaught: Vec<&str> = missed_forms
+        .iter()
+        .filter(|(_, source)| unauthorized_signing_doors(source).len() != 1)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(
+        uncaught.is_empty(),
+        "each of these receives caller-supplied coin spends and returns a signature, so each is an \
+         unauthorized route to one, but the guard missed: {uncaught:?}"
+    );
+
+    // And the guard must still not fire on the shapes that merely MENTION the type without being a
+    // door, or it becomes a guard that always trips and therefore says nothing.
+    for benign in [
+        "fn sign_approved(&self, approval: SpendApproval) -> Result<SpendBundle> {",
+        "fn required_signatures( signer: &LocalSigner, coin_spends: &[CoinSpend], ) -> Result<Vec<RequiredSignature>> {",
+    ] {
+        assert!(
+            unauthorized_signing_doors(benign).is_empty(),
+            "not a signing door: {benign}"
+        );
+    }
+}
+
+/// NEGATIVE CONTROLS for the EXEMPTION's own edges — the two ways a name-scoped exemption leaks.
+///
+/// A named exemption is only ever wrong about the one thing it names — provided the match is exact
+/// and the thing is singular. Both were measured false at `63d2ddf`: the exemption matched by name
+/// PREFIX, so `sign_mint_spends_backdoor` (and `_v2`, `_unchecked`, `_for_tests`) inherited it; and
+/// earned-ness read only the FIRST occurrence, so a second `pub` declaration of the exact name later
+/// in the same file was invisible. Both were injected into production `mint/did.rs`, both left the
+/// whole suite green, and both were externally reachable.
+#[test]
+fn the_exemption_covers_only_the_one_door_it_names() {
+    /// The genuine, reviewed, module-private mint door — the truthful control every fixture below
+    /// keeps, so that what varies is the impostor and nothing else.
+    const REAL_MINT_DOOR: &str = "fn sign_mint_spends( wallet: &WalletKey, coin_spends: \
+                                  &[CoinSpend], ) -> MintResult<Signature> { }";
+
+    let exempt_file = EXEMPT_SIGNING_DOOR.0;
+
+    // The real door, unchanged, must keep its exemption — otherwise this test proves nothing about
+    // narrowness, only that the exemption is broken.
+    assert!(
+        unauthorized_signing_doors_in(exempt_file, REAL_MINT_DOOR).is_empty(),
+        "the reviewed, module-private mint door must stay exempt"
+    );
+
+    // A LONGER name that merely begins with the exempted one is a different function.
+    //
+    // The impostor is placed AFTER the genuine private door, exactly as the measured injection was:
+    // an impostor alone would be caught anyway, because its own `pub` is what the earned-ness check
+    // reads. Keeping the truthful door in the fixture is what makes the prefix leak observable.
+    for impostor in [
+        "pub fn sign_mint_spends_backdoor(coin_spends: &[CoinSpend]) -> Signature { }",
+        "pub fn sign_mint_spends_v2(coin_spends: &[CoinSpend]) -> Signature { }",
+        "pub fn sign_mint_spends_unchecked(coin_spends: &[CoinSpend]) -> Signature { }",
+    ] {
+        let file = format!("{REAL_MINT_DOOR} {impostor}");
+        assert_eq!(
+            unauthorized_signing_doors_in(exempt_file, &file).len(),
+            1,
+            "the exemption names one function, not a name prefix: {impostor}"
+        );
+    }
+
+    // A SECOND declaration of the exact name, later in the same file, behind a public module. The
+    // first occurrence is the reviewed private one, so any check that reads only the first sees a
+    // clean file.
+    let two_declarations = format!(
+        "{REAL_MINT_DOOR} pub mod helpers {{ pub fn sign_mint_spends(coin_spends: &[CoinSpend]) \
+         -> Signature {{ }} }}"
+    );
+    let two_declarations = two_declarations.as_str();
+    assert!(
+        !exempt_door_is_still_module_private(two_declarations),
+        "a second declaration of the exempted name is a door nobody reviewed, so the exemption must \
+         lapse rather than cover both"
+    );
+    assert_eq!(
+        unauthorized_signing_doors_in(exempt_file, two_declarations).len(),
+        2,
+        "and with the exemption lapsed the guard must report BOTH declarations"
     );
 }
 
