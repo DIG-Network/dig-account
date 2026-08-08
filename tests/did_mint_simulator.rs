@@ -374,6 +374,12 @@ fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()>
     assert_eq!(did_coin.coin_id(), pending.did_coin_id());
     chain.observe_in_mempool(did_coin);
 
+    // Let the chain run WELL past the confirmation depth without ever including the bundle. This is
+    // what makes the missing height the only thing left to reject the record: at a shallow chain the
+    // depth rule would reject it anyway, and a `confirmed_height` defaulted to any plausible value
+    // would sail through unnoticed.
+    chain.bury(MIN_CONFIRMATION_DEPTH * 2);
+
     assert!(
         minter.mint_status(&pending, &chain)?.minted().is_none(),
         "a coin the node has merely SEEN is not a coin the chain has confirmed"

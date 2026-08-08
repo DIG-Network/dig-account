@@ -430,12 +430,39 @@ construct a puzzle, encode a condition, or compose a signature message itself.
 
 A DID is recorded ONLY from evidence of an actual on-chain mint.
 
-- `MintedDid` carries a NON-OPTIONAL `confirmed_height`, so an unconfirmed mint is not representable.
-- Its sole constructor is private to the mint module and returns nothing unless the supplied coin record
-  is BOTH the exact coin the pushed bundle creates AND confirmed at a block height. A mempool observation
-  — a real record of the right coin, from a reachable node, with no confirmed height — is NOT evidence.
-- A successful push yields a `PendingMint`, which is not a DID and MUST NOT be recorded as one. Its
-  `pending_did_string` is for display of a pending mint only.
+`MintedDid` carries a NON-OPTIONAL `confirmed_height`, and its sole constructor is private to the mint
+module. That constructor MUST reject a coin record unless ALL of the following hold:
+
+1. the record is the exact coin the pushed bundle creates;
+2. it carries a confirmed height (a mempool observation — a real record of the right coin, from a
+   reachable node, with no confirmed height — is NOT evidence);
+3. that height is not `0` (no coin is created in genesis);
+4. that height is not below the chain peak observed immediately BEFORE the push (a mint cannot appear in
+   a block that already existed when it was broadcast); and
+5. the coin is buried under at least `MIN_CONFIRMATION_DEPTH` blocks, so a shallow reorg cannot undo a
+   DID already recorded as permanent. This also rejects a height beyond the source's own peak, whose
+   depth is 1; `MIN_CONFIRMATION_DEPTH` MUST therefore exceed 1.
+
+A source that cannot report a peak height MUST make the mint fail closed with `ChainUnreachable`: without
+a peak, none of the bounds above can be evaluated.
+
+A successful push yields a `PendingMint`, which is not a DID and MUST NOT be recorded as one. Its
+`pending_did_string` is for display of a pending mint only.
+
+**Scope of the guarantee.** The type makes "no height" unrepresentable; it cannot make a height TRUE.
+Every field of the evidence is asserted by the chain source, and in a typical deployment that source is
+the same node the bundle was pushed to — the `did_coin_id` is not a secret from it. The checks above force
+a fabrication to stay self-consistent across separate answers from that source; they do NOT defeat a source
+that lies coherently. Callers MUST therefore pass a trusted or aggregating `ChainSource`, not the same
+unvetted node used to broadcast.
+
+### 6A.2a Mint status (normative)
+
+`mint_status` MUST distinguish three states, because a caller cannot poll safely on an `Option`:
+`Confirmed` (evidence per §6A.2), `Awaiting` (carrying the blocks elapsed since the push, so a caller can
+build a timeout), and `Failed` — the mint's source coin is reported spent while no DID coin exists, which
+can only mean another spend consumed it, since the bundle is atomic. A `Failed` mint MUST NOT be polled
+as though it might still confirm.
 
 ### 6A.3 The three outcomes are distinct (normative)
 
@@ -445,11 +472,16 @@ not answer, so the outcome is unknown". A chain read that fails MUST NOT be degr
 list (which would report a funded wallet as empty), and a `confirm` that cannot reach the chain MUST
 return `ChainUnreachable`, never `Ok(None)`.
 
-### 6A.4 Coin selection
+### 6A.4 Coin selection and change
 
 The funding coin is the SMALLEST confirmed, unspent coin whose amount is at least `1 + fee`. Unconfirmed
 and spent coins are neither selected nor counted toward the `available` amount reported by
 `InsufficientFunds`.
+
+A change output of exactly 1 mojo MUST NOT be created: it would share `(parent, puzzle_hash, amount)` with
+the funding coin — the same coin id twice in one spend — which consensus rejects as a duplicate output.
+Because the build is deterministic, that rejection would recur on every retry and a wallet holding exactly
+`fee + 2` mojos could never mint. The colliding mojo MUST be folded into the fee instead.
 
 ### 6A.5 The signing gate (normative)
 
@@ -459,6 +491,8 @@ Before signing, the mint MUST refuse — as `MintError::Refused` — anything ou
   domain string, i.e. `AGG_SIG_UNSAFE`, is refused); and
 - the bundle spends exactly ONE pre-existing coin — a coin whose parent is not itself spent in the same
   bundle — and that coin pays this wallet's puzzle hash. Every other spent coin is created by the bundle.
+  (The rule is OWNERSHIP of that coin, not identity with the coin selection chose; on the single-call path
+  they are the same coin.)
 
 The general money path's `LocalMoneySigner` verifier decodes standard and CAT spends and fails closed on a
 singleton launch; it is NOT weakened for the mint. This narrower, whitelist gate applies instead.
@@ -495,8 +529,10 @@ the policy/crypto evaluation stays in-crate (§4.2).
 - Every unlock/auth/custody decision is fail-closed: ambiguity resolves to an error, never a silent
   success.
 - A DID is recorded ONLY from on-chain evidence (§6A.2): `MintedDid` is unconstructible without a
-  confirmed coin record of the exact coin the pushed mint bundle creates, so no calling surface can
-  assert a DID that the chain has not acknowledged.
+  confirmed, sufficiently-buried coin record of the exact coin the pushed mint bundle creates, whose
+  height is bounded by the chain's peak and by the peak observed before the push. The residual — a chain
+  source that lies coherently about all of them — is stated in §6A.2 and is the caller's to mitigate by
+  choosing a trusted source.
 - The crate forbids `unsafe` code (`unsafe_code = "forbid"`).
 
 ## 9. Error model
