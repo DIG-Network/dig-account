@@ -54,6 +54,10 @@ serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
 chia-sdk-test = "0.30"
+# Test-only: a DERIVED k1 keypair for the secp-refusal fixture (the gate must refuse a signature
+# requirement a DID mint never produces). Pinned to the version chia-wallet-sdk 0.30 resolves to.
+chia-secp = "0.26"
+sha2 = "0.10"
 
 [lints.rust]
 unsafe_code = "forbid"

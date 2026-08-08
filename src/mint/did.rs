@@ -24,8 +24,8 @@
 //!   a gate, and a broadcast — no puzzle, no condition encoding, no message construction of its own.
 //! - **The signing gate.** The account key is never used as an oracle: [`gate`] refuses to sign
 //!   anything but `AGG_SIG_ME` under this wallet's own key, over a bundle that spends exactly one
-//!   pre-existing coin — the one this mint selected — and otherwise only coins the bundle itself
-//!   creates. (The general money path's `LocalMoneySigner` cannot serve here: its verifier decodes
+//!   pre-existing coin, which must pay this wallet's own puzzle hash, and otherwise only coins the
+//!   bundle itself creates. (The general money path's `LocalMoneySigner` cannot serve here: its verifier decodes
 //!   standard and CAT spends and fails closed on a singleton launch, by design. That fail-closed
 //!   verifier is not weakened; this narrower, mint-specific gate is applied instead, and it is
 //!   strictly a whitelist.)
@@ -46,6 +46,7 @@ use crate::keys::wallet_key::WalletKey;
 use crate::mint::chain::{PushOutcome, SpendPublisher};
 use crate::mint::error::{MintError, MintResult};
 use crate::mint::evidence::{MintedDid, PendingMint};
+use crate::mint::status::MintStatus;
 use crate::profile_mint::ProfileMinter;
 
 /// The mojo amount of the coin that launches the singleton. A singleton's amount must be odd.
@@ -105,7 +106,8 @@ impl ProfileMinter {
     /// wallet.
     ///
     /// Returns a [`PendingMint`] — the bundle reached the mempool, which is NOT yet a DID. Poll
-    /// [`confirm`](Self::confirm) until it yields the [`MintedDid`] evidence; only that may be
+    /// [`mint_status`](Self::mint_status) until it reports
+    /// [`MintStatus::Confirmed`](crate::mint::MintStatus::Confirmed); only that evidence may be
     /// recorded.
     ///
     /// # Errors
@@ -133,7 +135,11 @@ impl ProfileMinter {
     {
         let wallet = self.wallet_key(ix);
         let source = select_funding_coin(chain, wallet.puzzle_hash(), options)?;
-        let (coin_spends, pending) = build_mint_spends(&wallet, source, options)?;
+        // The peak BEFORE the push. A mint cannot confirm in a block that already existed when it
+        // was pushed, so this height is what later makes a back-dated confirmation contradict
+        // something the chain itself said earlier.
+        let pushed_at_height = peak_height(chain)?;
+        let (coin_spends, pending) = build_mint_spends(&wallet, source, options, pushed_at_height)?;
         let signature = sign_mint_spends(&wallet, &coin_spends, network)?;
 
         match publisher
@@ -145,30 +151,79 @@ impl ProfileMinter {
         }
     }
 
-    /// Ask the chain whether `pending` has confirmed.
+    /// Ask the chain where `pending` stands: confirmed, still waiting, or dead.
     ///
-    /// - `Ok(Some(minted))` — the DID coin is confirmed at a height. This is the evidence, and the
-    ///   only value a caller may record as a DID.
-    /// - `Ok(None)` — the chain answered and the coin is not confirmed yet. Poll again.
-    /// - `Err(`[`MintError::ChainUnreachable`]`)` — the chain did not answer. The mint's state is
-    ///   UNKNOWN; this is never an absence.
-    pub fn confirm<C>(&self, pending: &PendingMint, chain: &C) -> MintResult<Option<MintedDid>>
+    /// This replaces a bare `Option`, which could not distinguish "not yet" from "never" — a mint
+    /// whose funding coin has been consumed by a different spend can never confirm, and a caller
+    /// polling it would otherwise spin forever on a result that will not change.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::ChainUnreachable`] when the chain could not answer — including when it cannot
+    /// report a peak height, without which a claimed confirmation height cannot be checked at all.
+    /// The mint's state is then UNKNOWN, never an absence.
+    pub fn mint_status<C>(&self, pending: &PendingMint, chain: &C) -> MintResult<MintStatus>
     where
         C: ChainSource + ?Sized,
     {
-        let record = chain
+        let peak = peak_height(chain)?;
+
+        let did_record = chain
             .coin_record(pending.did_coin_id())
             .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
 
-        Ok(record
+        if let Some(minted) = did_record
             .as_ref()
-            .and_then(|record| MintedDid::from_confirmed(pending, record)))
+            .and_then(|record| MintedDid::from_confirmed(pending, record, peak))
+        {
+            return Ok(MintStatus::Confirmed(minted));
+        }
+
+        // The source coin is this mint's sole input from the chain's point of view, and the bundle
+        // is atomic: had it been included, the source would be spent AND the DID coin would exist.
+        // A spent source with no DID coin can therefore only be a DIFFERENT spend, which makes this
+        // bundle permanently includable.
+        let source = chain
+            .coin_record(pending.source_coin_id())
+            .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+        if did_record.is_none() && source.as_ref().is_some_and(CoinRecord::is_spent) {
+            return Ok(MintStatus::Failed {
+                reason: "the funding coin was spent by a different spend; this mint can never \
+                         confirm"
+                    .into(),
+            });
+        }
+
+        Ok(MintStatus::Awaiting {
+            blocks_since_push: peak.saturating_sub(pending.pushed_at_height()),
+        })
     }
 
     /// The profile's wallet (money) key. In-crate only — the raw key never crosses the public API.
     fn wallet_key(&self, ix: ProfileIx) -> WalletKey {
         WalletKey::from_seed_at(&self.master_seed()[..], ix)
     }
+}
+
+/// Reads the chain's current peak, failing closed when it cannot be established.
+///
+/// A source that does not expose a peak (`Ok(None)`) is not an absence to work around: without a
+/// peak, a claimed confirmation height cannot be bounded, so the mint refuses to evaluate evidence
+/// at all rather than accept an unbounded one.
+fn peak_height<C>(chain: &C) -> MintResult<u32>
+where
+    C: ChainSource + ?Sized,
+{
+    chain
+        .peak_height()
+        .map_err(|e| MintError::ChainUnreachable(e.to_string()))?
+        .ok_or_else(|| {
+            MintError::ChainUnreachable(
+                "the chain source reports no peak height, so a confirmation height cannot be \
+                 checked"
+                    .into(),
+            )
+        })
 }
 
 /// Picks the smallest confirmed, unspent coin that can fund the mint on its own.
@@ -220,6 +275,7 @@ fn build_mint_spends(
     wallet: &WalletKey,
     source: Coin,
     options: &MintOptions,
+    pushed_at_height: u32,
 ) -> MintResult<(Vec<CoinSpend>, PendingMint)> {
     let mut ctx = SpendContext::new();
     let puzzle_hash = wallet.puzzle_hash();
@@ -228,16 +284,14 @@ fn build_mint_spends(
         .hint(puzzle_hash)
         .map_err(|e| MintError::Build(format!("hint: {e}")))?;
 
+    let (change, fee) = split_change_and_fee(source.amount, options.fee);
+
     let mut conditions = Conditions::new().create_coin(puzzle_hash, SINGLETON_AMOUNT, memos);
-    let change = source
-        .amount
-        .saturating_sub(SINGLETON_AMOUNT)
-        .saturating_sub(options.fee);
     if change > 0 {
         conditions = conditions.create_coin(puzzle_hash, change, memos);
     }
-    if options.fee > 0 {
-        conditions = conditions.reserve_fee(options.fee);
+    if fee > 0 {
+        conditions = conditions.reserve_fee(fee);
     }
 
     StandardLayer::new(wallet.public_key())
@@ -258,8 +312,32 @@ fn build_mint_spends(
 
     Ok((
         did_spend.coin_spends,
-        PendingMint::new(did.info.launcher_id, did.coin.coin_id()),
+        PendingMint::new(
+            did.info.launcher_id,
+            did.coin.coin_id(),
+            source.coin_id(),
+            pushed_at_height,
+        ),
     ))
+}
+
+/// Splits `source_amount` into the change returned to the wallet and the fee paid to a farmer.
+///
+/// A 1-mojo change is folded into the fee instead of being created. Both the funding coin and a
+/// 1-mojo change would be a coin of the same `(parent, puzzle_hash, amount)` — the SAME coin id,
+/// twice, in one spend — which consensus rejects as a duplicate output. That rejection happens
+/// after the push, is deterministic, and re-selecting picks the same coin every time, so a wallet
+/// holding exactly `fee + 2` mojos would be permanently unable to mint. One mojo to a farmer costs
+/// the user nothing measurable and cannot collide.
+fn split_change_and_fee(source_amount: u64, requested_fee: u64) -> (u64, u64) {
+    let change = source_amount
+        .saturating_sub(SINGLETON_AMOUNT)
+        .saturating_sub(requested_fee);
+    if change == SINGLETON_AMOUNT {
+        (0, requested_fee.saturating_add(change))
+    } else {
+        (change, requested_fee)
+    }
 }
 
 /// Gates then signs the mint bundle with the profile's wallet key.
@@ -291,9 +369,11 @@ fn sign_mint_spends(
 /// 1. **Only this wallet's key signs, only `AGG_SIG_ME`.** An `AGG_SIG_UNSAFE` requirement is a
 ///    blank cheque reusable against any coin, and a requirement under another key means the bundle
 ///    is asking this account to authorize a stranger's spend. Both refuse.
-/// 2. **Exactly one pre-existing coin is spent, and it is the coin this mint selected.** Every other
+/// 2. **Exactly one pre-existing coin is spent, and it pays THIS wallet's puzzle hash.** Every other
 ///    spent coin must be created by this same bundle (its parent is spent here too). A bundle that
-///    reaches outside its own lineage could drain any wallet coin; the mint will not sign one.
+///    reaches outside its own lineage could drain a second wallet coin; the mint will not sign one.
+///    Note the precise claim: the gate checks ownership, not that the coin is the one selection
+///    chose — on the single-call path they are the same coin, but only ownership is verified here.
 fn gate(
     wallet: &WalletKey,
     coin_spends: &[CoinSpend],
@@ -349,7 +429,7 @@ fn gate(
 mod tests {
     use super::*;
     use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
-    use chia_wallet_sdk::signer::RequiredBlsSignature;
+    use chia_wallet_sdk::signer::{RequiredBlsSignature, RequiredSecpSignature, SecpPublicKey};
 
     const SEED: [u8; 32] = [0x5A; 32];
     const OTHER_SEED: [u8; 32] = [0xA5; 32];
@@ -363,7 +443,7 @@ mod tests {
         let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
         let source = Coin::new(Bytes32::new([3; 32]), wallet.puzzle_hash(), 1_000_000);
         let (coin_spends, _) =
-            build_mint_spends(&wallet, source, &MintOptions::default()).expect("builds");
+            build_mint_spends(&wallet, source, &MintOptions::default(), 1).expect("builds");
         (wallet, coin_spends)
     }
 
@@ -420,7 +500,7 @@ mod tests {
         let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
         let foreign_coin = Coin::new(Bytes32::new([3; 32]), stranger.puzzle_hash(), 1_000_000);
         let (coin_spends, _) =
-            build_mint_spends(&wallet, foreign_coin, &MintOptions::default()).expect("builds");
+            build_mint_spends(&wallet, foreign_coin, &MintOptions::default(), 1).expect("builds");
 
         let error = gate(&wallet, &coin_spends, &[], &network())
             .expect_err("the funding coin must be this wallet's own");
@@ -522,6 +602,101 @@ mod tests {
             matches!(error, MintError::InsufficientFunds { available: 0, .. }),
             "{error}"
         );
+    }
+
+    /// **The production constructor, asserted directly.** Every other test in this crate drives
+    /// `from_constants(TESTNET11)`, so a `mainnet()` that returned the wrong chain's constants would
+    /// be an unkillable mutant: nothing would fail, and the only line a real user executes would
+    /// sign for a chain nobody is on. The value is compared against chia's own mainnet constant, not
+    /// against a second call to the same constructor.
+    #[test]
+    fn mainnet_signs_under_chia_mainnets_own_agg_sig_me_data() {
+        assert_eq!(
+            MintNetwork::mainnet().constants().me(),
+            MAINNET_CONSTANTS.agg_sig_me_additional_data,
+            "MintNetwork::mainnet() must sign under Chia mainnet's AGG_SIG_ME domain"
+        );
+    }
+
+    /// Mainnet and testnet11 are genuinely different domains — the control that stops the assertion
+    /// above from passing on two constants that happen to be equal.
+    #[test]
+    fn mainnet_and_testnet_domains_differ() {
+        assert_ne!(
+            MintNetwork::mainnet().constants().me(),
+            network().constants().me()
+        );
+    }
+
+    /// A deterministic 32-byte scalar derived by hashing a label — never a hard-coded key.
+    fn derived_secret_bytes() -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"dig-account secp gate fixture").into()
+    }
+
+    /// A `secp` signature requirement is refused. A DID mint never produces one, so its appearance
+    /// means the bundle is not what this module built — and an unhandled variant would otherwise
+    /// fall through to be signed by the BLS path's aggregation.
+    #[test]
+    fn a_secp_signature_requirement_is_refused() {
+        let (wallet, coin_spends) = honest_mint();
+        let mut required = required_for(&coin_spends);
+        // A DERIVED (never literal) k1 key, so the fixture carries no hard-coded cryptographic
+        // value.
+        let secret = chia_secp::K1SecretKey::from_bytes(&derived_secret_bytes())
+            .expect("a hashed seed is a valid k1 scalar");
+        required.push(RequiredSignature::Secp(RequiredSecpSignature {
+            public_key: SecpPublicKey::K1(secret.public_key()),
+            message_hash: [7; 32],
+            placeholder_ptr: clvmr::NodePtr::NIL,
+        }));
+
+        let error = gate(&wallet, &coin_spends, &required, &network())
+            .expect_err("a DID mint never produces a secp requirement");
+        assert!(error.to_string().contains("secp"), "{error}");
+    }
+
+    /// A source amount of exactly `fee + 2` leaves a 1-mojo change, which would be the SAME coin id
+    /// as the funding coin — a duplicate output consensus refuses. The mojo is folded into the fee
+    /// instead, and the resulting bundle is proven acceptable by the validator in the integration
+    /// suite; here we pin the arithmetic and the absence of a duplicate output.
+    #[test]
+    fn a_one_mojo_change_is_folded_into_the_fee_rather_than_duplicating_the_funding_coin() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let fee = 100;
+        let source = Coin::new(Bytes32::new([3; 32]), wallet.puzzle_hash(), fee + 2);
+
+        assert_eq!(
+            split_change_and_fee(source.amount, fee),
+            (0, fee + 1),
+            "the mojo that would collide becomes fee, not a second coin"
+        );
+
+        let (coin_spends, pending) =
+            build_mint_spends(&wallet, source, &MintOptions::with_fee(fee), 1).expect("builds");
+        let ids: HashSet<Bytes32> = coin_spends
+            .iter()
+            .map(|spend| spend.coin.coin_id())
+            .collect();
+        assert_eq!(
+            ids.len(),
+            coin_spends.len(),
+            "no coin is spent twice in the bundle"
+        );
+        assert_eq!(pending.source_coin_id(), source.coin_id());
+    }
+
+    /// Any other amount keeps its change: folding applies to the one colliding case only, so the
+    /// user is not quietly overpaying fees.
+    #[test]
+    fn change_is_untouched_when_it_cannot_collide() {
+        assert_eq!(split_change_and_fee(1_000, 100), (899, 100));
+        assert_eq!(
+            split_change_and_fee(103, 100),
+            (2, 100),
+            "a 2-mojo change is fine"
+        );
+        assert_eq!(split_change_and_fee(101, 100), (0, 100), "no change at all");
     }
 
     /// A chain source over a fixed set of coin records — enough to exercise selection without a
