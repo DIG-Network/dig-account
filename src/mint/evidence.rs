@@ -40,6 +40,19 @@ use dig_chainsource_interface::CoinRecord;
 /// accidental reorg is very unlikely to reach it.
 pub const MIN_CONFIRMATION_DEPTH: u32 = 6;
 
+/// A confirmation height claimed BEYOND the source's own peak is rejected by the depth rule alone:
+/// its computed depth is 1, which clears the bound only if the bound is 1. This assertion is what
+/// keeps that reasoning true — lowering [`MIN_CONFIRMATION_DEPTH`] to 1 would silently re-admit a
+/// `u32::MAX` confirmation, so it fails the build instead.
+#[allow(
+    dead_code,
+    reason = "a const assertion is evaluated at compile time, never read"
+)]
+const DEPTH_ALSO_REJECTS_A_FUTURE_HEIGHT: () = assert!(
+    MIN_CONFIRMATION_DEPTH > 1,
+    "MIN_CONFIRMATION_DEPTH must exceed 1, or a confirmation past the chain's peak becomes evidence"
+);
+
 /// A mint that has been signed and pushed, and is NOT yet proven on chain.
 ///
 /// This is deliberately not a DID: it names what to look for, and nothing may treat it as an
@@ -137,12 +150,12 @@ impl MintedDid {
     ///    proves nothing about this mint.
     /// 2. **It carries a confirmed height.** An unconfirmed record is a mempool observation.
     /// 3. **That height is not genesis.** No coin is created in block 0, so a `0` is fabricated.
-    /// 4. **It is not in the future.** A height past the source's own `peak` contradicts the same
-    ///    source's answer to a different question.
-    /// 5. **It does not predate the push.** A mint cannot appear in a block that already existed
+    /// 4. **It does not predate the push.** A mint cannot appear in a block that already existed
     ///    when it was broadcast.
-    /// 6. **It is buried under [`MIN_CONFIRMATION_DEPTH`] blocks**, so a shallow reorg cannot
-    ///    silently undo a DID that has already been recorded as permanent.
+    /// 5. **It is buried under [`MIN_CONFIRMATION_DEPTH`] blocks**, so a shallow reorg cannot
+    ///    silently undo a DID that has already been recorded as permanent. This also rejects a
+    ///    height in the FUTURE — one past the source's own peak has a depth of 1, which is why there
+    ///    is no separate future check to go stale (see [`DEPTH_ALSO_REJECTS_A_FUTURE_HEIGHT`]).
     pub(super) fn from_confirmed(
         pending: &PendingMint,
         record: &CoinRecord,
@@ -152,10 +165,7 @@ impl MintedDid {
             return None;
         }
         let confirmed_height = record.confirmed_height?;
-        if confirmed_height == 0
-            || confirmed_height > peak_height
-            || confirmed_height < pending.pushed_at_height()
-        {
+        if confirmed_height == 0 || confirmed_height < pending.pushed_at_height() {
             return None;
         }
         // `peak - confirmed` is the number of blocks built ON TOP; the confirming block itself is
@@ -277,13 +287,29 @@ mod tests {
     #[test]
     fn a_confirmation_at_genesis_is_not_evidence() {
         let coin = coin();
-        let pending = pending_for(&coin);
-        assert!(MintedDid::from_confirmed(&pending, &record(coin, Some(0)), PEAK).is_none());
+        // Pushed at height 0 and buried deep enough, so EVERY other rule passes and only the
+        // genesis rule can reject this. With a later push height the "predates the push" rule would
+        // reject it too, and this test would pass without exercising the rule it names.
+        let pending = PendingMint::new(
+            Bytes32::new([9; 32]),
+            coin.coin_id(),
+            Bytes32::new([4; 32]),
+            0,
+        );
+        let peak = MIN_CONFIRMATION_DEPTH - 1;
+
+        assert!(
+            MintedDid::from_confirmed(&pending, &record(coin, Some(0)), peak).is_none(),
+            "no coin is created in block 0"
+        );
+        // The control: the same pending mint, confirmed one block later, IS evidence — so the
+        // rejection above is the genesis rule and not some other rule this fixture trips.
+        assert!(MintedDid::from_confirmed(&pending, &record(coin, Some(1)), peak + 1).is_some());
     }
 
-    /// **Fabrication: the future.** A height beyond the source's own peak contradicts the answer
-    /// that same source gives to `peak_height`. `u32::MAX` is the shape a node picks when it wants
-    /// the depth check to pass trivially.
+    /// **Fabrication: the future.** A height beyond the source's own peak is rejected — by the depth
+    /// rule, since a future height is zero blocks deep. `u32::MAX` is the shape a node picks when it
+    /// wants a naive depth subtraction to underflow into something huge.
     #[test]
     fn a_confirmation_past_the_peak_is_not_evidence() {
         let coin = coin();
