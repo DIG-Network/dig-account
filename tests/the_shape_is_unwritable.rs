@@ -253,10 +253,13 @@ fn signing_doors(source: &str) -> Vec<String> {
 /// The exemption is scoped to BOTH the file and the name, so the same helper name reappearing in
 /// another module is a new door and is caught.
 fn unauthorized_signing_doors_in(path: &str, source: &str) -> Vec<String> {
-    let is_exempt_file = path.replace('\\', "/").ends_with(EXEMPT_SIGNING_DOOR.0);
+    // The exemption is CONDITIONAL on the door still being unreachable, so a `pub` added to it makes
+    // the main guard itself fire rather than relying on a separate test to notice.
+    let exemption_applies = path.replace('\\', "/").ends_with(EXEMPT_SIGNING_DOOR.0)
+        && exempt_door_is_still_module_private(source);
     signing_doors(source)
         .into_iter()
-        .filter(|door| !(is_exempt_file && door.starts_with(EXEMPT_SIGNING_DOOR.1)))
+        .filter(|door| !(exemption_applies && door.starts_with(EXEMPT_SIGNING_DOOR.1)))
         .collect()
 }
 
@@ -391,14 +394,18 @@ fn the_signing_door_guard_fires_on_every_form_it_once_missed() {
         ),
     ];
 
-    for (what, source) in missed_forms {
-        assert_eq!(
-            unauthorized_signing_doors(source).len(),
-            1,
-            "{what} is a route to a signature over caller-supplied spends and must be caught: \
-             {source}"
-        );
-    }
+    // Collected rather than asserted one at a time: a rule change that reopens the class should
+    // report the WHOLE class, not just whichever form happens to be listed first.
+    let uncaught: Vec<&str> = missed_forms
+        .iter()
+        .filter(|(_, source)| unauthorized_signing_doors(source).len() != 1)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(
+        uncaught.is_empty(),
+        "each of these is a route to a signature over caller-supplied spends and must be caught, \
+         but the guard missed: {uncaught:?}"
+    );
 
     // `pub(super)` — the third form the previous rule DID cover — must not be lost in the rewrite.
     assert_eq!(
