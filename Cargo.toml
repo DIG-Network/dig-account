@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -33,9 +33,9 @@ dig-social-profile = "0.2"
 # 0.16.1 exactly: the overflow boundary this crate pins in `enforcer` was only made observable there.
 dig-wallet-backend = { version = "0.16.1", default-features = false, features = ["client"] }
 dig-session = "0.5"
-dig-identity = "0.5"
+dig-identity = "0.6"
 dig-keystore = "0.4.1"
-dig-constants = "0.9"
+dig-constants = "0.10"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
