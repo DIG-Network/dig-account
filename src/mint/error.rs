@@ -47,6 +47,28 @@ pub enum MintError {
     #[error("could not build the mint spend: {0}")]
     Build(String),
 
+    /// The account is no longer unlocked: it was locked explicitly, or its idle window lapsed,
+    /// between obtaining the minter and asking it to mint.
+    ///
+    /// No key material was derived and nothing was pushed. The host re-unlocks and mints again.
+    #[error("account is locked")]
+    Locked,
+
+    /// The requested farmer fee is above the mint's hard ceiling ([`MAX_MINT_FEE_MOJOS`]).
+    ///
+    /// The singleton itself costs exactly one mojo, so the fee is the whole of what a mint can spend
+    /// — an unbounded one turns a single call into a route for handing a wallet coin to a farmer.
+    /// This is a ceiling, not a policy: no caller can raise it.
+    ///
+    /// [`MAX_MINT_FEE_MOJOS`]: crate::mint::MAX_MINT_FEE_MOJOS
+    #[error("mint fee of {fee} mojos is above the {ceiling} mojo ceiling")]
+    FeeAboveCeiling {
+        /// The fee the caller asked for.
+        fee: u64,
+        /// The largest fee a mint will pay.
+        ceiling: u64,
+    },
+
     /// The mint's own pre-signing gate refused the spend it was about to sign.
     ///
     /// Fail-closed: the mint signs only signatures under its own wallet key, only `AGG_SIG_ME`, and

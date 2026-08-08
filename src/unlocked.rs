@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
+use crate::profile_mint::ProfileMinter;
 use crate::session_residency::Residency;
 use crate::signer::ProfileSigner;
 use crate::wallet::authorizer::WalletOps;
@@ -110,6 +111,21 @@ impl UnlockedAccount {
             self.default_profile_ix,
             self.residency.clone(),
         )
+    }
+
+    /// The DID-mint handle for this account — the only way to obtain one.
+    ///
+    /// Like [`wallet_ops`](Self::wallet_ops), and for the same reason, the returned
+    /// [`ProfileMinter`] observes this unlock's [`Residency`]: a mint spends real XCH, so it stops
+    /// the moment [`lock`](Self::lock) is called or the idle window lapses. It is not a way to keep
+    /// a relocked account spendable.
+    ///
+    /// **Minting on [`MintNetwork::mainnet`](crate::mint::MintNetwork::mainnet) spends real XCH**,
+    /// and the resulting DID is a permanent on-chain artifact. A DID may be recorded only from a
+    /// [`MintStatus::Confirmed`](crate::mint::MintStatus::Confirmed) — never from a successful push
+    /// (`SPEC.md` §6A.2).
+    pub fn profile_minter(&self) -> ProfileMinter {
+        ProfileMinter::new(self.seed.clone(), self.residency.clone())
     }
 
     /// The per-profile data-encryption key (DEK) for profile `ix` — 32 bytes, derived from the seed

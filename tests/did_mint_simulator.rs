@@ -9,267 +9,23 @@
 //! a real window during which the mint has been pushed and no DID coin exists. A mint that recorded
 //! a DID from a successful push would return evidence inside that window; this one returns `None`.
 
-use std::cell::RefCell;
-
-use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
-use chia_sdk_test::Simulator;
-use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
-use chia_wallet_sdk::signer::AggSigConstants;
 use dig_account::{
-    ChainUnavailable, MintError, MintNetwork, MintOptions, MintStatus, ProfileIx, ProfileMinter,
-    PushOutcome, SpendPublisher, WalletKey, MIN_CONFIRMATION_DEPTH,
+    MintError, MintNetwork, MintOptions, MintStatus, ProfileIx, MIN_CONFIRMATION_DEPTH,
 };
-use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
-use dig_keystore::{BackendKey, MemoryBackend};
-use dig_session::{Password, Session, UnlockedMasterSeed, ENTROPY_LEN};
-use std::sync::Arc;
 
-/// A test double that is a chain source AND a publisher over one in-process simulator.
-///
-/// Pushed bundles land in `mempool` and are applied only by [`farm`](Self::farm) — the simulator
-/// applies a transaction immediately, so without this the "pushed but not yet confirmed" state
-/// would not exist and the evidence invariant could not be observed failing.
-struct SimulatorChain {
-    sim: RefCell<Simulator>,
-    mempool: RefCell<Vec<SpendBundle>>,
-    /// When set, every read and every push reports the chain as unanswerable.
-    offline: bool,
-    /// When set, the mempool rejects every push with this reason.
-    reject_with: Option<String>,
-    /// When set, READS succeed and only the PUSH cannot be delivered — the node is reachable enough
-    /// to answer questions and the bundle still did not get through.
-    push_undeliverable: bool,
-    /// When set, the source answers reads but exposes NO peak height — the shape of a provider that
-    /// simply does not track one.
-    no_peak: bool,
-    /// Coin ids this node reports as UNCONFIRMED coin states — what a mempool-aware node (and the
-    /// coinset API, whose `CoinState.created_height` is `None` for a mempool coin) really returns
-    /// while a bundle waits for a block.
-    mempool_observed: RefCell<Vec<chia_protocol::Coin>>,
-    /// Coin ids this node reports as SPENT, whatever the simulator holds — how a node answers once
-    /// some other spend has consumed a coin.
-    spent_elsewhere: RefCell<Vec<Bytes32>>,
-}
+mod common;
 
-impl SimulatorChain {
-    fn new() -> Self {
-        let sim = Simulator::new();
-        let chain = Self {
-            sim: RefCell::new(sim),
-            mempool: RefCell::new(Vec::new()),
-            offline: false,
-            reject_with: None,
-            push_undeliverable: false,
-            no_peak: false,
-            mempool_observed: RefCell::new(Vec::new()),
-            spent_elsewhere: RefCell::new(Vec::new()),
-        };
-        // Leave genesis behind: a real coin is never created in block 0, and a fixture that
-        // confirmed there would be indistinguishable from a fabricated height.
-        chain.bury(1);
-        chain
-    }
-
-    /// Make this node report `coin_id` as spent — a different spend got there first.
-    fn report_spent(&self, coin_id: Bytes32) {
-        self.spent_elsewhere.borrow_mut().push(coin_id);
-    }
-
-    /// Make this node report `coin` the way a mempool-aware node reports a coin it has seen but no
-    /// block has confirmed: the real coin, with no confirmed height.
-    fn observe_in_mempool(&self, coin: chia_protocol::Coin) {
-        self.mempool_observed.borrow_mut().push(coin);
-    }
-
-    fn offline() -> Self {
-        Self {
-            offline: true,
-            ..Self::new()
-        }
-    }
-
-    fn rejecting(reason: &str) -> Self {
-        Self {
-            reject_with: Some(reason.to_string()),
-            ..Self::new()
-        }
-    }
-
-    /// Fund `puzzle_hash` with a confirmed coin of `amount` mojos.
-    fn fund(&self, puzzle_hash: Bytes32, amount: u64) {
-        self.sim.borrow_mut().new_coin(puzzle_hash, amount);
-    }
-
-    /// Apply every pushed bundle, then build blocks on top until the result is buried past
-    /// [`MIN_CONFIRMATION_DEPTH`] — a mint is not evidence until it is deep, so a "farm" that
-    /// stopped at inclusion would leave every confirmation test asserting the wrong thing.
-    fn farm(&self) -> anyhow::Result<()> {
-        self.include_in_a_block()?;
-        self.bury(MIN_CONFIRMATION_DEPTH);
-        Ok(())
-    }
-
-    /// Apply every pushed bundle in the very next block, and no deeper.
-    fn include_in_a_block(&self) -> anyhow::Result<Vec<Bytes32>> {
-        let mut verdicts = Vec::new();
-        for bundle in self.mempool.borrow_mut().drain(..) {
-            let updates = self.sim.borrow_mut().new_transaction(bundle)?;
-            verdicts.extend(updates.keys().copied());
-        }
-        self.sim.borrow_mut().create_block();
-        Ok(verdicts)
-    }
-
-    /// Advance the chain by `blocks` empty blocks.
-    fn bury(&self, blocks: u32) {
-        for _ in 0..blocks {
-            self.sim.borrow_mut().create_block();
-        }
-    }
-
-    fn unavailable<T>(&self) -> Result<T, String> {
-        Err("simulated: no node answered".to_string())
-    }
-}
-
-impl ChainSource for SimulatorChain {
-    type Error = String;
-
-    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
-        if self.offline {
-            return self.unavailable();
-        }
-        if let Some(state) = self.sim.borrow().coin_state(coin_id) {
-            let mut record = CoinRecord::from_coin_state(state);
-            if self.spent_elsewhere.borrow().contains(&coin_id) {
-                record.spent_height = record.confirmed_height;
-            }
-            return Ok(Some(record));
-        }
-        if let Some(coin) = self
-            .mempool_observed
-            .borrow()
-            .iter()
-            .find(|coin| coin.coin_id() == coin_id)
-        {
-            return Ok(Some(CoinRecord {
-                coin: *coin,
-                confirmed_height: None,
-                spent_height: None,
-                timestamp: None,
-                coinbase: false,
-            }));
-        }
-        Ok(None)
-    }
-
-    fn coin_records_by_puzzle_hash(
-        &self,
-        puzzle_hash: Bytes32,
-        include_spent: bool,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
-        if self.offline {
-            return self.unavailable();
-        }
-        let sim = self.sim.borrow();
-        Ok(sim
-            .unspent_coins(puzzle_hash, false)
-            .into_iter()
-            .filter_map(|coin| sim.coin_state(coin.coin_id()))
-            .filter(|state| include_spent || state.spent_height.is_none())
-            .map(CoinRecord::from_coin_state)
-            .collect())
-    }
-
-    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
-        if self.offline {
-            return self.unavailable();
-        }
-        Ok(self
-            .sim
-            .borrow()
-            .children(parent)
-            .into_iter()
-            .map(CoinRecord::from_coin_state)
-            .collect())
-    }
-
-    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
-        if self.offline {
-            return self.unavailable();
-        }
-        Ok(self.sim.borrow().coin_spend(coin_id))
-    }
-
-    fn resolve_singleton_lineage(
-        &self,
-        _launcher_id: Bytes32,
-    ) -> Result<Option<SingletonLineage>, Self::Error> {
-        // Honest refusal: the mint never walks a lineage, so this double does not pretend to.
-        Err("lineage resolution is not supported by the simulator double".to_string())
-    }
-
-    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
-        if self.offline {
-            return self.unavailable();
-        }
-        if self.no_peak {
-            return Ok(None);
-        }
-        Ok(Some(self.sim.borrow().height()))
-    }
-
-    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
-        Ok(None)
-    }
-}
-
-impl SpendPublisher for SimulatorChain {
-    fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome, ChainUnavailable> {
-        if self.offline || self.push_undeliverable {
-            return Err(ChainUnavailable::new("simulated: no node answered"));
-        }
-        if let Some(reason) = &self.reject_with {
-            return Ok(PushOutcome::Rejected {
-                reason: reason.clone(),
-            });
-        }
-        self.mempool.borrow_mut().push(bundle.clone());
-        Ok(PushOutcome::Accepted)
-    }
-}
-
-fn unlocked_seed() -> Arc<UnlockedMasterSeed> {
-    Arc::new(
-        Session::enroll_master_seed(
-            Arc::new(MemoryBackend::new()),
-            BackendKey::new("mint-test".to_string()),
-            Password::new("pw"),
-            &[0x5A; ENTROPY_LEN],
-        )
-        .expect("enrolling a master seed"),
-    )
-}
-
-fn wallet_puzzle_hash(seed: &UnlockedMasterSeed, ix: ProfileIx) -> Bytes32 {
-    WalletKey::from_seed_at(&seed.master_seed()[..], ix).puzzle_hash()
-}
-
-/// The simulator validates against testnet11's consensus constants, so the mint must sign under
-/// those — signing under mainnet's would produce a bundle no validator accepts.
-fn simulator_network() -> MintNetwork {
-    MintNetwork::from_constants(AggSigConstants::from(&*TESTNET11_CONSTANTS))
-}
+use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
 /// The whole mint, proven by consensus: a real bundle is built, signed with the account's own wallet
 /// key, accepted by the CLVM+signature validator, and the DID coin it creates is what the evidence
 /// names.
 #[test]
 fn a_mint_is_accepted_by_the_consensus_validator_and_yields_its_did() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -299,10 +55,10 @@ fn a_mint_is_accepted_by_the_consensus_validator_and_yields_its_did() -> anyhow:
 /// by the mempool — and there is still no DID on chain. `confirm` must say so.
 #[test]
 fn a_pushed_but_unfarmed_mint_is_not_yet_a_did() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -325,13 +81,11 @@ fn a_pushed_but_unfarmed_mint_is_not_yet_a_did() -> anyhow::Result<()> {
 }
 
 /// Mints on a throwaway chain and farms it, returning the real DID coin the mint creates.
-fn farmed_did_coin(
-    seed: &Arc<UnlockedMasterSeed>,
-    network: &MintNetwork,
-) -> anyhow::Result<chia_protocol::Coin> {
-    let minter = ProfileMinter::new(seed.clone());
+fn farmed_did_coin(network: &MintNetwork) -> anyhow::Result<chia_protocol::Coin> {
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
@@ -355,10 +109,10 @@ fn farmed_did_coin(
 /// record at all, so a `confirm` that ignored the height entirely would still pass it.)
 #[test]
 fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -370,7 +124,7 @@ fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()>
     // The DID coin exactly as it will exist on chain — learned by farming this same mint on a
     // second, throwaway chain, so the record under test differs from real evidence in ONE respect:
     // it has no confirmed height.
-    let did_coin = farmed_did_coin(&seed, &simulator_network())?;
+    let did_coin = farmed_did_coin(&simulator_network())?;
     assert_eq!(did_coin.coin_id(), pending.did_coin_id());
     chain.observe_in_mempool(did_coin);
 
@@ -392,10 +146,10 @@ fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()>
 /// collapsing the two would let a wizard report "no DID yet" for a mint that has in fact confirmed.
 #[test]
 fn an_unreachable_chain_is_not_reported_as_an_unconfirmed_mint() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let online = SimulatorChain::new();
-    online.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    online.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -418,8 +172,8 @@ fn an_unreachable_chain_is_not_reported_as_an_unconfirmed_mint() -> anyhow::Resu
 /// "add funds" — carrying what it needed and what it found.
 #[test]
 fn an_unfunded_wallet_reports_insufficient_funds() {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed);
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
 
     let error = minter
@@ -450,10 +204,10 @@ fn an_unfunded_wallet_reports_insufficient_funds() {
 /// The unfunded case above cannot distinguish "no coins" from "no big-enough coin"; this one can.
 #[test]
 fn a_wallet_whose_coins_are_all_too_small_reports_the_largest_one() {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    let puzzle_hash = wallet_puzzle_hash(&seed, ProfileIx::ROOT);
+    let puzzle_hash = wallet_puzzle_hash(&account);
     chain.fund(puzzle_hash, 10);
     chain.fund(puzzle_hash, 40);
 
@@ -484,8 +238,8 @@ fn a_wallet_whose_coins_are_all_too_small_reports_the_largest_one() {
 /// funded wallet the node simply could not be asked about.
 #[test]
 fn an_unreachable_chain_during_selection_is_not_reported_as_insufficient_funds() {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed);
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::offline();
 
     let error = minter
@@ -508,10 +262,10 @@ fn an_unreachable_chain_during_selection_is_not_reported_as_insufficient_funds()
 /// funded and the chain is reachable, so neither of the other two outcomes can explain it.
 #[test]
 fn a_rejected_push_is_reported_as_a_rejection_with_the_node_reason() {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::rejecting("DOUBLE_SPEND");
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let error = minter
         .begin_did_mint(
@@ -534,8 +288,8 @@ fn a_rejected_push_is_reported_as_a_rejection_with_the_node_reason() {
 /// whether the node answered, so they pin the distinction itself.
 #[test]
 fn an_undeliverable_push_is_unreachable_rather_than_rejected() {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     // Reads work and the wallet is funded, so selection and building both succeed: the ONLY thing
     // that fails is the delivery of the bundle. A double that was offline for reads too would fail
     // at coin selection and never exercise the push at all.
@@ -543,7 +297,7 @@ fn an_undeliverable_push_is_unreachable_rather_than_rejected() {
         push_undeliverable: true,
         ..SimulatorChain::new()
     };
-    reachable_but_undeliverable.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    reachable_but_undeliverable.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let error = minter
         .begin_did_mint(
@@ -562,10 +316,10 @@ fn an_undeliverable_push_is_unreachable_rather_than_rejected() {
 /// mint the wallet holds its change coin and exactly the fee has left.
 #[test]
 fn the_fee_leaves_the_wallet_and_the_change_returns_to_it() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    let puzzle_hash = wallet_puzzle_hash(&seed, ProfileIx::ROOT);
+    let puzzle_hash = wallet_puzzle_hash(&account);
     chain.fund(puzzle_hash, 1_000_000);
 
     minter.begin_did_mint(
@@ -599,11 +353,11 @@ fn the_fee_leaves_the_wallet_and_the_change_returns_to_it() -> anyhow::Result<()
 /// `DuplicateOutput`, and the mint must now be included and confirm.
 #[test]
 fn a_wallet_holding_exactly_fee_plus_two_can_still_mint() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
     let fee = 100;
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), fee + 2);
+    chain.fund(wallet_puzzle_hash(&account), fee + 2);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -630,10 +384,10 @@ fn a_wallet_holding_exactly_fee_plus_two_can_still_mint() -> anyhow::Result<()> 
 fn the_amounts_either_side_of_the_colliding_one_also_mint() -> anyhow::Result<()> {
     let fee = 100;
     for amount in [fee + 1, fee + 3] {
-        let seed = unlocked_seed();
-        let minter = ProfileMinter::new(seed.clone());
+        let account = unlocked_account();
+        let minter = account.profile_minter();
         let chain = SimulatorChain::new();
-        chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), amount);
+        chain.fund(wallet_puzzle_hash(&account), amount);
 
         let pending = minter.begin_did_mint(
             ProfileIx::ROOT,
@@ -656,10 +410,10 @@ fn the_amounts_either_side_of_the_colliding_one_also_mint() -> anyhow::Result<()
 /// that no longer exists. The status stays `Awaiting` until the burial completes.
 #[test]
 fn a_freshly_included_mint_is_not_evidence_until_it_is_buried() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -717,10 +471,10 @@ fn a_freshly_included_mint_is_not_evidence_until_it_is_buried() -> anyhow::Resul
 /// fail; the caller must be able to see `Failed` and mint again.
 #[test]
 fn a_mint_whose_input_was_spent_elsewhere_is_failed_not_awaiting() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
@@ -757,12 +511,12 @@ fn a_mint_whose_input_was_spent_elsewhere_is_failed_not_awaiting() -> anyhow::Re
 /// fabricated height pass the checks that exist to catch one.
 #[test]
 fn a_source_without_a_peak_height_cannot_establish_evidence() -> anyhow::Result<()> {
-    let seed = unlocked_seed();
-    let minter = ProfileMinter::new(seed.clone());
+    let account = unlocked_account();
+    let minter = account.profile_minter();
 
     // The control: with a peak, this same chain mints and confirms.
     let chain = SimulatorChain::new();
-    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
     let pending = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
@@ -789,7 +543,7 @@ fn a_source_without_a_peak_height_cannot_establish_evidence() -> anyhow::Result<
         no_peak: true,
         ..SimulatorChain::new()
     };
-    unstartable.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    unstartable.fund(wallet_puzzle_hash(&account), 1_000_000);
     assert!(matches!(
         minter.begin_did_mint(
             ProfileIx::ROOT,

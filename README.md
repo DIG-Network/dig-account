@@ -11,7 +11,8 @@ This crate owns the object model, unlock policy + keystore crypto, the in-proces
 signer, per-profile key/DEK derivation, the DID+dig-store mint, and all wallet ops. It never draws
 UI — the host harness (dig-app) injects a UI/auth provider that this crate calls back through.
 
-`PolicyAuthorizer` is the custody gate, and **it is not optional.** It enforces the two-tier custody
+`PolicyAuthorizer` is the custody gate for the **money path**, and on that path **it is not optional.**
+It enforces the two-tier custody
 policy and the user's auto-send policy: a vault-tier spend always requires a full authorization
 ceremony and may only ever pay the profile's own hot wallet (via `VaultMove`, a 24-hour clawback the
 user can cancel); a hot-wallet spend auto-signs only within its op class, its per-transaction limit,
@@ -30,6 +31,28 @@ being silently declined.
 
 `SPEC.md` §6.2 is the normative statement, including the limits this layer still does NOT provide
 (§6.1.1).
+
+**The DID mint is the one spend this gate does not rule, deliberately.** A mint bundle is a singleton
+launch, which the money path's spend-summary derivation fails closed on by design — routing the mint
+through that gate would mean weakening the verifier that protects every ordinary spend. So the mint
+carries its own, strictly narrower controls instead of borrowing these: a whitelist that signs nothing
+but `AGG_SIG_ME` under this wallet's own key over exactly one pre-existing coin it owns, a hard fee
+ceiling of `MAX_MINT_FEE_MOJOS` (0.01 XCH — the fee is the only value a mint can vary), and the same
+residency the money signer observes, so a locked or idled-out account cannot mint. `SPEC.md` §6A.5/§6A.6
+states it normatively.
+
+## The DID mint
+
+```rust
+let minter = unlocked.profile_minter();          // the only route to one
+let pending = minter.begin_did_mint(ix, &chain, &publisher, &MintNetwork::mainnet(), &options)?;
+// …later, and only this may be recorded:
+if let MintStatus::Confirmed(minted) = minter.mint_status(&pending, &chain)? { … }
+```
+
+A pushed bundle is not a DID. `begin_did_mint` returns a `PendingMint`; only a sufficiently-buried
+confirmation of the exact coin that bundle created becomes a `MintedDid`, so a host cannot claim an
+identity the chain has not shown it. On mainnet this spends real XCH.
 
 ## The recovery phrase
 
