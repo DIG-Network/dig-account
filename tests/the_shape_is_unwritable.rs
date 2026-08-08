@@ -184,42 +184,86 @@ fn without_line_breaks(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The visibility modifiers that make a function reachable from outside its own module.
-const REACHABLE_VISIBILITIES: [&str; 3] = ["pub ", "pub(crate) ", "pub(super) "];
+/// The ONE production signing helper this guard exempts, named explicitly.
+///
+/// `src/mint/did.rs` holds a module-private `fn sign_mint_spends(&[CoinSpend])` that runs the mint's
+/// own whitelist gate three lines before it signs; the only way in is `mint_did`, so it is not a
+/// route anybody can take. Rewriting the mint's gate onto `SpendApproval` is a separate design
+/// decision (`SPEC.md` §6.2), so the door is permitted — by NAME.
+///
+/// The exemption is a name rather than a rule shape, because the rule-shape version of this same
+/// judgement is what failed. Expressing "unreachable" as "the text `pub `/`pub(crate) `/`pub(super) `
+/// abuts `fn`" silently exempted a whole CLASS: `pub async fn sign…`, `pub unsafe/const/extern fn
+/// sign…`, `pub(in path)`, `pub(self)`, and every method inside a `pub trait` — all reachable, all
+/// invisible to it, and all of them caught before the narrowing. A named exemption can only ever be
+/// wrong about the one thing it names, and [`the_exemption_is_still_earned`] re-checks that one
+/// thing on every run.
+const EXEMPT_SIGNING_DOOR: (&str, &str) = ("src/mint/did.rs", "fn sign_mint_spends");
 
-/// The signature shapes that would be an unauthorized route to a signature, in normalized form.
+/// How far back to read for a visibility modifier when deciding whether the exemption still applies.
+/// Generously wide: over-reading can only REVOKE the exemption (fail-closed), never grant it.
+const VISIBILITY_LOOKBEHIND: usize = 80;
+
+/// Whether the exempted door in `source` is still module-private.
 ///
-/// A signing door is a function whose name begins `sign`, which accepts loose coin spends, and which
-/// is REACHABLE beyond its own module.
+/// Fail-closed by construction: it looks for the substring `pub` anywhere in the run of text before
+/// the declaration and, finding any, refuses the exemption. So every form the previous rule could not
+/// spell — `pub(in …)`, `pub(self)`, `pub async`, `pub unsafe` — revokes the exemption rather than
+/// silently inheriting it.
+fn exempt_door_is_still_module_private(source: &str) -> bool {
+    let normalized = without_line_breaks(source);
+    match normalized.find(EXEMPT_SIGNING_DOOR.1) {
+        None => true, // Not present at all; nothing to exempt.
+        Some(start) => {
+            let from = start.saturating_sub(VISIBILITY_LOOKBEHIND);
+            !normalized[from..start].contains("pub")
+        }
+    }
+}
+
+/// Every function in `source` that turns loose coin spends into a signature, exempt or not.
 ///
-/// The reachability qualifier is deliberate and is the guard's exact boundary. `src/mint/did.rs`
-/// holds a module-private `fn sign_mint_spends(&[CoinSpend])` that runs the mint's own whitelist gate
-/// three lines before it signs; it is not a route anybody can take, because the only way in is
-/// `mint_did`. Flagging it would force either a false exemption for that file — a hole the next
-/// author inherits silently — or a rewrite of the mint's gate onto `SpendApproval`, which is a
-/// separate design decision. What the guard still claims in full is the thing #1698 actually was: no
-/// signature over caller-supplied spends is REACHABLE without an approval.
-fn unauthorized_signing_doors(source: &str) -> Vec<String> {
+/// A signing door is a function whose name begins `sign` and which accepts `&[CoinSpend]`. No
+/// visibility filter: an unreachable door is excluded by NAME above, never by a guess at what
+/// "reachable" looks like in text.
+fn signing_doors(source: &str) -> Vec<String> {
     let normalized = without_line_breaks(source);
     normalized
         .match_indices("fn sign")
-        .filter(|(start, _)| {
-            let preceding = &normalized[..*start];
-            REACHABLE_VISIBILITIES
-                .iter()
-                .any(|vis| preceding.ends_with(vis))
-        })
         .filter_map(|(start, _)| {
-            // A signature ends at its opening brace or its `where`; take a bounded window so a later,
-            // unrelated `&[CoinSpend]` elsewhere in the file cannot be attributed to this function.
+            // A signature ends at its opening brace, its semicolon (a trait method has no body), or
+            // its `where`; take a bounded window so a later, unrelated `&[CoinSpend]` elsewhere in
+            // the file cannot be attributed to this function.
             let rest = &normalized[start..];
-            let end = rest.find('{').unwrap_or(rest.len()).min(400);
+            let end = rest
+                .find(['{', ';'])
+                .unwrap_or(rest.len())
+                .min(400)
+                .min(rest.len());
             let signature = &rest[..end];
             signature
                 .contains("&[CoinSpend]")
                 .then(|| signature.to_string())
         })
         .collect()
+}
+
+/// The signing doors in `path`'s `source` that the one named exemption does not cover.
+///
+/// The exemption is scoped to BOTH the file and the name, so the same helper name reappearing in
+/// another module is a new door and is caught.
+fn unauthorized_signing_doors_in(path: &str, source: &str) -> Vec<String> {
+    let is_exempt_file = path.replace('\\', "/").ends_with(EXEMPT_SIGNING_DOOR.0);
+    signing_doors(source)
+        .into_iter()
+        .filter(|door| !(is_exempt_file && door.starts_with(EXEMPT_SIGNING_DOOR.1)))
+        .collect()
+}
+
+/// The signing doors in a source fragment that belongs to no exempted file — the shape every
+/// negative control below exercises.
+fn unauthorized_signing_doors(source: &str) -> Vec<String> {
+    unauthorized_signing_doors_in("src/wallet/money_signer.rs", source)
 }
 
 /// **No signing entry point takes loose coin spends.**
@@ -231,7 +275,7 @@ fn unauthorized_signing_doors(source: &str) -> Vec<String> {
 #[test]
 fn no_signing_function_accepts_bare_coin_spends() {
     for (path, text) in production_sources() {
-        let doors = unauthorized_signing_doors(&text);
+        let doors = unauthorized_signing_doors_in(&path, &text);
         assert!(
             doors.is_empty(),
             "{path} declares a signing function over bare coin spends, which would be an \
@@ -296,6 +340,131 @@ impl LocalMoneySigner {
         .len(),
         1,
         "a crate-visible signing door is still reachable, and still a door"
+    );
+}
+
+/// NEGATIVE CONTROLS for every door form a previous version of this guard MISSED.
+///
+/// Each of these was inserted verbatim into production `money_signer.rs` and the guard still printed
+/// `ok`. They are here individually, and named, because the previous control set tested only
+/// `pub(crate)` — the one form that still worked — so it could confirm the rule and never notice the
+/// class the rule had stopped covering. A control that only re-tests the working form is how this
+/// recurred.
+#[test]
+fn the_signing_door_guard_fires_on_every_form_it_once_missed() {
+    let missed_forms: [(&str, &str); 8] = [
+        (
+            "an async door",
+            "pub async fn sign_these_spends_async(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            "an unsafe door",
+            "pub unsafe fn sign_raw(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            "a const door",
+            "pub const fn sign_const(coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            "an extern door",
+            "pub extern \"C\" fn sign_ffi(coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            "a path-restricted door",
+            "pub(in crate::wallet) fn sign_in_path(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            "a pub(self) door",
+            "pub(self) fn sign_here(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {",
+        ),
+        (
+            // A trait method has no body, so its signature ends at a SEMICOLON, not a brace — the
+            // reason the previous window (brace-only) could not even bound it.
+            "a public trait's method",
+            "pub trait BackdoorSigner { fn sign_raw_spends(&self, coin_spends: &[CoinSpend]) -> Result<Signature>; }",
+        ),
+        (
+            // Reachable through the trait even though the `impl` block carries no visibility at all —
+            // the form no visibility-prefix rule can ever see.
+            "a trait-impl method",
+            "impl BackdoorSigner for LocalMoneySigner { fn sign_raw_spends(&self, coin_spends: &[CoinSpend]) -> Result<Signature> { unimplemented!() } }",
+        ),
+    ];
+
+    for (what, source) in missed_forms {
+        assert_eq!(
+            unauthorized_signing_doors(source).len(),
+            1,
+            "{what} is a route to a signature over caller-supplied spends and must be caught: \
+             {source}"
+        );
+    }
+
+    // `pub(super)` — the third form the previous rule DID cover — must not be lost in the rewrite.
+    assert_eq!(
+        unauthorized_signing_doors(
+            "pub(super) fn sign_upward(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {"
+        )
+        .len(),
+        1,
+        "a parent-visible door is still a door"
+    );
+}
+
+/// The named exemption must stay EARNED, and stay narrow.
+///
+/// A named exemption's failure mode is that it outlives its justification: the door it names becomes
+/// reachable, or the name migrates to a second module, and the guard keeps waving both through. Both
+/// are checked here against the real tree rather than against a fixture.
+#[test]
+fn the_exemption_is_still_earned() {
+    let (exempt_path, exempt_name) = EXEMPT_SIGNING_DOOR;
+
+    let homes: Vec<String> = production_sources()
+        .into_iter()
+        .filter(|(_, text)| without_line_breaks(text).contains(exempt_name))
+        .map(|(path, _)| path.replace('\\', "/"))
+        .collect();
+    assert_eq!(
+        homes.len(),
+        1,
+        "`{exempt_name}` must exist in exactly one module, or the exemption covers a door nobody \
+         reviewed; found: {homes:?}"
+    );
+    assert!(
+        homes[0].ends_with(exempt_path),
+        "the exemption names {exempt_path}, but the door lives in {}",
+        homes[0]
+    );
+
+    let source = production_sources()
+        .into_iter()
+        .find(|(path, _)| path.replace('\\', "/").ends_with(exempt_path))
+        .map(|(_, text)| text)
+        .expect("the exempted module must exist");
+    assert!(
+        exempt_door_is_still_module_private(&source),
+        "`{exempt_name}` is exempted ONLY because it is unreachable outside its module (SPEC §6.2); \
+         it now carries a visibility modifier, so the exemption no longer holds"
+    );
+
+    // NEGATIVE CONTROL for the earned-ness check itself: it must revoke on every visibility form,
+    // including the ones no prefix rule could spell.
+    for made_reachable in [
+        "pub fn sign_mint_spends(",
+        "pub(crate) fn sign_mint_spends(",
+        "pub(in crate::mint) fn sign_mint_spends(",
+        "pub async fn sign_mint_spends(",
+        "pub(self) fn sign_mint_spends(",
+    ] {
+        assert!(
+            !exempt_door_is_still_module_private(made_reachable),
+            "the exemption must be revoked by `{made_reachable}`"
+        );
+    }
+    assert!(
+        exempt_door_is_still_module_private("fn sign_mint_spends( wallet: &WalletKey, ) {"),
+        "a genuinely module-private helper must keep the exemption, or the guard always trips"
     );
 }
 

@@ -159,7 +159,13 @@ Idle-relock (Phase-1 status): the idle-relock LIFECYCLE PRIMITIVE ships as
 `auth::policy::UnlockGate` — a clock-injected holder that runs the `AuthPolicy` + keystore unlock and,
 while unlocked AND within the idle window, hands out a live `UnlockedAccount` via `unlock()` / `access()`
 (refreshing the deadline), relocks (drops + zeroizes the seed) after the idle window, and supports
-explicit `lock()`. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
+explicit `lock()`. **One unlock yields exactly ONE `Residency`, shared by every `UnlockedAccount` the
+gate hands out from it and by every capability derived from those handles.** `UnlockGate::lock()`, idle
+expiry, a superseding `unlock()`, and dropping the gate MUST each REVOKE that token, so a capability
+retained across any of them (a `LocalMoneySigner` in particular) fails with `Locked` rather than
+continuing to sign. Revocation is required rather than implied by dropping the seed: the seed's `Arc` is
+shared with every handle already issued, so dropping the gate's reference alone leaves those handles
+fully working. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
 `Arc<UnlockedMasterSeed>` lives only in its private state, and both `unlock()` and `access()` return
 `UnlockedAccount` (the same shape as `AccountSession`). A host that needs idle-relock today holds the
 account through an `UnlockGate`. Wiring idle-relock directly onto the `UnlockedAccount` capability
@@ -167,7 +173,8 @@ lifecycle (so `signer()`/`wallet_ops()`/`dek()` re-check the idle window and ret
 is a deferred v0.1.x follow-up: it changes those accessors to fallible and is a deliberate, tested
 lifecycle change rather than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained
 directly from `AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained
-via `UnlockGate::access()` is idle-bounded by the gate.
+via `UnlockGate::unlock()`/`access()` is idle-bounded by the gate, and its capabilities are revoked when
+the gate relocks.
 
 ### 4.2 AuthPolicy / SecondFactor evaluation (pure, in-crate)
 
@@ -290,14 +297,23 @@ it of a host.** The enforcement is structural:
   otherwise describe them: a comparison of two values is a step that can be skipped, mis-scoped, or run
   over the wrong bytes, whereas a single owned value cannot be mismatched.
 - `MoneySigner::sign_approved(SpendApproval) -> Result<SpendBundle>` MUST be the only signing entry
-  point on the money path. **No REACHABLE function — `pub`, `pub(crate)` or `pub(super)` — MAY turn
-  `&[CoinSpend]` into a signature.** An unauthorized spend therefore has no type that can reach a
-  signer, which is what makes the ordering rule above an enforcement point rather than a sentence in a
-  specification.
-- The DID mint (§6A) is the one signing path that does NOT run through a `SpendApproval`. It builds its
-  own spends rather than accepting a caller's, and it MUST gate them under its own whitelist (§6A.4)
-  before signing. Its signing helper MUST stay module-private, so it remains unreachable except through
-  `mint_did`. Unifying the two gates is a future change, not a licence to add a second reachable door.
+  point on the money path. **The CAPABILITY of turning caller-supplied coin spends into a signature
+  MUST NOT be obtainable by any route other than presenting a `SpendApproval`** — whatever form that
+  route would take: a free function, an inherent method, a trait method or its implementation, an
+  `async`/`unsafe`/`const`/`extern` function, or any visibility short of module-private. An
+  unauthorized spend therefore has no type that can reach a signer, which is what makes the ordering
+  rule above an enforcement point rather than a sentence in a specification.
+
+  The MUST is stated over the capability rather than over a parameter type or a list of visibility
+  keywords deliberately. A rule spelled as a keyword list exempts, silently, every form it fails to
+  spell; the enforcing guard (`tests/the_shape_is_unwritable.rs`) therefore flags EVERY signing
+  function over coin spends and carries its single permitted exception by name.
+- The DID mint (§6A) is the one signing path that does NOT run through a `SpendApproval`, and is the
+  one exception the guard names. It builds its own spends rather than accepting a caller's, and it
+  MUST gate them under its own whitelist (§6A.4) before signing. Its signing helper MUST stay
+  module-private and MUST live in exactly one module, so it remains unreachable except through
+  `mint_did`; the exception lapses automatically if either ceases to hold. Unifying the two gates is a
+  future change, not a licence to add a second door.
 - The returned bundle carries the approval's OWN coin spends, so a caller MUST NOT be able to pair the
   resulting signature with different bytes.
 

@@ -47,11 +47,32 @@ impl UnlockedAccount {
         seed: Arc<UnlockedMasterSeed>,
         default_profile_ix: ProfileIx,
     ) -> Self {
+        Self::with_residency(
+            account,
+            seed,
+            default_profile_ix,
+            Arc::new(Residency::new()),
+        )
+    }
+
+    /// Wrap an already-unlocked `seed` under an EXISTING `residency`.
+    ///
+    /// Used by [`UnlockGate`](crate::auth::policy::UnlockGate), which owns the unlock's lifetime and
+    /// may hand out several handles over one unlock. Those handles MUST share the gate's token:
+    /// minting a fresh one per handle would give each handle a private liveness the gate cannot
+    /// revoke, which is exactly the "ask the host to remember" shape
+    /// [`Residency`](crate::session_residency::Residency) exists to replace.
+    pub(crate) fn with_residency(
+        account: AccountId,
+        seed: Arc<UnlockedMasterSeed>,
+        default_profile_ix: ProfileIx,
+        residency: Arc<Residency>,
+    ) -> Self {
         Self {
             account,
             seed,
             default_profile_ix,
-            residency: Arc::new(Residency::new()),
+            residency,
         }
     }
 
