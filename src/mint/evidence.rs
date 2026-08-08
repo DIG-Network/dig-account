@@ -17,17 +17,28 @@
 //! was told exactly what to fabricate. The `did_coin_id` is not a secret either: it is fully
 //! determined by the bundle that node received.
 //!
-//! [`from_confirmed`](MintedDid::from_confirmed) therefore checks a claimed height against
-//! everything the SAME source has already committed to — the coin it names, the genesis floor, the
-//! source's own peak, the peak observed before the push, and a
-//! [`MIN_CONFIRMATION_DEPTH`]-block burial. That turns a one-field lie into a multi-field one that
-//! must stay self-consistent across separate calls, and it closes the shallow-reorg case where a
-//! 1-block confirmation is recorded as permanent.
+//! [`from_confirmed`](MintedDid::from_confirmed) therefore checks a claimed height against the
+//! genesis floor, the peak observed before the push, and a [`MIN_CONFIRMATION_DEPTH`]-block burial.
 //!
-//! It does not, and cannot, defeat a chain source that lies coherently about everything. **That
-//! residual is a property of trusting one source**, and the mitigation is the caller's: pass a
-//! trusted or aggregating `ChainSource` (the `dig-chainsource-interface` registry exists for exactly
-//! this), not the same unvetted node used to broadcast.
+//! **Be precise about what that costs an attacker: nothing.** `pushed_at_height`, `peak` and
+//! `confirmed_height` all come from the same source, and the checks are arithmetic over three
+//! numbers it chooses. A source that broadcast the bundle nowhere can satisfy every one of them in a
+//! single round trip and return a `Confirmed` DID. Do not read the multi-field shape as work; a
+//! dishonest source picks three consistent integers as easily as one.
+//!
+//! What the checks genuinely buy, which is worth having:
+//!
+//! - **Reorg safety against an HONEST source.** A confirmation one block deep is real and still
+//!   reversible; requiring burial is what stops a transient DID being recorded as permanent. This is
+//!   the case that actually occurs in practice.
+//! - **Closing the degenerate fabrications** — a height of `0`, a `u32::MAX`, a height predating the
+//!   push — so a merely BUGGY or sloppy source cannot produce evidence by accident.
+//!
+//! Against a source that lies deliberately, none of this helps, and no check inside this crate can:
+//! the evidence is entirely that source's testimony. **The residual is a property of trusting one
+//! source**, and the mitigation is the caller's — pass a trusted or aggregating `ChainSource` (the
+//! `dig-chainsource-interface` registry exists for exactly this), never the same unvetted node the
+//! bundle was pushed to.
 
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::CoinRecord;

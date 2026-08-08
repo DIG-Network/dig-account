@@ -414,7 +414,7 @@ the concrete memo wiring lands with the spend-building path.
 ### 6A.1 Shape
 
 `ProfileMinter::begin_did_mint` builds, signs and broadcasts ONE spend bundle that mints a `did:chia:`
-singleton for a profile, and `ProfileMinter::confirm` turns that mint's on-chain confirmation into
+singleton for a profile, and `ProfileMinter::mint_status` turns that mint's on-chain confirmation into
 `MintedDid` evidence. The bundle contains exactly two halves:
 
 1. a standard-layer spend of ONE selected wallet coin, creating a 1-mojo funding coin at the wallet's own
@@ -451,25 +451,39 @@ A successful push yields a `PendingMint`, which is not a DID and MUST NOT be rec
 
 **Scope of the guarantee.** The type makes "no height" unrepresentable; it cannot make a height TRUE.
 Every field of the evidence is asserted by the chain source, and in a typical deployment that source is
-the same node the bundle was pushed to — the `did_coin_id` is not a secret from it. The checks above force
-a fabrication to stay self-consistent across separate answers from that source; they do NOT defeat a source
-that lies coherently. Callers MUST therefore pass a trusted or aggregating `ChainSource`, not the same
-unvetted node used to broadcast.
+the same node the bundle was pushed to — the `did_coin_id` is not a secret from it. `pushed_at_height`,
+`peak` and `confirmed_height` all come from that one source, so satisfying rules 3–5 costs a dishonest
+source nothing: it picks three consistent integers in a single round trip and returns a `Confirmed` DID
+for a bundle it never broadcast. The rules buy two real things — reorg safety against an HONEST source
+(the case that actually occurs), and rejection of degenerate values a buggy source might emit — and they
+buy no defence at all against deliberate deceit. Callers MUST therefore pass a trusted or aggregating
+`ChainSource`, never the same unvetted node used to broadcast.
 
 ### 6A.2a Mint status (normative)
 
 `mint_status` MUST distinguish three states, because a caller cannot poll safely on an `Option`:
-`Confirmed` (evidence per §6A.2), `Awaiting` (carrying the blocks elapsed since the push, so a caller can
-build a timeout), and `Failed` — the mint's source coin is reported spent while no DID coin exists, which
-can only mean another spend consumed it, since the bundle is atomic. A `Failed` mint MUST NOT be polled
-as though it might still confirm.
+`Confirmed` (evidence per §6A.2), `Awaiting` (carrying the blocks elapsed since the push), and `Failed` —
+the mint's source coin is reported spent while no DID coin exists, which can only mean another spend
+consumed it, since the bundle is atomic. A `Failed` mint MUST NOT be polled as though it might still
+confirm.
+
+`Failed` covers exactly ONE proven-dead cause, the one the chain can attest to. It is NOT a general
+death signal: a mint EVICTED from the mempool (the likelier death with the default zero fee) leaves the
+source coin unspent and is, on chain, indistinguishable from a slow mint — so it MUST report `Awaiting`.
+Callers MUST therefore impose their own deadline on `blocks_since_push` and re-mint when it elapses; the
+contract is that a caller always has either a proof of death or a monotonically growing number to time
+out on, never an unchanging absence.
+
+The status query MUST NOT report `Failed` for a mint whose DID coin already exists: an included mint has
+spent its source coin by way of its own bundle, and reporting that as a different spend would make a
+caller re-mint a DID it had already paid for.
 
 ### 6A.3 The three outcomes are distinct (normative)
 
 `MintError::InsufficientFunds`, `MintError::Rejected` and `MintError::ChainUnreachable` MUST stay distinct
 variants and MUST NOT be collapsed: they mean "add funds", "the network answered no", and "the network did
 not answer, so the outcome is unknown". A chain read that fails MUST NOT be degraded into an empty coin
-list (which would report a funded wallet as empty), and a `confirm` that cannot reach the chain MUST
+list (which would report a funded wallet as empty), and a `mint_status` that cannot reach the chain MUST
 return `ChainUnreachable`, never `Ok(None)`.
 
 ### 6A.4 Coin selection and change

@@ -683,10 +683,19 @@ fn a_freshly_included_mint_is_not_evidence_until_it_is_buried() -> anyhow::Resul
     let mut first_evidence_depth = None;
     while chain.sim.borrow().height() < included_at + MIN_CONFIRMATION_DEPTH + 2 {
         let depth = chain.sim.borrow().height() - included_at + 1;
-        if minter.mint_status(&pending, &chain)?.minted().is_some() {
+        let status = minter.mint_status(&pending, &chain)?;
+        if status.minted().is_some() {
             first_evidence_depth = Some(depth);
             break;
         }
+        // The VARIANT, not merely the absence of evidence. An included-but-burying mint has already
+        // spent its source coin — by this very bundle — so a liveness check that ignored whether the
+        // DID coin exists would call this mint `Failed`, and a caller acting on that would mint
+        // again: a second fee and a second singleton for a mint that had already succeeded.
+        assert!(
+            matches!(status, MintStatus::Awaiting { .. }),
+            "a mint {depth} blocks deep is still burying, not dead: {status:?}"
+        );
         assert!(
             depth < MIN_CONFIRMATION_DEPTH,
             "a mint {depth} blocks deep should already be evidence"

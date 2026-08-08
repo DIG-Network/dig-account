@@ -4,7 +4,7 @@
 //! # What is implemented
 //!
 //! The **DID half is live**: [`ProfileMinter::begin_did_mint`](crate::mint) builds, signs and pushes
-//! a real `did:chia:` mint, and [`ProfileMinter::confirm`](crate::mint) turns its on-chain
+//! a real `did:chia:` mint, and [`ProfileMinter::mint_status`](crate::mint) turns its on-chain
 //! confirmation into [`MintedDid`](crate::mint::MintedDid) evidence. See [`crate::mint`].
 //!
 //! [`mint`](ProfileMinter::mint) — the FULL profile (DID + dig-store + SMT seed, bound into an
