@@ -20,14 +20,23 @@
 //! # Live-key lifecycle
 //!
 //! Once unlocked, the [`UnlockedMasterSeed`] is held behind [`UnlockGate`], which **idle-relocks**:
-//! after a configured idle window with no access, every capability derived from that unlock stops
-//! working and the account is sealed again. Every successful access refreshes the idle deadline. This
-//! bounds how long live key material can be USED on an unattended tray process.
+//! after a configured idle window with no access, the gate reports locked and the money-signing
+//! capability derived from that unlock stops working. Every successful access refreshes the idle
+//! deadline. This bounds how long live key material can be USED to SPEND on an unattended tray
+//! process.
 //!
 //! The deadline lives on the unlock's [`Residency`], not in [`access`](UnlockGate::access), so
 //! elapsing alone ends the session — a host that simply stops calling the gate cannot thereby extend
-//! it. The seed BYTES are dropped and zeroized at the next gate interaction; the CAPABILITY to use
-//! them dies the instant the deadline passes.
+//! it.
+//!
+//! # What the idle window does NOT bound (Phase 1)
+//!
+//! Only the money signer reads the [`Residency`]. An [`UnlockedAccount`] the host retains past the
+//! deadline still serves `profile_signer()`, `dek()`, `profile_sealing_key()` and
+//! `recovery_phrase()` — including the full 24-word phrase. The seed bytes are zeroized when the LAST
+//! handle drops, not at the next gate interaction, so a retained handle keeps them alive. A host MUST
+//! drop its [`UnlockedAccount`] to end disclosure; the window bounds spending. Wiring the remaining
+//! accessors onto the residency is a deferred v0.1.x follow-up (see SPEC.md §4.1).
 //!
 //! The gate is clock-injected ([`Clock`]) so idle-relock is deterministically testable; production
 //! uses [`SystemClock`].

@@ -161,30 +161,43 @@ while unlocked AND within the idle window, hands out a live `UnlockedAccount` vi
 (refreshing the deadline), relocks (drops + zeroizes the seed) after the idle window, and supports
 explicit `lock()`. **One unlock yields exactly ONE `Residency`, shared by every `UnlockedAccount` the
 gate hands out from it and by every capability derived from those handles.** `UnlockGate::lock()`, idle
-expiry, a superseding `unlock()`, and dropping the gate MUST each REVOKE that token, so a capability
-retained across any of them (a `LocalMoneySigner` in particular) fails with `Locked` rather than
-continuing to sign. Revocation is required rather than implied by dropping the seed: the seed's `Arc` is
+expiry, a superseding `unlock()`, and dropping the gate MUST each REVOKE that token, so a `LocalMoneySigner`
+retained across any of them fails with `Locked` rather than continuing to sign. (Which capabilities read
+that token is stated below: in Phase 1, only the money signer does.) Revocation is required rather than implied by dropping the seed: the seed's `Arc` is
 shared with every handle already issued, so dropping the gate's reference alone leaves those handles
 fully working.
 
 **Idle expiry MUST be a property of TIME, not of calling the gate.** The `Residency` carries its own
 idle deadline, refreshed by each `access()` the gate serves; once the clock passes that deadline the
-token reports not-live and every capability derived from it refuses — with no `access()`, no `lock()`,
-and no other gate call required. Evaluating the window inside `access()` instead would make the bound
-conditional on the host that stopped calling, which is exactly the unattended process the window exists
-to bound. The seed BYTES are dropped and zeroized at the next gate interaction (`access()`, `lock()`, a
-superseding `unlock()`, or `Drop`); the CAPABILITY to use them ends the instant the deadline passes.
-`is_unlocked()` reports the same observed liveness, so the gate and its capabilities can never
-disagree. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
+token reports not-live — with no `access()`, no `lock()`, and no other gate call required. Evaluating
+the window inside `access()` instead would make the bound conditional on the host that stopped calling,
+which is exactly the unattended process the window exists to bound.
+
+**Exactly ONE capability observes that token in Phase 1: the money signer.** A `LocalMoneySigner`
+obtained through `UnlockedAccount::wallet_ops()` re-reads the residency on every signing attempt and
+fails with `Locked` the instant the deadline passes, with no gate call required. The other four
+capability surfaces reachable from a retained `UnlockedAccount` — `profile_signer()`, `dek()`,
+`profile_sealing_key()` and `recovery_phrase()` — do NOT yet observe the residency, and a handle
+retained past the idle deadline continues to serve them, including the full 24-word recovery phrase.
+A host MUST therefore treat a retained `UnlockedAccount` as live key material until it drops that
+handle; the idle window bounds spending, not disclosure. Closing that gap is the deferred follow-up
+described below.
+
+The seed BYTES are dropped and zeroized when the LAST handle holding them drops — consistent with the
+shared `Arc` described above, dropping the gate's own reference does not zeroize anything while any
+issued `UnlockedAccount` survives. `is_unlocked()` reports the same observed liveness as the residency,
+so the gate and the money signer can never disagree. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
 `Arc<UnlockedMasterSeed>` lives only in its private state, and both `unlock()` and `access()` return
 `UnlockedAccount` (the same shape as `AccountSession`). A host that needs idle-relock today holds the
-account through an `UnlockGate`. Wiring idle-relock directly onto the `UnlockedAccount` capability
-lifecycle (so `signer()`/`wallet_ops()`/`dek()` re-check the idle window and return locked once expired)
-is a deferred v0.1.x follow-up: it changes those accessors to fallible and is a deliberate, tested
-lifecycle change rather than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained
-directly from `AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained
-via `UnlockGate::unlock()`/`access()` is idle-bounded by the gate, and its capabilities are revoked when
-the gate relocks.
+account through an `UnlockGate` and drops each `UnlockedAccount` promptly. Extending idle-relock to the
+REMAINING `UnlockedAccount` capabilities (so `profile_signer()`, `dek()`, `profile_sealing_key()` and
+`recovery_phrase()` re-check the residency and return locked once expired) is a deferred v0.1.x
+follow-up: it changes those accessors to fallible and is a deliberate, tested lifecycle change rather
+than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained directly from
+`AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained via
+`UnlockGate::unlock()`/`access()` has its MONEY-SIGNING capability idle-bounded and revoked by the gate,
+while its identity-signing, DEK, sealing-key and recovery-phrase surfaces remain usable for as long as
+the host retains the handle.
 
 ### 4.2 AuthPolicy / SecondFactor evaluation (pure, in-crate)
 
