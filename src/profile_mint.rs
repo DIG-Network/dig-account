@@ -18,24 +18,51 @@ use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::id::ProfileIx;
+use crate::mint::error::{MintError, MintResult};
+use crate::session_residency::Residency;
 
 /// Mints new profiles for an unlocked account.
 ///
-/// Holds the master seed so it can sign the launch/create spends with the profile's derived key.
+/// Obtained from [`UnlockedAccount::profile_minter`](crate::unlocked::UnlockedAccount::profile_minter)
+/// — there is no other way to build one, because there is no other way to hold the seed it needs.
+///
+/// # It OBSERVES the unlock rather than copying it
+///
+/// A mint spends real XCH, so the minter sits on the SPENDING side of the residency line beside the
+/// money signer (`SPEC.md` §4.1): it shares the unlock's [`Residency`] and re-reads it before
+/// deriving anything, so an explicit `lock()` or an elapsed idle window stops it. A minter that had
+/// merely cloned the seed out would keep spending after the user locked their account, and no
+/// documentation asking hosts to drop it would change that.
+///
+/// This is also why the constructor is `pub(crate)`. A public constructor taking
+/// `Arc<UnlockedMasterSeed>` would be a way to build a spending capability with no residency at all
+/// — the crate would advertise a lock it could not enforce.
 pub struct ProfileMinter {
     seed: Arc<UnlockedMasterSeed>,
+    /// The unlock this minter belongs to. Checked before every derivation, so `lock()` is a
+    /// revocation rather than a hint.
+    residency: Arc<Residency>,
 }
 
 impl ProfileMinter {
-    /// Build a minter backed by the account's unlocked `seed`.
-    pub fn new(seed: Arc<UnlockedMasterSeed>) -> Self {
-        Self { seed }
+    /// Build a minter over `seed`, scoped to `residency`.
+    ///
+    /// `pub(crate)`: only [`UnlockedAccount`](crate::unlocked::UnlockedAccount) constructs one, so a
+    /// minter can never exist without the unlock that authorizes it.
+    pub(crate) fn new(seed: Arc<UnlockedMasterSeed>, residency: Arc<Residency>) -> Self {
+        Self { seed, residency }
     }
 
-    /// The account's master seed bytes. `pub(crate)`: the mint derives the profile's wallet key from
-    /// them in-process, and they never cross the public API.
-    pub(crate) fn master_seed(&self) -> Zeroizing<[u8; MASTER_SEED_LEN]> {
-        self.seed.master_seed()
+    /// The account's master seed bytes for the CURRENT session, or [`MintError::Locked`].
+    ///
+    /// The liveness check comes FIRST, so a relocked account produces no key material at all rather
+    /// than deriving a key and failing later. `pub(crate)`: the mint derives the profile's wallet key
+    /// from these bytes in-process, and they never cross the public API.
+    pub(crate) fn live_master_seed(&self) -> MintResult<Zeroizing<[u8; MASTER_SEED_LEN]>> {
+        if !self.residency.is_live() {
+            return Err(MintError::Locked);
+        }
+        Ok(self.seed.master_seed())
     }
 
     /// Mint a new profile at HD index `ix`: launch its DID + dig-store and bind them into an
@@ -66,15 +93,26 @@ mod tests {
         )
     }
 
+    fn minter_scoped_to(residency: &Arc<Residency>) -> ProfileMinter {
+        ProfileMinter::new(seed(), residency.clone())
+    }
+
+    /// The derivation a mint depends on is refused once the unlock is over — and the live case is
+    /// asserted alongside it, so the refusal cannot be a minter that never worked.
     #[test]
-    fn a_minter_can_be_constructed_from_an_unlocked_seed() {
-        let _minter = ProfileMinter::new(seed());
+    fn seed_derivation_follows_the_residency() {
+        let residency = Arc::new(Residency::new());
+        let minter = minter_scoped_to(&residency);
+        assert!(minter.live_master_seed().is_ok());
+
+        residency.revoke();
+        assert!(matches!(minter.live_master_seed(), Err(MintError::Locked)));
     }
 
     #[test]
     #[should_panic(expected = "Phase 2")]
     fn mint_is_not_yet_implemented() {
         // Phase-1 guard: the mint path deliberately panics until the Phase-2 on-chain flow lands.
-        let _ = ProfileMinter::new(seed()).mint(ProfileIx::ROOT);
+        let _ = minter_scoped_to(&Arc::new(Residency::new())).mint(ProfileIx::ROOT);
     }
 }

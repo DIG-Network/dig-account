@@ -19,7 +19,7 @@ pub mod evidence;
 pub mod status;
 
 pub use chain::{ChainUnavailable, PushOutcome, SpendPublisher};
-pub use did::{MintNetwork, MintOptions};
+pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use status::MintStatus;

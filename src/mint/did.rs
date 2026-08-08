@@ -52,6 +52,21 @@ use crate::profile_mint::ProfileMinter;
 /// The mojo amount of the coin that launches the singleton. A singleton's amount must be odd.
 const SINGLETON_AMOUNT: u64 = 1;
 
+/// The largest farmer fee a DID mint will pay: **0.01 XCH**.
+///
+/// The mint's own cost is fixed at one mojo (the singleton amount) — so the caller-supplied fee is
+/// the entire variable spend of a mint, and an unbounded one makes `begin_did_mint` a single call
+/// that can hand a whole wallet coin to a farmer. The general money path bounds that with the
+/// [`PolicyAuthorizer`](crate::wallet::enforcer::PolicyAuthorizer)'s per-transaction limit and
+/// rolling cap; a mint bundle is a singleton launch, which that gate's summary derivation refuses to
+/// decode by design (§6A.5), so the mint carries its own bound instead of going ungated.
+///
+/// The value is chosen to be far above any fee that buys inclusion — mainnet mempool fees clear at
+/// orders of magnitude less, and a mint is four coin spends — and far below an amount whose loss
+/// would matter. It is a HARD ceiling rather than configuration precisely because the caller that
+/// supplies the fee is the caller a configurable limit would let raise it.
+pub const MAX_MINT_FEE_MOJOS: u64 = 10_000_000_000;
+
 /// The network whose `AGG_SIG_ME` domain the mint signs against.
 ///
 /// Wrong constants produce a bundle whose signatures verify nowhere — so the network is an explicit
@@ -99,6 +114,20 @@ impl MintOptions {
     fn required_coin_amount(&self) -> u64 {
         SINGLETON_AMOUNT.saturating_add(self.fee)
     }
+
+    /// Refuse a fee above [`MAX_MINT_FEE_MOJOS`].
+    ///
+    /// The bound is inclusive: a fee exactly at the ceiling is allowed, and the first refused value
+    /// is one mojo over.
+    fn check_fee_ceiling(&self) -> MintResult<()> {
+        if self.fee > MAX_MINT_FEE_MOJOS {
+            return Err(MintError::FeeAboveCeiling {
+                fee: self.fee,
+                ceiling: MAX_MINT_FEE_MOJOS,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl ProfileMinter {
@@ -133,7 +162,12 @@ impl ProfileMinter {
         C: ChainSource + ?Sized,
         P: SpendPublisher + ?Sized,
     {
-        let wallet = self.wallet_key(ix);
+        // The two refusals that must happen before anything else: a relocked account derives no key
+        // material at all, and an over-ceiling fee is rejected before a coin is even selected. Both
+        // are checked here rather than deeper down so that neither can be reached after a push.
+        let wallet = self.live_wallet_key(ix)?;
+        options.check_fee_ceiling()?;
+
         let source = select_funding_coin(chain, wallet.puzzle_hash(), options)?;
         // The peak BEFORE the push. A mint cannot confirm in a block that already existed when it
         // was pushed, so this height is what later makes a back-dated confirmation contradict
@@ -199,9 +233,13 @@ impl ProfileMinter {
         })
     }
 
-    /// The profile's wallet (money) key. In-crate only — the raw key never crosses the public API.
-    fn wallet_key(&self, ix: ProfileIx) -> WalletKey {
-        WalletKey::from_seed_at(&self.master_seed()[..], ix)
+    /// The profile's wallet (money) key for the CURRENT session, or [`MintError::Locked`].
+    ///
+    /// Derived per call from the live seed rather than stored, which is what makes the residency
+    /// effective: a minter that had derived the key at construction would keep spending after the
+    /// account relocked. In-crate only — the raw key never crosses the public API.
+    fn live_wallet_key(&self, ix: ProfileIx) -> MintResult<WalletKey> {
+        Ok(WalletKey::from_seed_at(&self.live_master_seed()?[..], ix))
     }
 }
 

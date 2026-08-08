@@ -152,7 +152,7 @@ inside the `UnlockedAccount` returned by a successful unlock/enrol.
   showing a user their backup MUST NOT consume or relock the account. This is the ONE secret the public
   API deliberately exposes, because a backup the user cannot see is not a backup; it MUST NOT be logged.
 - `UnlockedAccount` holds the seed behind `Arc<UnlockedMasterSeed>` whose `Debug` redacts and whose drop
-  zeroizes. It hands out capability handles (`ProfileSigner`, `WalletOps`) and DEKs derived from the
+  zeroizes. It hands out capability handles (`ProfileSigner`, `WalletOps`, `ProfileMinter`) and DEKs derived from the
   seed; `master_seed()` is `pub(crate)`. `lock(self)` relocks immediately by dropping the handle.
 
 Idle-relock (Phase-1 status): the idle-relock LIFECYCLE PRIMITIVE ships as
@@ -173,15 +173,29 @@ token reports not-live — with no `access()`, no `lock()`, and no other gate ca
 the window inside `access()` instead would make the bound conditional on the host that stopped calling,
 which is exactly the unattended process the window exists to bound.
 
-**Exactly ONE capability observes that token in Phase 1: the money signer.** A `LocalMoneySigner`
-obtained through `UnlockedAccount::wallet_ops()` re-reads the residency on every signing attempt and
-fails with `Locked` the instant the deadline passes, with no gate call required. The other four
-capability surfaces reachable from a retained `UnlockedAccount` — `profile_signer()`, `dek()`,
-`profile_sealing_key()` and `recovery_phrase()` — do NOT yet observe the residency, and a handle
-retained past the idle deadline continues to serve them, including the full 24-word recovery phrase.
-A host MUST therefore treat a retained `UnlockedAccount` as live key material until it drops that
-handle; the idle window bounds spending, not disclosure. Closing that gap is the deferred follow-up
-described below.
+**The capabilities that observe that token are exactly the SPENDING ones — the money signer and the
+DID minter.** Both re-read the residency before deriving any key material, and both fail with
+`Locked` the instant the deadline passes or `lock()` is called, with no gate call required:
+
+| Capability, from a retained `UnlockedAccount` | Observes the residency | Refusal |
+|---|---|---|
+| `wallet_ops().money_signer(..)` — signs a spend | **YES**, per signature | `AccountError::Locked` |
+| `profile_minter().begin_did_mint(..)` — spends XCH to mint a DID | **YES**, before any derivation, before any push | `MintError::Locked` |
+| `profile_minter().mint_status(..)` — reads chain evidence | no, deliberately (below) | — |
+| `profile_signer()` | no | — |
+| `dek()` | no | — |
+| `profile_sealing_key()` / `profile_sealing_public_key()` | no | — |
+| `recovery_phrase()` | no | — |
+
+The rule the table encodes: **a capability that MOVES MONEY MUST observe the residency; the idle
+window bounds spending, not disclosure.** `mint_status` sits on the disclosure side on purpose — it
+derives no key material and moves nothing, reading only public chain state about a `PendingMint` the
+host already holds. Refusing it would strand a host that locked while a mint was in flight, holding a
+pushed bundle it could never resolve, and would protect nothing that is not already public.
+
+The non-observing surfaces continue to serve a handle retained past the idle deadline, including the
+full 24-word recovery phrase. A host MUST therefore treat a retained `UnlockedAccount` as live key
+material until it drops that handle. Closing that gap is the deferred follow-up described below.
 
 The seed BYTES are dropped and zeroized when the LAST handle holding them drops — consistent with the
 shared `Arc` described above, dropping the gate's own reference does not zeroize anything while any
@@ -197,7 +211,7 @@ than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained 
 `AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained via
 `UnlockGate::unlock()`/`access()` has its MONEY-SIGNING capability idle-bounded and revoked by the gate,
 while its identity-signing, DEK, sealing-key and recovery-phrase surfaces remain usable for as long as
-the host retains the handle.
+the host retains the handle. The DID mint is idle-bounded on the same terms as money signing.
 
 ### 4.2 AuthPolicy / SecondFactor evaluation (pure, in-crate)
 
@@ -680,6 +694,25 @@ The general money path's `LocalMoneySigner` verifier decodes standard and CAT sp
 singleton launch; it is NOT weakened for the mint. This narrower, whitelist gate applies instead.
 
 ### 6A.6 The custody boundary
+
+`ProfileMinter` is obtained ONLY from `UnlockedAccount::profile_minter()`; its constructor is not
+public, so a minter cannot exist without the unlock that authorizes it. It shares that unlock's
+`Residency` and re-reads it before deriving the wallet key, so an explicit `lock()` or an elapsed idle
+window makes `begin_did_mint` fail with `MintError::Locked` having derived nothing and pushed nothing
+(§4.1).
+
+The mint does NOT run through `PolicyAuthorizer`/`SpendApproval`, and that split is RATIFIED rather
+than incidental: a mint bundle is a singleton launch, which the money path's summary derivation
+fails closed on by design (§6A.5), so routing the mint through that gate would require weakening the
+verifier that protects every ordinary spend. The mint carries its own, strictly narrower whitelist
+gate (§6A.5) plus its own bound on the only value it can vary:
+
+**The farmer fee MUST NOT exceed `MAX_MINT_FEE_MOJOS` (10_000_000_000 mojos = 0.01 XCH).** The
+singleton itself costs exactly one mojo, so the fee is the entire variable spend of a mint; an
+unbounded fee makes one call a route for handing a whole wallet coin to a farmer. The bound is
+inclusive (a fee at the ceiling is allowed, one mojo over is refused as
+`MintError::FeeAboveCeiling`) and is a HARD ceiling, not configuration — the caller that supplies the
+fee is exactly the caller a configurable limit would let raise it.
 
 Signing happens in-process against the unlocked account's own wallet key. The `SpendPublisher` seam
 accepts an ALREADY-SIGNED bundle and has no other method, so a node implementing it can broadcast and can
