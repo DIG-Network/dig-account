@@ -15,10 +15,23 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{AccountError, Result};
-
 /// The default rolling window the period cap is measured over: 24 hours.
 pub const DEFAULT_PERIOD_SECONDS: u64 = 24 * 60 * 60;
+
+/// The default ceiling on confirmation ceremonies raised within one rolling period: 64.
+///
+/// Chosen as generous for a person and useless for a grinder. A user who genuinely confirms dozens of
+/// spends a day is not inconvenienced; an automated prompt flood is stopped long before mis-click
+/// probability accumulates. It is configuration, not a constant to design against.
+pub const DEFAULT_MAX_CONFIRMATIONS_PER_PERIOD: u32 = 64;
+
+/// The most rolling-ledger entries the gate will retain within one period.
+///
+/// The period cap bounds the ledger's total VALUE but not its LENGTH: a `period_cap_mojos` of `10^12`
+/// admits `10^12` one-mojo approvals, each an entry, which is memory exhaustion by accounting. Reaching
+/// the ceiling is treated as an unevaluable window rather than silently dropping entries — dropping the
+/// oldest would forgive charges the cap is supposed to remember, i.e. hand back allowance under load.
+pub const MAX_LEDGER_ENTRIES: usize = 4_096;
 
 /// What a spend is FOR — the caller's declared intent, which the auto-send policy gates on.
 ///
@@ -44,10 +57,11 @@ pub enum SpendOpClass {
     SmallSend,
     /// The caller did NOT declare what the spend is for.
     ///
-    /// This is the value the [`SpendAuthorizer`](crate::wallet::authorizer::SpendAuthorizer) trait
-    /// seam supplies, because that seam carries no intent. It never maps to a set of limits: an
-    /// undeclared spend is [`PolicyIndeterminate`](AccountError::PolicyIndeterminate), so the
-    /// untyped seam cannot auto-approve anything.
+    /// This is what any request arriving from OUTSIDE the process is — a dapp cannot be trusted to
+    /// declare its own intent, so it declares none. It never maps to a set of limits, so it can never
+    /// auto-approve; the custody gate routes it to the human instead
+    /// ([`RequiresConfirmation`](crate::wallet::approval::SpendRuling::RequiresConfirmation)), which is
+    /// what makes an inherently-undeclared request spendable-with-consent rather than unspendable.
     Undeclared,
 }
 
@@ -108,6 +122,22 @@ pub struct AutoSendPolicy {
     /// The total native mojos (amounts plus fees) that may auto-send within any
     /// `period_seconds`-long window, summed across ALL op classes. Default `0`.
     pub period_cap_mojos: u64,
+    /// The most confirmation ceremonies the gate will raise within any `period_seconds`-long window.
+    /// Default [`DEFAULT_MAX_CONFIRMATIONS_PER_PERIOD`].
+    ///
+    /// **The scarce resource this bounds is the user's ATTENTION.** Every spend the policy will not
+    /// auto-approve escalates to a prompt, and a request arriving from outside the process is always
+    /// [`Undeclared`](SpendOpClass::Undeclared) and so always escalates — so without a bound, anything
+    /// that can reach the gate can raise prompts without limit until the user mis-clicks one. Consent
+    /// that can be requested indefinitely is not consent.
+    ///
+    /// Unlike every other bound here, the fail-safe default is NON-ZERO: zero would refuse every
+    /// ceremony and make a confirmable spend unspendable, which is refusal disguised as protection. The
+    /// bound is on the COUNT of prompts, never on whether a prompt may be shown at all.
+    ///
+    /// This crate has no notion of a request's ORIGIN, so it can only bound the total. A host that
+    /// serves multiple origins MUST additionally bound them per origin (`SPEC.md` §6.4).
+    pub max_confirmations_per_period: u32,
 }
 
 impl Default for AutoSendPolicy {
@@ -119,26 +149,25 @@ impl Default for AutoSendPolicy {
             small_send: OpClassLimits::default(),
             period_seconds: DEFAULT_PERIOD_SECONDS,
             period_cap_mojos: 0,
+            max_confirmations_per_period: DEFAULT_MAX_CONFIRMATIONS_PER_PERIOD,
         }
     }
 }
 
 impl AutoSendPolicy {
-    /// The bounds configured for `op_class`.
+    /// The bounds configured for `op_class`, or `None` for
+    /// [`Undeclared`](SpendOpClass::Undeclared) — which has no bounds and never will.
     ///
-    /// [`Undeclared`](SpendOpClass::Undeclared) has no bounds and never will: it yields
-    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate), because "we do not know what this
-    /// spend is for" is a different answer from "this spend is not allowed", and only the latter is
-    /// something a user could sensibly reconsider.
-    pub fn limits_for(&self, op_class: SpendOpClass) -> Result<OpClassLimits> {
+    /// The `Option` form is deliberate and is the only form: "no intent was declared" is not a failure
+    /// for the custody gate — it routes the spend to the human. A `Result` form existed until 0.5.0 and
+    /// turned that into `PolicyIndeterminate`, which no ceremony may permit, so an inherently-undeclared
+    /// request was permanently unspendable rather than confirmable.
+    pub fn configured_limits(&self, op_class: SpendOpClass) -> Option<OpClassLimits> {
         match op_class {
-            SpendOpClass::Rebalance => Ok(self.rebalance),
-            SpendOpClass::Tip => Ok(self.tip),
-            SpendOpClass::SmallSend => Ok(self.small_send),
-            SpendOpClass::Undeclared => Err(AccountError::PolicyIndeterminate(
-                "the caller did not declare what this spend is for, so no auto-send limit applies"
-                    .to_string(),
-            )),
+            SpendOpClass::Rebalance => Some(self.rebalance),
+            SpendOpClass::Tip => Some(self.tip),
+            SpendOpClass::SmallSend => Some(self.small_send),
+            SpendOpClass::Undeclared => None,
         }
     }
 }
@@ -147,6 +176,17 @@ impl AutoSendPolicy {
 mod tests {
     use super::*;
 
+    /// The default rolling window is exactly 24 hours, pinned as a NUMBER.
+    ///
+    /// `24 * 60 * 60` reads as self-evidently a day, which is exactly why nothing checked it: any
+    /// arithmetic slip in that expression produces a plausible-looking window, and a user told "a daily
+    /// cap" would be given some other period entirely. The published value is the contract, so the
+    /// literal is asserted rather than the expression re-derived.
+    #[test]
+    fn the_default_rolling_window_is_exactly_twenty_four_hours() {
+        assert_eq!(DEFAULT_PERIOD_SECONDS, 86_400);
+    }
+
     #[test]
     fn the_default_policy_auto_approves_nothing() {
         let policy = AutoSendPolicy::default();
@@ -154,7 +194,7 @@ mod tests {
         assert_eq!(policy.period_cap_mojos, 0);
         assert_eq!(policy.period_seconds, DEFAULT_PERIOD_SECONDS);
         for op_class in SpendOpClass::CONFIGURABLE {
-            let limits = policy.limits_for(op_class).unwrap();
+            let limits = policy.configured_limits(op_class).unwrap();
             assert!(!limits.enabled, "{op_class:?} must default to disabled");
             assert_eq!(
                 limits.per_tx_limit_mojos, 0,
@@ -173,31 +213,35 @@ mod tests {
         };
         assert_eq!(
             policy
-                .limits_for(SpendOpClass::Rebalance)
+                .configured_limits(SpendOpClass::Rebalance)
                 .unwrap()
                 .per_tx_limit_mojos,
             1
         );
         assert_eq!(
             policy
-                .limits_for(SpendOpClass::Tip)
+                .configured_limits(SpendOpClass::Tip)
                 .unwrap()
                 .per_tx_limit_mojos,
             2
         );
         assert_eq!(
             policy
-                .limits_for(SpendOpClass::SmallSend)
+                .configured_limits(SpendOpClass::SmallSend)
                 .unwrap()
                 .per_tx_limit_mojos,
             3
         );
     }
 
+    /// An undeclared op class has NO configured bounds — and that is not a refusal.
+    ///
+    /// The truthful control is the permissive policy itself: every declared class on it returns bounds,
+    /// so `None` here is the absence of bounds for THIS class and not a policy that grants nothing. The
+    /// gate turns that `None` into a confirmation ceremony; before 0.5.0 this lookup returned an error
+    /// that no ceremony could permit, which made an inherently-undeclared request unspendable.
     #[test]
-    fn an_undeclared_op_class_has_no_limits_and_is_indeterminate() {
-        // Even a policy that permits everything it knows about cannot answer for an intent it was
-        // never told.
+    fn an_undeclared_op_class_has_no_configured_bounds_while_declared_ones_do() {
         let permissive = AutoSendPolicy {
             enabled: true,
             rebalance: OpClassLimits::enabled_up_to(u64::MAX),
@@ -206,8 +250,34 @@ mod tests {
             period_cap_mojos: u64::MAX,
             ..AutoSendPolicy::default()
         };
-        let err = permissive.limits_for(SpendOpClass::Undeclared).unwrap_err();
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+        for declared in SpendOpClass::CONFIGURABLE {
+            assert!(
+                permissive.configured_limits(declared).is_some(),
+                "{declared:?} is configurable and must have bounds"
+            );
+        }
+        assert!(permissive
+            .configured_limits(SpendOpClass::Undeclared)
+            .is_none());
+    }
+
+    /// The prompt ceiling's default is deliberately NON-ZERO, unlike every other bound here.
+    ///
+    /// Zero would refuse every confirmation ceremony, making a confirmable spend unspendable — refusal
+    /// disguised as protection. Pinned as a number for the same reason the period is: an arithmetic slip
+    /// in a plausible-looking expression is invisible.
+    #[test]
+    fn the_confirmation_ceiling_defaults_to_a_usable_non_zero_bound() {
+        assert_eq!(DEFAULT_MAX_CONFIRMATIONS_PER_PERIOD, 64);
+        assert_eq!(
+            AutoSendPolicy::default().max_confirmations_per_period,
+            DEFAULT_MAX_CONFIRMATIONS_PER_PERIOD,
+            "the refusing default must still permit a person to be asked"
+        );
+        assert!(
+            AutoSendPolicy::default().max_confirmations_per_period > 0,
+            "a zero ceiling would make every confirmable spend unspendable"
+        );
     }
 
     /// A persisted policy (#1560) that omits fields must deserialize to the REFUSING defaults, not
@@ -254,6 +324,7 @@ mod tests {
             small_send: OpClassLimits::default(),
             period_seconds: 3_600,
             period_cap_mojos: 1_000,
+            max_confirmations_per_period: 8,
         };
         let json = serde_json::to_string(&policy).unwrap();
         assert_eq!(

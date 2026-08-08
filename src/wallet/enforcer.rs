@@ -5,27 +5,39 @@
 //!
 //! | Situation | Outcome |
 //! |---|---|
-//! | The summary's native total cannot be summed in a `u64` | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
-//! | The summary's declared tier disagrees with the profile's [`CustodyPolicy`] | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
+//! | The coin spends cannot be fully accounted for | [`Spend`](AccountError::Spend) — refused at the gate, before any approval exists |
+//! | The native total cannot be summed in a `u64` | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
 //! | A vault outflow paying anything but the profile's own hot wallet | [`PolicyDenied`](AccountError::PolicyDenied) |
-//! | A vault outflow to the hot wallet | [`RequireAuth`](AccountError::RequireAuth) — always, at any amount |
-//! | A [`Confirm`](SpendTier::Confirm)-tier spend | [`RequireAuth`](AccountError::RequireAuth) |
-//! | Auto-send globally off, or off for this op class | [`RequireAuth`](AccountError::RequireAuth) |
-//! | An undeclared op class, or value in units no mojo limit can bound | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
-//! | Over the per-transaction limit, or over the rolling period cap | [`RequireAuth`](AccountError::RequireAuth) |
-//! | Within the op class, the per-transaction limit, AND the rolling cap | `Ok(())` |
+//! | A vault outflow to the hot wallet | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) — always, at any amount |
+//! | A [`Confirm`](SpendTier::Confirm)-tier spend | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
+//! | Auto-send globally off, or off for this op class | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
+//! | No op class declared | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) — ask the human |
+//! | Value in units no mojo limit can bound | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
+//! | Over the per-transaction limit, or over the rolling period cap | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
+//! | Within the op class, the per-transaction limit, AND the rolling cap | [`Approved`](SpendRuling::Approved) |
 //!
-//! # Fail-closed in both directions
+//! # Three outcomes, because two cannot say "ask the human"
 //!
-//! Refusal is never a single boolean. "Not permitted, but a human could permit it"
-//! ([`RequireAuth`](AccountError::RequireAuth)), "forbidden outright, no ceremony can permit it"
-//! ([`PolicyDenied`](AccountError::PolicyDenied)), and "the policy could not be evaluated at all"
-//! ([`PolicyIndeterminate`](AccountError::PolicyIndeterminate)) are distinct outcomes, because a
-//! caller that cannot tell them apart will escalate a forbidden spend into an approved one.
+//! "Not auto-approved, but a human could permit it" is
+//! [`Ok(RequiresConfirmation)`](SpendRuling::RequiresConfirmation) — a RULING, not an error.
+//! "Forbidden outright, no ceremony can permit it" ([`PolicyDenied`](AccountError::PolicyDenied)) and
+//! "the policy could not be evaluated at all"
+//! ([`PolicyIndeterminate`](AccountError::PolicyIndeterminate)) stay `Err`, and stay distinct from
+//! each other. A caller handed only `Ok(())`/`Err` collapses the escalatable outcome into the
+//! refusals, which makes the confirm ceremony unreachable for exactly the tiers that exist to require
+//! it — a defect this crate shipped into its only consumer before 0.5.0.
 //!
 //! Every [`SpendTier`] gets exactly one arm of one wildcard-free `match`, so a tier added in future
 //! is a COMPILE error here rather than a variant that quietly inherits some other tier's decision
 //! (see [`authorize_op`](PolicyAuthorizer::authorize_op)).
+//!
+//! # The authorization IS the signed bytes
+//!
+//! The gate takes `&[CoinSpend]` and derives the summary itself, so no caller-supplied description
+//! exists to disagree with; it then mints a [`SpendApproval`] that OWNS those exact spends, and
+//! [`MoneySigner::sign_approved`](crate::wallet::money_signer::MoneySigner::sign_approved) — the only
+//! signing entry point in the crate — signs the spends the approval carries. There is no unauthorized
+//! route to a signature, and no comparison that could compare the wrong bytes.
 //!
 //! # What this gate does NOT protect — read before relying on it
 //!
@@ -38,44 +50,28 @@
 //! a property of the AUTHORIZER THE CALLER BUILT, not a property of the funds — the caller MUST
 //! construct the authorizer that matches the coins it is about to spend.
 //!
-//! **Enforcement is opt-in.** [`WalletOps::money_signer`](crate::wallet::authorizer::WalletOps::money_signer)
-//! is public and returns a signer that will sign anything it can verify. There is no composed
-//! send path in this crate that forces a spend through this gate, so a caller that goes straight to
-//! the signer never meets a limit.
-//!
-//! **This gate does not know WHICH coin spends it authorized.** It decides over a
-//! [`SpendSummary`], while [`LocalMoneySigner`](crate::wallet::money_signer::LocalMoneySigner) signs
-//! over `&[CoinSpend]`, and nothing in this crate proves the one describes the other —
-//! [`SpendSummary::new`] is public, so a caller can hand the gate a summary of a one-mojo tip and
-//! then sign a spend of a billion. The signer re-derives its own summary and checks it against
-//! itself, which catches a malformed spend but not a mismatched authorization. A host MUST therefore
-//! pass the summary produced by
-//! [`SpendSummary::from_coin_spends`](crate::wallet::summary::SpendSummary::from_coin_spends) over
-//! **the exact coin spends it is about to sign**, and MUST NOT construct one by hand. That obligation
-//! is the host's; this crate cannot check it, and closing the gap needs a shape change (authorizing
-//! over the coin spends, or an approval token the signer demands) tracked separately.
-//!
-//! **A [`SpendSummary`] accounts only for HINTED outputs plus the fee.** An un-hinted output is
-//! change, which `dig-wallet-backend`'s re-derivation excludes from the recipient list, so no amount
-//! limit here can see it. That invariant is held one layer down by
-//! [`LocalMoneySigner`](crate::wallet::money_signer::LocalMoneySigner), which refuses to sign a spend
-//! with a change output the wallet does not own — which bounds where such value can GO (somewhere
-//! under the same seed) but not that it obeyed a policy.
-//! `refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves` pins the
-//! composition.
+//! **A [`SpendSummary`] counts every output by DESTINATION, never by hint status** — so this
+//! paragraph's former warning (that an un-hinted output was invisible to every amount limit) no
+//! longer holds, and neither does any custody claim built on it. An output is weighed unless it pays
+//! a puzzle hash the spend is itself spending from. The signer's change-ownership check remains a
+//! required second layer, because this one bounds how MUCH value leaves while that one bounds where
+//! it may go; `an_unhinted_output_to_an_owned_derivation_is_counted_not_hidden` and
+//! `refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves` pin the two
+//! halves.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use chia_protocol::Bytes32;
+use chia_protocol::{Bytes32, CoinSpend};
 use chia_wallet_sdk::utils::Address;
 
 use crate::error::{AccountError, Result};
-use crate::wallet::authorizer::SpendAuthorizer;
-use crate::wallet::autosend::{AutoSendPolicy, SpendOpClass};
+use crate::id::ProfileIx;
+use crate::wallet::approval::{PendingApproval, SpendApproval, SpendRuling};
+use crate::wallet::autosend::{AutoSendPolicy, SpendOpClass, MAX_LEDGER_ENTRIES};
 use crate::wallet::clock::Clock;
-use crate::wallet::policy::CustodyPolicy;
-use crate::wallet::summary::{SpendSummary, SpendTier};
+use crate::wallet::policy::{CustodyPolicy, CustodyScope};
+use crate::wallet::summary::{DerivedSpend, SpendSummary, SpendTier};
 
 /// One auto-approved spend, recorded so the rolling period cap can be measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +121,18 @@ pub struct PolicyAuthorizer {
     /// the coin, whereas two address strings can differ (network prefix, casing) while naming the
     /// same key, and two identical strings cannot be compared at all if either fails to decode.
     hot_wallet_puzzle_hash: Bytes32,
+    /// WHOSE money this gate rules over, stamped onto every permission it mints so a signer for a
+    /// different profile refuses it. See [`CustodyScope`].
+    scope: CustodyScope,
     clock: Arc<dyn Clock>,
     /// Auto-approvals inside the current rolling window, oldest first.
     recent: Mutex<VecDeque<AutoSendRecord>>,
+    /// When each confirmation ceremony was raised, inside the current rolling window, oldest first.
+    ///
+    /// Kept apart from `recent` because the two bound different scarce things: `recent` bounds VALUE
+    /// moved unattended, this bounds demands on the user's ATTENTION. Merging them would let an
+    /// approved spend consume prompt budget, or a prompt consume spend allowance.
+    prompts: Mutex<VecDeque<u64>>,
 }
 
 impl PolicyAuthorizer {
@@ -138,6 +143,7 @@ impl PolicyAuthorizer {
     /// here so an unusable value is a construction error rather than a comparison that silently never
     /// matches at authorization time.
     pub fn new(
+        profile: ProfileIx,
         custody: CustodyPolicy,
         auto_send: AutoSendPolicy,
         hot_wallet_address: &str,
@@ -149,19 +155,27 @@ impl PolicyAuthorizer {
             ))
         })?;
         Ok(Self {
+            scope: CustodyScope::new(profile, &custody, hot_wallet.puzzle_hash),
             custody,
             auto_send,
             hot_wallet_puzzle_hash: hot_wallet.puzzle_hash,
             clock,
             recent: Mutex::new(VecDeque::new()),
+            prompts: Mutex::new(VecDeque::new()),
         })
     }
 
-    /// Authorize `summary` for a caller that declares the spend's intent as `op_class`.
+    /// Rule on `coin_spends`, for a caller that declares the spend's intent as `op_class`.
     ///
-    /// This is the full gate. The [`SpendAuthorizer`] trait impl delegates here with
-    /// [`SpendOpClass::Undeclared`], which can never auto-approve — so a caller that reaches this
-    /// authorizer through the untyped seam always escalates.
+    /// This is the full gate, and the only way to obtain a [`SpendApproval`]. The spends are re-parsed
+    /// and summarized HERE — the caller supplies bytes, never a description — so there is no
+    /// caller-supplied summary for the ruling to disagree with, and the approval the gate mints owns
+    /// the very spends it judged.
+    ///
+    /// `op_class` is a statement of intent that only an in-process caller which BUILT the spend can
+    /// make truthfully. It cannot widen a bound: it selects WHICH configured bounds apply, and
+    /// [`Undeclared`](SpendOpClass::Undeclared) — the value any request arriving from outside the
+    /// process gets — can never auto-approve.
     ///
     /// # One arm per tier, no wildcard
     ///
@@ -171,58 +185,24 @@ impl PolicyAuthorizer {
     ///   new tier's rule. A wildcard arm — even one that refuses — would instead let a new tier
     ///   silently inherit a decision nobody chose for it.
     /// - **No two arms can decide the same tier.** An earlier `if tier == Vault { … }` followed by a
-    ///   catch-all `if tier != AutoSend { … }` looked equivalent but was not: both returned
-    ///   `RequireAuth` for a vault spend, so deleting the vault arm changed nothing observable and the
-    ///   vault-escalation rule was pinned by no test at all. One arm per tier makes that mutant a
-    ///   compile error rather than a silent equivalence.
-    pub fn authorize_op(&self, summary: &SpendSummary, op_class: SpendOpClass) -> Result<()> {
-        let (tier, native_total_mojos) = self.reclassify(summary)?;
-        match tier {
+    ///   catch-all `if tier != AutoSend { … }` looked equivalent but was not: both escalated a vault
+    ///   spend, so deleting the vault arm changed nothing observable and the vault rule was pinned by
+    ///   no test at all. One arm per tier makes that mutant a compile error rather than a silent
+    ///   equivalence.
+    pub fn authorize_op(
+        &self,
+        coin_spends: &[CoinSpend],
+        op_class: SpendOpClass,
+    ) -> Result<SpendRuling> {
+        let derived = DerivedSpend::derive(coin_spends, &self.custody)?;
+        match derived.summary.tier {
             SpendTier::Vault => {
-                self.reject_vault_outflow_to_anyone_but_the_hot_wallet(summary)?;
-                Err(AccountError::RequireAuth(
-                    "a vault spend always requires the full authorization ceremony, at any amount"
-                        .to_string(),
-                ))
+                self.reject_vault_outflow_to_anyone_but_the_hot_wallet(&derived.summary)?;
+                self.escalate(coin_spends, derived)
             }
-            SpendTier::Confirm => Err(AccountError::RequireAuth(
-                "a spend over this profile's auto-send allowance requires explicit confirmation"
-                    .to_string(),
-            )),
-            SpendTier::AutoSend => self.check_auto_send(summary, op_class, native_total_mojos),
+            SpendTier::Confirm => self.escalate(coin_spends, derived),
+            SpendTier::AutoSend => self.rule_on_auto_send(coin_spends, derived, op_class),
         }
-    }
-
-    /// Re-derive the spend's tier from the profile's OWN custody policy and require the summary to
-    /// agree, returning the tier ALONGSIDE the total it was derived from.
-    ///
-    /// The tier on a [`SpendSummary`] is only as trustworthy as whoever built it. Re-classifying
-    /// here means a summary hand-labelled `AutoSend` for a spend this profile's policy would tier
-    /// `Confirm` (or `Vault`) is refused — it cannot borrow a permission by asserting one. A
-    /// disagreement is INDETERMINATE rather than denied: the two sides used different policies, so
-    /// the correct answer is unknown, and confirming it away would hide the misconfiguration.
-    ///
-    /// # Why the total is returned rather than recomputed downstream
-    ///
-    /// This is the ONE place the native total is computed for a custody decision, and it is computed
-    /// CHECKED — a spend whose amounts cannot be summed is refused for that reason rather than clamped
-    /// to `u64::MAX` and then tiered as though the clamp were its value. Handing the figure onward
-    /// means no later step can quietly recompute it a different way. When the per-transaction check
-    /// summed it a second time, the two computations could disagree while every test stayed green,
-    /// because this check refuses an unsummable spend first and the second one was therefore
-    /// unreachable — a guard that cannot be reached cannot be tested, so the honest fix is to not have
-    /// it rather than to pretend it is verified.
-    fn reclassify(&self, summary: &SpendSummary) -> Result<(SpendTier, u64)> {
-        let native_total_mojos = summary.checked_native_total_mojos()?;
-        let derived = SpendTier::classify(&self.custody, native_total_mojos);
-        if derived != summary.tier {
-            return Err(AccountError::PolicyIndeterminate(format!(
-                "the summary declares the {:?} tier but this profile's custody policy classifies \
-                 this spend as {derived:?}",
-                summary.tier
-            )));
-        }
-        Ok((derived, native_total_mojos))
     }
 
     /// A vault outflow may pay ONE destination: the profile's own hot wallet (#1504).
@@ -259,41 +239,50 @@ impl PolicyAuthorizer {
         Ok(())
     }
 
-    /// Evaluate the auto-send policy for an [`AutoSend`](SpendTier::AutoSend)-tier spend.
+    /// Rule on an [`AutoSend`](SpendTier::AutoSend)-tier spend under the auto-send policy.
     ///
-    /// `native_total_mojos` is the checked total [`reclassify`](Self::reclassify) already derived, not
-    /// a fresh sum: the value a limit is compared against MUST be the same value the tier was decided
-    /// from, or the two could disagree.
-    fn check_auto_send(
+    /// Every "no" here is escalatable — the user may still confirm the spend by hand — so each returns
+    /// [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) rather than an error. Only a
+    /// genuinely unjudgeable spend (a value no configured limit can bound, an unusable window or
+    /// clock) is an `Err`.
+    ///
+    /// The amount checks weigh `derived.native_total_mojos` — the one checked total the tier was
+    /// decided from, never a fresh sum, so no two steps can disagree about what the spend is worth.
+    fn rule_on_auto_send(
         &self,
-        summary: &SpendSummary,
+        coin_spends: &[CoinSpend],
+        derived: DerivedSpend,
         op_class: SpendOpClass,
-        native_total_mojos: u64,
-    ) -> Result<()> {
+    ) -> Result<SpendRuling> {
         if !self.auto_send.enabled {
-            return Err(AccountError::RequireAuth(
-                "auto-send is switched off for this account".to_string(),
-            ));
+            return self.escalate(coin_spends, derived);
         }
 
-        let limits = self.auto_send.limits_for(op_class)?;
+        // No declared intent means no configured bounds apply — so ask the human rather than refuse.
+        // This is the path every out-of-process request (a dapp's) takes, and it must lead to the
+        // ceremony: refusing it would make an inherently-undeclared request permanently unspendable.
+        let Some(limits) = self.auto_send.configured_limits(op_class) else {
+            return self.escalate(coin_spends, derived);
+        };
         if !limits.enabled {
-            return Err(AccountError::RequireAuth(format!(
-                "auto-send is not enabled for {op_class:?} spends"
-            )));
+            return self.escalate(coin_spends, derived);
         }
 
-        self.reject_amounts_no_mojo_limit_can_bound(summary)?;
+        self.reject_amounts_no_mojo_limit_can_bound(&derived.summary)?;
 
-        if native_total_mojos > limits.per_tx_limit_mojos {
-            return Err(AccountError::RequireAuth(format!(
-                "{native_total_mojos} mojos exceeds the {} mojo per-transaction auto-send limit for \
-                 {op_class:?}",
-                limits.per_tx_limit_mojos
-            )));
+        if derived.native_total_mojos > limits.per_tx_limit_mojos {
+            return self.escalate(coin_spends, derived);
         }
 
-        self.charge_the_rolling_period_cap(native_total_mojos)
+        match self.charge_the_rolling_period_cap(derived.native_total_mojos)? {
+            CapVerdict::Charged => Ok(SpendRuling::Approved(SpendApproval::new(
+                coin_spends.to_vec(),
+                derived.summary,
+                derived.verified,
+                self.scope,
+            ))),
+            CapVerdict::OverCap => self.escalate(coin_spends, derived),
+        }
     }
 
     /// Refuse any spend whose value is denominated in units the configured limits cannot bound.
@@ -327,9 +316,9 @@ impl PolicyAuthorizer {
     /// `t + period_seconds`. Getting that boundary wrong by one second hands out a second full
     /// allowance early, so it is pinned from both sides in the tests.
     ///
-    /// The charge is recorded only on approval, and only once — a refused spend must not consume the
-    /// user's allowance.
-    fn charge_the_rolling_period_cap(&self, total: u64) -> Result<()> {
+    /// The charge is recorded only when the window still fits, and only once — a spend that escalates
+    /// to the ceremony must not consume the user's unattended allowance.
+    fn charge_the_rolling_period_cap(&self, total: u64) -> Result<CapVerdict> {
         if self.auto_send.period_seconds == 0 {
             return Err(AccountError::PolicyIndeterminate(
                 "the auto-send period is zero seconds long, so no window exists to measure the cap \
@@ -347,24 +336,34 @@ impl PolicyAuthorizer {
 
         recent.retain(|record| record.at_unix.saturating_add(self.auto_send.period_seconds) > now);
 
-        let already: u64 = recent.iter().try_fold(0u64, |sum, record| {
-            sum.checked_add(record.mojos).ok_or_else(|| {
+        // ONE checked accumulation, starting from this spend, rather than summing the window and then
+        // adding to it. The two-step form had an unreachable half: the window's own total can only
+        // overflow if two recorded charges sum past `u64::MAX`, which the projection check below
+        // already prevents from ever being recorded — so that guard could never fire, and a guard that
+        // cannot fire is a guard no test can hold. Folded together, the single remaining check IS
+        // reachable (a `u64::MAX` charge under a `u64::MAX` cap, then one mojo more).
+        let projected = recent
+            .iter()
+            .try_fold(total, |sum, record| sum.checked_add(record.mojos))
+            .ok_or_else(|| {
                 AccountError::PolicyIndeterminate(
-                    "the auto-send ledger total overflows u64".to_string(),
+                    "this spend plus the rolling period total overflows u64, so the cap cannot be \
+                     evaluated"
+                        .to_string(),
                 )
-            })
-        })?;
-        let projected = already.checked_add(total).ok_or_else(|| {
-            AccountError::PolicyIndeterminate(
-                "this spend plus the period total overflows u64".to_string(),
-            )
-        })?;
+            })?;
 
         if projected > self.auto_send.period_cap_mojos {
-            return Err(AccountError::RequireAuth(format!(
-                "this {total} mojo spend would bring the rolling {}s auto-send total to {projected} \
-                 mojos, over the {} mojo cap",
-                self.auto_send.period_seconds, self.auto_send.period_cap_mojos
+            return Ok(CapVerdict::OverCap);
+        }
+
+        // The cap bounds the ledger's total VALUE but not its LENGTH: a large cap admits an enormous
+        // number of tiny approvals, each an entry. Refusing at the ceiling is the only safe answer —
+        // evicting the oldest entry would forgive a charge the cap is supposed to still be counting,
+        // i.e. hand allowance back under exactly the load that produced the pressure.
+        if recent.len() >= MAX_LEDGER_ENTRIES {
+            return Err(AccountError::PolicyIndeterminate(format!(
+                "the rolling auto-send ledger already holds {MAX_LEDGER_ENTRIES} approvals in this                  window, so the cap cannot be measured over any further spend"
             )));
         }
 
@@ -377,35 +376,101 @@ impl PolicyAuthorizer {
                 mojos: total,
             });
         }
+        Ok(CapVerdict::Charged)
+    }
+
+    /// Escalate a derived spend to the human, carrying the exact spends the ceremony will describe.
+    ///
+    /// # The prompt itself is rate-limited
+    ///
+    /// Escalation is not free: it spends the user's ATTENTION, which is the scarce resource an attacker
+    /// actually targets. `SPEC.md` §6.3.1 requires every out-of-process request to be
+    /// [`Undeclared`](SpendOpClass::Undeclared), and an undeclared spend always escalates — so without a
+    /// bound, anything able to reach this gate could raise prompts until the user mis-clicked one.
+    /// Consent that can be demanded indefinitely is not consent.
+    ///
+    /// Past `max_confirmations_per_period` prompts in the rolling window the answer is
+    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate): the gate cannot obtain a trustworthy
+    /// decision, which is a condition to fix rather than a verdict on the spend.
+    ///
+    /// This crate has no notion of a request's ORIGIN, so this bounds the TOTAL only. A host serving
+    /// several origins MUST bound them per origin as well; that half cannot live here.
+    fn escalate(&self, coin_spends: &[CoinSpend], derived: DerivedSpend) -> Result<SpendRuling> {
+        self.charge_a_confirmation_prompt()?;
+        Ok(SpendRuling::RequiresConfirmation(PendingApproval::new(
+            coin_spends.to_vec(),
+            derived.summary,
+            derived.verified,
+            self.scope,
+        )))
+    }
+
+    /// Record that a ceremony is being raised, refusing once the window's ceiling is reached.
+    fn charge_a_confirmation_prompt(&self) -> Result<()> {
+        if self.auto_send.period_seconds == 0 {
+            return Err(AccountError::PolicyIndeterminate(
+                "the auto-send period is zero seconds long, so no window exists to measure the \
+                 confirmation ceiling over"
+                    .to_string(),
+            ));
+        }
+        let now = self.clock.now_unix()?;
+        let mut prompts = self.prompts.lock().map_err(|_| {
+            AccountError::PolicyIndeterminate(
+                "the confirmation ledger is poisoned, so the prompt ceiling cannot be evaluated"
+                    .to_string(),
+            )
+        })?;
+
+        prompts.retain(|at| at.saturating_add(self.auto_send.period_seconds) > now);
+
+        if prompts.len() as u64 >= u64::from(self.auto_send.max_confirmations_per_period) {
+            return Err(AccountError::PolicyIndeterminate(format!(
+                "{} confirmation ceremonies have already been raised in the last {}s, reaching the \
+                 configured ceiling; no further spend can be put to the user until the window rolls \
+                 forward",
+                prompts.len(),
+                self.auto_send.period_seconds
+            )));
+        }
+        prompts.push_back(now);
         Ok(())
     }
 }
 
-impl SpendAuthorizer for PolicyAuthorizer {
-    /// The untyped seam: no intent is supplied, so this can only ever refuse or escalate.
-    ///
-    /// Delegating with [`SpendOpClass::Undeclared`] is what makes the seam safe by construction. A
-    /// caller that wants an unattended approval must say what the spend is for, through
-    /// [`authorize_op`](Self::authorize_op) — and only an in-process caller that built the spend is
-    /// in a position to say so truthfully.
-    fn authorize(&self, summary: &SpendSummary) -> Result<()> {
-        self.authorize_op(summary, SpendOpClass::Undeclared)
-    }
+/// Whether the rolling window still had room for a spend — and, if it did, that the spend has now been
+/// charged to it.
+///
+/// A distinct type rather than a `bool` so the two outcomes cannot be swapped at a call site, and so
+/// "over the cap" cannot be mistaken for a failure: it is an ordinary escalation to the human.
+enum CapVerdict {
+    /// The window had room, and `total` has been recorded against it.
+    Charged,
+    /// The window would overflow. Nothing was recorded.
+    OverCap,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::ProfileIx;
     use crate::keys::wallet_key::WalletKey;
     use crate::wallet::autosend::{OpClassLimits, DEFAULT_PERIOD_SECONDS};
     use crate::wallet::clock::{FixedClock, UnreadableClock};
     use crate::wallet::policy::{HotWallet, Vault};
     use crate::wallet::summary::SpendRecipient;
+    use chia_protocol::Coin;
+    use chia_puzzle_types::Memos;
+    use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
+    use chia_wallet_sdk::types::Conditions;
 
     /// An explicit, pinned "now" so every period assertion exercises the boundary it names rather
     /// than whatever the wall clock happens to read.
     const NOW: u64 = 1_800_000_000;
+
+    /// The profile every gate in this module rules for. These tests exercise the gate's DECISIONS,
+    /// which do not depend on the index; the scope it stamps is exercised where it is enforced, in
+    /// `authorizer.rs` and `policy.rs`.
+    const GATE_PROFILE: ProfileIx = ProfileIx::ROOT;
 
     /// Comfortably above every per-transaction limit these tests configure, so a spend's TIER is
     /// decided by the custody policy while its APPROVAL is decided by the auto-send limits. If this
@@ -413,46 +478,129 @@ mod tests {
     /// classification alone and the per-transaction check could be deleted without a test noticing.
     const CUSTODY_AUTO_SEND_CEILING: u64 = 1_000_000;
 
-    /// The profile's own hot wallet.
-    fn hot_wallet_address() -> String {
+    /// The seed whose wallet key OWNS the coins every fixture spends. Irrelevant to the gate — which
+    /// judges outputs, not inputs — but a spend must be a real, parseable standard-layer spend before
+    /// the gate will derive anything from it at all.
+    const SPENDER_SEED: [u8; 32] = [0x5C; 32];
+
+    fn spender() -> WalletKey {
+        WalletKey::from_seed_at(&SPENDER_SEED, ProfileIx::ROOT)
+    }
+
+    /// The profile's own hot wallet — the only destination a vault outflow may pay.
+    fn hot_wallet() -> WalletKey {
         WalletKey::from_seed_at(&[0xA1; 32], ProfileIx::ROOT)
-            .address()
-            .unwrap()
     }
 
     /// Somebody else entirely — a third party the vault must never be able to pay.
-    fn third_party_address() -> String {
+    fn third_party() -> WalletKey {
         WalletKey::from_seed_at(&[0xB2; 32], ProfileIx::ROOT)
-            .address()
-            .unwrap()
     }
 
-    fn xch(address: &str, amount_mojos: u64) -> SpendRecipient {
-        SpendRecipient {
-            address: address.to_string(),
-            amount_mojos,
-            asset_id: None,
+    /// A conserving standard-layer spend of a wallet-owned coin, paying each `(puzzle_hash, amount)`
+    /// as a HINTED output plus `fee`.
+    ///
+    /// Hinting matters: `dig-wallet-backend`'s re-derivation files an UN-hinted output as change and
+    /// excludes it from the recipient list, so an un-hinted fixture would be invisible to every amount
+    /// limit and a test built on one would prove nothing about the limits. The input coin is exactly
+    /// the total, so there is no change output to muddy what the gate sees.
+    ///
+    /// **This is the whole point of the 0.5.0 shape in fixture form:** the gate is handed spends, so a
+    /// test cannot describe a spend as something it is not — every amount asserted below is an amount
+    /// the coin spends really move.
+    fn spend_paying(payments: &[(Bytes32, u64)], fee: u64) -> Vec<CoinSpend> {
+        let total = payments
+            .iter()
+            .try_fold(fee, |sum, (_, amount)| sum.checked_add(*amount))
+            .expect("fixture totals must be representable; use `two_coin_spend_totalling` if not");
+
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::new();
+        for (puzzle_hash, amount) in payments {
+            let hint = ctx.hint(*puzzle_hash).unwrap();
+            conditions = conditions.create_coin(*puzzle_hash, *amount, hint);
         }
-    }
-
-    fn cat(address: &str, amount: u64, asset_id: &str) -> SpendRecipient {
-        SpendRecipient {
-            address: address.to_string(),
-            amount_mojos: amount,
-            asset_id: Some(asset_id.to_string()),
+        if fee > 0 {
+            conditions = conditions.reserve_fee(fee);
         }
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), total),
+                conditions,
+            )
+            .unwrap();
+        ctx.take()
     }
 
-    /// A summary tiered exactly as `custody` would classify it — the shape a summary built through
-    /// `WalletOps::summarize` always has.
-    fn summary_under(
-        custody: &CustodyPolicy,
-        recipients: Vec<SpendRecipient>,
-        fee: u64,
-    ) -> SpendSummary {
-        let mut summary = SpendSummary::new(SpendTier::Confirm, recipients, fee);
-        summary.tier = SpendTier::classify(custody, summary.native_total_mojos());
-        summary
+    /// Two wallet-owned input coins, each paid straight out to a hinted third party.
+    ///
+    /// A multi-coin fixture is the only shape whose INPUT total can exceed a single coin's `u64`, so it
+    /// is the only one that can exercise the input-summability guard.
+    fn two_coin_spend(first: u64, second: u64) -> Vec<CoinSpend> {
+        let recipient = third_party().puzzle_hash();
+        let mut ctx = SpendContext::new();
+        for (parent, amount) in [([1u8; 32], first), ([2u8; 32], second)] {
+            let hint = ctx.hint(recipient).unwrap();
+            StandardLayer::new(spender().public_key())
+                .spend(
+                    &mut ctx,
+                    Coin::new(Bytes32::new(parent), spender().puzzle_hash(), amount),
+                    Conditions::new().create_coin(recipient, amount, hint),
+                )
+                .unwrap();
+        }
+        ctx.take()
+    }
+
+    /// A spend paying `amount` to a third party with no fee — the workhorse fixture.
+    fn pays_third_party(amount: u64) -> Vec<CoinSpend> {
+        spend_paying(&[(third_party().puzzle_hash(), amount)], 0)
+    }
+
+    /// A conserving CAT send: `amount` base units of a CAT to a hinted third party, plus a native
+    /// `fee`. The CAT amount is denominated in the asset's own units, so no mojo-denominated limit can
+    /// weigh it — the native total is the fee alone.
+    fn cat_spend_paying(amount: u64, fee: u64) -> Vec<CoinSpend> {
+        use chia_wallet_sdk::driver::{Cat, CatSpend, SpendWithConditions};
+
+        let wallet_ph = spender().puzzle_hash();
+
+        // Issue the CAT under the spender's own key in a THROWAWAY context, so only the clean send
+        // below reaches the gate.
+        let cat = {
+            let mut issue_ctx = SpendContext::new();
+            let genesis = Coin::new(Bytes32::new([9u8; 32]), wallet_ph, amount);
+            let hint = issue_ctx.hint(wallet_ph).unwrap();
+            let issue = Conditions::new().create_coin(wallet_ph, amount, hint);
+            let (_, cats) =
+                Cat::issue_with_coin(&mut issue_ctx, genesis.coin_id(), amount, issue).unwrap();
+            cats[0]
+        };
+
+        let mut ctx = SpendContext::new();
+        let recipient = third_party().puzzle_hash();
+        let cat_hint = ctx.hint(recipient).unwrap();
+        let inner = StandardLayer::new(spender().public_key())
+            .spend_with_conditions(
+                &mut ctx,
+                Conditions::new().create_coin(recipient, amount, cat_hint),
+            )
+            .unwrap();
+        Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner)]).unwrap();
+
+        // The fee is NATIVE value and must come from a native coin, spent to nothing but the fee —
+        // conserving XCH separately from the CAT, which conserves in its own units.
+        if fee > 0 {
+            StandardLayer::new(spender().public_key())
+                .spend(
+                    &mut ctx,
+                    Coin::new(Bytes32::new([8u8; 32]), wallet_ph, fee),
+                    Conditions::new().reserve_fee(fee),
+                )
+                .unwrap();
+        }
+        ctx.take()
     }
 
     /// A policy that permits as much as it can, so a refusal in a test is attributable to the rule
@@ -465,6 +613,9 @@ mod tests {
             small_send: OpClassLimits::enabled_up_to(u64::MAX),
             period_seconds: DEFAULT_PERIOD_SECONDS,
             period_cap_mojos: u64::MAX,
+            // Permissive here too, so a test that escalates repeatedly fails on the rule it is
+            // about rather than on the prompt ceiling. The ceiling has its own tests.
+            max_confirmations_per_period: u32::MAX,
         }
     }
 
@@ -487,58 +638,142 @@ mod tests {
         auto_send: AutoSendPolicy,
     ) -> (PolicyAuthorizer, Arc<FixedClock>) {
         let clock = Arc::new(FixedClock::new(NOW));
-        let gate = PolicyAuthorizer::new(custody, auto_send, &hot_wallet_address(), clock.clone())
-            .unwrap();
+        let gate = PolicyAuthorizer::new(
+            GATE_PROFILE,
+            custody,
+            auto_send,
+            &hot_wallet().address().unwrap(),
+            clock.clone(),
+        )
+        .unwrap();
         (gate, clock)
+    }
+
+    // `SpendRuling` carries no `Debug` (an approval is not a value to log), so these three take the
+    // place of `unwrap`/`unwrap_err` and say which outcome the test demanded.
+
+    fn approval(result: Result<SpendRuling>) -> SpendApproval {
+        match result {
+            Ok(SpendRuling::Approved(approval)) => approval,
+            Ok(SpendRuling::RequiresConfirmation(_)) => {
+                panic!("expected an auto-approval, got an escalation to the human")
+            }
+            Err(e) => panic!("expected an auto-approval, got a refusal: {e}"),
+        }
+    }
+
+    fn pending(result: Result<SpendRuling>) -> PendingApproval {
+        match result {
+            Ok(SpendRuling::RequiresConfirmation(pending)) => pending,
+            Ok(SpendRuling::Approved(_)) => {
+                panic!("expected an escalation to the human, got an auto-approval")
+            }
+            Err(e) => panic!("expected an escalation to the human, got a refusal: {e}"),
+        }
+    }
+
+    fn refusal(result: Result<SpendRuling>) -> AccountError {
+        match result {
+            Ok(SpendRuling::Approved(_)) => panic!("expected a refusal, got an auto-approval"),
+            Ok(SpendRuling::RequiresConfirmation(_)) => {
+                panic!("expected a refusal, got an escalation to the human")
+            }
+            Err(e) => e,
+        }
+    }
+
+    /// The same for a `Result<SpendApproval>`, which `PendingApproval::confirmed` returns.
+    /// Run the ceremony to `decision` through the real consent seam.
+    ///
+    /// A fixed-answer [`AuthProvider`] stands in for the harness, so these tests exercise
+    /// [`PendingApproval::confirm_with`] — the only public route from a pending approval to a
+    /// signature — rather than the crate-private tail it delegates to. A host cannot skip this seam,
+    /// so neither does the test.
+    async fn confirmed(
+        pending: PendingApproval,
+        decision: crate::auth::provider::SpendDecision,
+    ) -> Result<SpendApproval> {
+        use crate::auth::factors::AuthFactors;
+        use crate::auth::provider::{AuthProvider, SpendConfirmRequest, UnlockRequest};
+        use crate::id::AccountId;
+
+        use crate::auth::provider::SpendDecision;
+
+        struct Fixed(SpendDecision);
+
+        #[async_trait::async_trait]
+        impl AuthProvider for Fixed {
+            async fn collect_factors(&self, _: UnlockRequest) -> Result<AuthFactors> {
+                unreachable!("a spend ceremony never collects unlock factors")
+            }
+            async fn confirm_spend(&self, _: SpendConfirmRequest) -> Result<SpendDecision> {
+                Ok(self.0.clone())
+            }
+        }
+
+        pending
+            .confirm_with(
+                &Fixed(decision),
+                AccountId::new("ceremony-fixture"),
+                ProfileIx::ROOT,
+            )
+            .await
+    }
+
+    fn denial(result: Result<SpendApproval>) -> AccountError {
+        match result {
+            Ok(_) => panic!("expected a denial, got a signable approval"),
+            Err(e) => e,
+        }
+    }
+
+    fn is_approved(result: &Result<SpendRuling>) -> bool {
+        matches!(result, Ok(SpendRuling::Approved(_)))
+    }
+
+    /// The rolling ledger's current total — the FIGURE the period cap is measured from.
+    ///
+    /// Asserting the figure, not merely the eventual refusal, is what pins that the gate charged the
+    /// spend's REAL value: before 0.5.0 a caller could have a one-mojo summary authorized for a
+    /// billion-mojo spend, so the ledger stood at 1 while a billion moved, and every advertised bound
+    /// was satisfied by a number nobody had checked against the coin spends.
+    fn ledger_total(gate: &PolicyAuthorizer) -> u64 {
+        gate.recent.lock().unwrap().iter().map(|r| r.mojos).sum()
     }
 
     // ------------------------------------------------------------- vault tier (#1504)
 
-    /// A vault spend is refused however small it is and however permissive the auto-send policy —
-    /// including a spend to the hot wallet of one mojo with every limit set to `u64::MAX`.
+    /// A vault spend never auto-approves, however small it is and however permissive the auto-send
+    /// policy — including a spend to the hot wallet of one mojo with every limit set to `u64::MAX`.
     #[test]
-    fn a_vault_spend_is_refused_at_every_amount_even_under_a_maximally_permissive_policy() {
+    fn a_vault_spend_never_auto_approves_at_any_amount_even_under_a_maximally_permissive_policy() {
         let gate = gate_with(vault_custody(), permissive_auto_send());
         for amount in [0, 1, 42, CUSTODY_AUTO_SEND_CEILING, u64::MAX - 1] {
-            let summary = summary_under(
-                &vault_custody(),
-                vec![xch(&hot_wallet_address(), amount)],
-                0,
-            );
-            assert_eq!(summary.tier, SpendTier::Vault);
-            let err = gate
-                .authorize_op(&summary, SpendOpClass::SmallSend)
-                .unwrap_err();
-            assert!(
-                matches!(err, AccountError::RequireAuth(_)),
-                "{amount} mojos: {err}"
+            let coin_spends = spend_paying(&[(hot_wallet().puzzle_hash(), amount)], 0);
+            let escalated = pending(gate.authorize_op(&coin_spends, SpendOpClass::SmallSend));
+            assert_eq!(
+                escalated.summary().tier,
+                SpendTier::Vault,
+                "{amount} mojos must be tiered Vault"
             );
         }
     }
 
     /// The structural rule behind the 24h window: the vault may pay its own hot wallet (escalated to
-    /// a ceremony) but may NOT pay a third party at all. The two outcomes must differ by VARIANT —
-    /// `PolicyDenied` cannot be escalated by prompting the user, `RequireAuth` can. Collapsing both
-    /// into one refusal would let a caller prompt its way to a direct vault to third-party spend.
+    /// a ceremony) but may NOT pay a third party at all. The two outcomes must differ by KIND — a
+    /// `PolicyDenied` cannot be escalated by prompting the user, an escalation can. Collapsing them
+    /// would let a caller prompt its way to a direct vault-to-third-party spend.
     #[test]
     fn a_vault_spend_to_a_third_party_is_forbidden_outright_while_one_to_the_hot_wallet_escalates()
     {
         let gate = gate_with(vault_custody(), permissive_auto_send());
 
-        let to_hot = summary_under(&vault_custody(), vec![xch(&hot_wallet_address(), 500)], 0);
-        let escalated = gate
-            .authorize_op(&to_hot, SpendOpClass::SmallSend)
-            .unwrap_err();
-        assert!(
-            matches!(escalated, AccountError::RequireAuth(_)),
-            "vault to hot must escalate, got: {escalated}"
-        );
+        pending(gate.authorize_op(
+            &spend_paying(&[(hot_wallet().puzzle_hash(), 500)], 0),
+            SpendOpClass::SmallSend,
+        ));
 
-        let to_stranger =
-            summary_under(&vault_custody(), vec![xch(&third_party_address(), 500)], 0);
-        let denied = gate
-            .authorize_op(&to_stranger, SpendOpClass::SmallSend)
-            .unwrap_err();
+        let denied = refusal(gate.authorize_op(&pays_third_party(500), SpendOpClass::SmallSend));
         assert!(
             matches!(denied, AccountError::PolicyDenied(_)),
             "vault to a third party must be forbidden outright, got: {denied}"
@@ -546,45 +781,75 @@ mod tests {
     }
 
     /// Paying the hot wallet does not license paying anyone else in the same spend. The rule is over
-    /// the CLASS of destination — every recipient must be the hot wallet — so smuggling a second
+    /// the CLASS of destination — EVERY recipient must be the hot wallet — so smuggling a second
     /// output alongside a legitimate one is refused.
     #[test]
     fn a_vault_spend_paying_the_hot_wallet_and_a_third_party_is_forbidden() {
         let gate = gate_with(vault_custody(), permissive_auto_send());
-        let summary = summary_under(
-            &vault_custody(),
-            vec![
-                xch(&hot_wallet_address(), 500),
-                xch(&third_party_address(), 1),
+        let coin_spends = spend_paying(
+            &[
+                (hot_wallet().puzzle_hash(), 500),
+                (third_party().puzzle_hash(), 1),
             ],
             0,
         );
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
+        let err = refusal(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
         assert!(matches!(err, AccountError::PolicyDenied(_)), "{err}");
     }
 
     /// A recipient whose address cannot be decoded cannot be PROVEN to be the hot wallet, so the
-    /// answer is unknown rather than approved. Silence is the cheapest hostile claim: an undecodable
-    /// address must neither compare-unequal by luck nor compare-equal by accident — it must stop the
-    /// evaluation.
+    /// answer is unknown rather than approved: an undecodable address must neither compare-unequal by
+    /// luck nor compare-equal by accident — it must stop the evaluation.
+    ///
+    /// Pinned at the destination rule itself rather than through `authorize_op`, because since 0.5.0
+    /// the gate DERIVES the addresses it compares (from puzzle hashes, via the wallet backend), so no
+    /// caller can present it an undecodable one. The rule is still reachable by any future caller that
+    /// hands it a summary from elsewhere, so its failure arm stays tested where it can be reached.
     #[test]
     fn a_vault_recipient_with_an_undecodable_address_is_indeterminate() {
         let gate = gate_with(vault_custody(), permissive_auto_send());
-        let hot = hot_wallet_address();
+        let hot = hot_wallet().address().unwrap();
         for address in ["", "not-an-address", "xch1", &hot[..20]] {
-            let summary = summary_under(&vault_custody(), vec![xch(address, 500)], 0);
-            let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
+            let summary = SpendSummary::new(
+                SpendTier::Vault,
+                vec![SpendRecipient {
+                    address: address.to_string(),
+                    amount_mojos: 500,
+                    asset_id: None,
+                }],
+                0,
+            );
+            let err = gate
+                .reject_vault_outflow_to_anyone_but_the_hot_wallet(&summary)
+                .unwrap_err();
             assert!(
                 matches!(err, AccountError::PolicyIndeterminate(_)),
                 "address {address:?}: {err}"
             );
         }
+
+        // The truthful control: the real hot-wallet address decodes and passes, so the assertions
+        // above are the decode FAILING and not the rule refusing everything.
+        let ok = SpendSummary::new(
+            SpendTier::Vault,
+            vec![SpendRecipient {
+                address: hot,
+                amount_mojos: 500,
+                asset_id: None,
+            }],
+            0,
+        );
+        gate.reject_vault_outflow_to_anyone_but_the_hot_wallet(&ok)
+            .expect("the profile's own hot wallet is the one permitted destination");
     }
 
     // -------------------------------------------------------- auto-send bounds (#1505)
 
+    /// The happy path — and the LEDGER FIGURE, which is where the pre-0.5.0 defect was observable.
+    /// The cap must be charged the spend's real value (990 + a 10 mojo fee), not a number a caller
+    /// supplied.
     #[test]
-    fn an_auto_send_within_the_op_class_the_per_tx_limit_and_the_period_cap_is_permitted() {
+    fn an_auto_send_within_every_bound_is_approved_and_charges_the_cap_its_real_value() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -594,16 +859,65 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 990)], 10);
-        assert_eq!(summary.tier, SpendTier::AutoSend);
-        gate.authorize_op(&summary, SpendOpClass::Tip).unwrap();
+        let coin_spends = spend_paying(&[(third_party().puzzle_hash(), 990)], 10);
+
+        let approved = approval(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+
+        assert_eq!(approved.summary().tier, SpendTier::AutoSend);
+        assert_eq!(approved.summary().fee, 10);
+        assert_eq!(approved.summary().recipients[0].amount_mojos, 990);
+        assert_eq!(
+            approved.coin_spends(),
+            coin_spends.as_slice(),
+            "the approval must own the very spends that were judged"
+        );
+        assert_eq!(
+            ledger_total(&gate),
+            1_000,
+            "the cap must be charged the spend's real value, fee included"
+        );
+    }
+
+    /// The rolling cap is charged the REAL value even when the spend is large: the figure is read from
+    /// the coin spends, so there is no smaller description of them that could be charged instead.
+    ///
+    /// This is #1698's exploit expressed as an arithmetic assertion. Under the pre-0.5.0 API the same
+    /// sequence — authorize a hand-built 1-mojo summary, sign a 900_000-mojo spend — left the ledger at
+    /// 1 and approved both; here a second spend of 200_000 must be refused because the first really
+    /// did consume 900_000 of the 1_000_000 window.
+    #[test]
+    fn the_rolling_cap_is_charged_the_spends_own_value_so_a_small_description_cannot_understate_it()
+    {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000_000),
+                period_cap_mojos: 1_000_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+
+        approval(gate.authorize_op(&pays_third_party(900_000), SpendOpClass::Tip));
+        assert_eq!(
+            ledger_total(&gate),
+            900_000,
+            "the ledger must stand at the spend's real value, not at a nominal 1"
+        );
+
+        pending(gate.authorize_op(&pays_third_party(200_000), SpendOpClass::Tip));
+        assert_eq!(
+            ledger_total(&gate),
+            900_000,
+            "and the escalated spend must not have been charged"
+        );
     }
 
     /// The per-transaction limit binds independently of the custody classification: this spend is
     /// AutoSend-tier (well under the custody ceiling) yet over the op class's own limit. Pinned from
-    /// both sides — exactly at the limit passes, one mojo over is refused.
+    /// both sides — exactly at the limit is approved, one mojo over escalates.
     #[test]
-    fn an_auto_send_over_the_per_transaction_limit_requires_auth() {
+    fn an_auto_send_over_the_per_transaction_limit_escalates() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -613,14 +927,14 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let at_limit = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_000)], 0);
-        gate.authorize_op(&at_limit, SpendOpClass::Tip)
-            .expect("a spend exactly at the limit is within it");
+        approval(gate.authorize_op(&pays_third_party(1_000), SpendOpClass::Tip));
 
-        let one_over = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_001)], 0);
-        assert_eq!(one_over.tier, SpendTier::AutoSend);
-        let err = gate.authorize_op(&one_over, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        let escalated = pending(gate.authorize_op(&pays_third_party(1_001), SpendOpClass::Tip));
+        assert_eq!(
+            escalated.summary().tier,
+            SpendTier::AutoSend,
+            "the custody tier is untouched — it is the auto-send limit that bound"
+        );
     }
 
     /// The fee counts toward the per-transaction limit: value the user parts with is value the user
@@ -637,13 +951,12 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_000)], 1);
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        let coin_spends = spend_paying(&[(third_party().puzzle_hash(), 1_000)], 1);
+        pending(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
     }
 
     #[test]
-    fn an_auto_send_over_the_rolling_period_cap_requires_auth() {
+    fn an_auto_send_over_the_rolling_period_cap_escalates() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -653,11 +966,9 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let spend = summary_under(&hot_custody(), vec![xch(&third_party_address(), 900)], 0);
-        gate.authorize_op(&spend, SpendOpClass::Tip).unwrap();
+        approval(gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip));
         // 900 + 900 = 1800 > the 1500 cap, even though each spend is under the 1000 per-tx limit.
-        let err = gate.authorize_op(&spend, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        pending(gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip));
     }
 
     /// The rolling cap is shared across op classes: a tip cannot re-earn an allowance a rebalance
@@ -674,10 +985,8 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let spend = summary_under(&hot_custody(), vec![xch(&third_party_address(), 900)], 0);
-        gate.authorize_op(&spend, SpendOpClass::Rebalance).unwrap();
-        let err = gate.authorize_op(&spend, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        approval(gate.authorize_op(&pays_third_party(900), SpendOpClass::Rebalance));
+        pending(gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip));
     }
 
     /// The rollover boundary, pinned from BOTH sides. A spend recorded at `t` must still be counted
@@ -697,26 +1006,53 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let spend = summary_under(&hot_custody(), vec![xch(&third_party_address(), 900)], 0);
 
-        gate.authorize_op(&spend, SpendOpClass::Tip).unwrap();
+        approval(gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip));
 
         clock.set(NOW + period - 1);
-        let err = gate.authorize_op(&spend, SpendOpClass::Tip).unwrap_err();
         assert!(
-            matches!(err, AccountError::RequireAuth(_)),
-            "one second before the window closes the earlier spend must still count: {err}"
+            !is_approved(&gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip)),
+            "one second before the window closes the earlier spend must still count"
         );
 
         clock.set(NOW + period);
-        gate.authorize_op(&spend, SpendOpClass::Tip)
-            .expect("exactly one period later the allowance has renewed");
+        approval(gate.authorize_op(&pays_third_party(900), SpendOpClass::Tip));
     }
 
-    /// A refused spend must not consume the user's allowance — otherwise a caller could exhaust the
-    /// day's budget with requests that were never approved.
+    /// An escalated spend must not consume the user's unattended allowance — otherwise a caller could
+    /// exhaust the day's budget with requests that were never auto-approved.
     #[test]
-    fn a_refused_spend_does_not_consume_the_period_allowance() {
+    fn an_escalated_spend_does_not_consume_the_period_allowance() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000),
+                period_cap_mojos: 1_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+
+        approval(gate.authorize_op(&pays_third_party(600), SpendOpClass::Tip));
+        assert_eq!(ledger_total(&gate), 600);
+
+        // Escalated BY THE CAP ITSELF (600 + 600 > 1000) — the only outcome that reaches the ledger,
+        // and therefore the only one that could wrongly bill it. Escalations decided earlier (a
+        // disabled class, an undeclared intent, an over-limit amount) never reach the ledger at all,
+        // so asserting on those alone would leave this rule untested.
+        pending(gate.authorize_op(&pays_third_party(600), SpendOpClass::Tip));
+        assert_eq!(ledger_total(&gate), 600, "the escalation must cost nothing");
+
+        // Exactly the remaining 400 must still be available. Had the escalated 600 been billed, the
+        // window would stand at 1200 and this would escalate too.
+        approval(gate.authorize_op(&pays_third_party(400), SpendOpClass::Tip));
+    }
+
+    /// The escalations decided BEFORE the ledger is consulted must also leave the allowance untouched.
+    /// Kept separate from the cap case above because the two travel different paths and a single test
+    /// covering both would be satisfied by either.
+    #[test]
+    fn a_spend_escalated_before_the_ledger_is_reached_does_not_consume_the_period_allowance() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -727,57 +1063,19 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let six_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 600)], 0);
-        let four_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 400)], 0);
 
-        gate.authorize_op(&six_hundred, SpendOpClass::Tip)
-            .expect("600 of the 1000 allowance");
+        pending(gate.authorize_op(&pays_third_party(1_000), SpendOpClass::Rebalance));
+        pending(gate.authorize_op(&pays_third_party(1_000), SpendOpClass::Undeclared));
+        pending(gate.authorize_op(&pays_third_party(1_001), SpendOpClass::Tip));
+        assert_eq!(ledger_total(&gate), 0);
 
-        // Refused BY THE CAP ITSELF (600 + 600 > 1000) — the only refusal that reaches the ledger,
-        // and therefore the only one that could wrongly bill it. Refusals decided earlier (a
-        // disabled class, an undeclared intent, an over-limit amount) never reach the ledger at
-        // all, so asserting on those alone would leave this rule untested.
-        let err = gate
-            .authorize_op(&six_hundred, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
-
-        // Exactly the remaining 400 must still be available. Had the refused 600 been billed, the
-        // window would stand at 1200 and this would be refused too.
-        gate.authorize_op(&four_hundred, SpendOpClass::Tip)
-            .expect("a refusal must not have consumed the remaining allowance");
+        approval(gate.authorize_op(&pays_third_party(1_000), SpendOpClass::Tip));
     }
 
-    /// The refusals decided BEFORE the ledger is consulted must also leave the allowance untouched.
-    /// Kept separate from the cap-refusal case above because the two travel different paths and a
-    /// single test covering both would be satisfied by either.
+    /// A disabled op class escalates while an ENABLED sibling on the same gate still auto-approves.
+    /// The truthful control matters: without it, a gate that escalated everything would pass.
     #[test]
-    fn a_spend_refused_before_the_ledger_is_reached_does_not_consume_the_period_allowance() {
-        let gate = gate_with(
-            hot_custody(),
-            AutoSendPolicy {
-                enabled: true,
-                tip: OpClassLimits::enabled_up_to(1_000),
-                rebalance: OpClassLimits::default(),
-                period_cap_mojos: 1_000,
-                ..AutoSendPolicy::default()
-            },
-        );
-        let spend = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_000)], 0);
-
-        assert!(gate.authorize_op(&spend, SpendOpClass::Rebalance).is_err());
-        assert!(gate.authorize_op(&spend, SpendOpClass::Undeclared).is_err());
-        let over = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_001)], 0);
-        assert!(gate.authorize_op(&over, SpendOpClass::Tip).is_err());
-
-        gate.authorize_op(&spend, SpendOpClass::Tip)
-            .expect("the full allowance must still be available");
-    }
-
-    /// A disabled op class is refused while an ENABLED sibling on the same gate still passes. The
-    /// truthful control matters: without it, a gate that refused everything would pass this test.
-    #[test]
-    fn a_disabled_op_class_is_refused_while_its_enabled_sibling_is_permitted() {
+    fn a_disabled_op_class_escalates_while_its_enabled_sibling_is_approved() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -791,15 +1089,9 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 100)], 0);
 
-        gate.authorize_op(&summary, SpendOpClass::Tip)
-            .expect("the enabled class must still pass");
-
-        let err = gate
-            .authorize_op(&summary, SpendOpClass::Rebalance)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        approval(gate.authorize_op(&pays_third_party(100), SpendOpClass::Tip));
+        pending(gate.authorize_op(&pays_third_party(100), SpendOpClass::Rebalance));
     }
 
     /// A class enabled but left at a zero limit permits nothing: `enabled` alone is not an allowance.
@@ -817,41 +1109,37 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1)], 0);
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        pending(gate.authorize_op(&pays_third_party(1), SpendOpClass::Tip));
     }
 
     /// The global switch overrides every per-class permission — including a spend that is within
-    /// every other bound and would otherwise be approved by this very gate.
+    /// every other bound and would otherwise be auto-approved by this very gate.
     #[test]
-    fn the_global_off_switch_refuses_even_a_spend_that_is_within_every_other_bound() {
-        let within_everything =
-            summary_under(&hot_custody(), vec![xch(&third_party_address(), 100)], 0);
+    fn the_global_off_switch_escalates_even_a_spend_within_every_other_bound() {
+        let coin_spends = pays_third_party(100);
         let permissive = AutoSendPolicy {
             enabled: true,
             tip: OpClassLimits::enabled_up_to(1_000),
             period_cap_mojos: u64::MAX,
             ..AutoSendPolicy::default()
         };
-        gate_with(hot_custody(), permissive)
-            .authorize_op(&within_everything, SpendOpClass::Tip)
-            .expect("control: this spend is within every bound while the switch is on");
+        approval(
+            gate_with(hot_custody(), permissive).authorize_op(&coin_spends, SpendOpClass::Tip),
+        );
 
         let switched_off = AutoSendPolicy {
             enabled: false,
             ..permissive
         };
-        let err = gate_with(hot_custody(), switched_off)
-            .authorize_op(&within_everything, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+        pending(
+            gate_with(hot_custody(), switched_off).authorize_op(&coin_spends, SpendOpClass::Tip),
+        );
     }
 
     #[test]
-    fn the_default_policy_refuses_every_op_class() {
+    fn the_default_policy_auto_approves_no_op_class() {
         let gate = gate_with(hot_custody(), AutoSendPolicy::default());
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1)], 0);
+        let coin_spends = pays_third_party(1);
         for op_class in [
             SpendOpClass::Rebalance,
             SpendOpClass::Tip,
@@ -859,66 +1147,381 @@ mod tests {
             SpendOpClass::Undeclared,
         ] {
             assert!(
-                gate.authorize_op(&summary, op_class).is_err(),
-                "{op_class:?} must be refused under the default policy"
+                !is_approved(&gate.authorize_op(&coin_spends, op_class)),
+                "{op_class:?} must not auto-approve under the default policy"
             );
         }
     }
 
-    // ---------------------------------------------- fail-closed on the unevaluable
+    // ------------------------------------------- the undeclared intent escalates, never dead-ends
 
-    /// The untyped `SpendAuthorizer` seam carries no intent, so it can never auto-approve — even for
-    /// a spend within every configured bound under a maximally permissive policy. The control in the
-    /// same test proves the spend itself was approvable, so this is the SEAM failing closed and not
-    /// an incidental refusal.
+    /// An UNDECLARED intent must reach the human, not a refusal.
+    ///
+    /// This is the outcome every request arriving from outside the process gets, so a refusal here
+    /// makes a dapp's spend permanently unspendable rather than confirmable — and, before 0.5.0, an
+    /// undeclared spend WAS `PolicyIndeterminate`, which no ceremony may permit.
+    ///
+    /// Pinned from BOTH sides of the auto-send switch, because the switch-ON case is the one that
+    /// reaches the op-class lookup at all: with auto-send off every spend escalates for an unrelated
+    /// reason and the test would pass without exercising the rule.
     #[test]
-    fn the_untyped_trait_seam_cannot_auto_approve_even_an_otherwise_approvable_spend() {
+    fn an_undeclared_intent_escalates_to_the_human_rather_than_dead_ending() {
+        let coin_spends = pays_third_party(100);
+
+        let on = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1_000),
+                small_send: OpClassLimits::enabled_up_to(1_000),
+                rebalance: OpClassLimits::enabled_up_to(1_000),
+                period_cap_mojos: u64::MAX,
+                ..AutoSendPolicy::default()
+            },
+        );
+        // Control: the very same spend auto-approves the moment an intent IS declared, so what
+        // follows is the UNDECLARED case being handled and not a spend that could never pass.
+        approval(on.authorize_op(&coin_spends, SpendOpClass::Tip));
+
+        let escalated = pending(on.authorize_op(&coin_spends, SpendOpClass::Undeclared));
+        assert_eq!(escalated.summary().recipients[0].amount_mojos, 100);
+        assert_eq!(
+            ledger_total(&on),
+            100,
+            "only the declared, auto-approved spend was charged"
+        );
+
+        let off = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: false,
+                ..permissive_auto_send()
+            },
+        );
+        pending(off.authorize_op(&coin_spends, SpendOpClass::Undeclared));
+    }
+
+    /// A `Confirm`-tier spend reaches the confirm path and, once confirmed, becomes signable — the
+    /// whole ceremony, end to end, on a spend the gate will never auto-approve.
+    #[tokio::test]
+    async fn a_confirm_tier_spend_reaches_the_ceremony_and_a_confirmation_makes_it_signable() {
         let gate = gate_with(hot_custody(), permissive_auto_send());
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 100)], 0);
+        let coin_spends = pays_third_party(CUSTODY_AUTO_SEND_CEILING + 1);
 
-        gate.authorize_op(&summary, SpendOpClass::Tip)
-            .expect("control: declared intent, within every bound");
+        let escalated = pending(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+        assert_eq!(escalated.summary().tier, SpendTier::Confirm);
+        assert_eq!(
+            escalated.summary().recipients[0].amount_mojos,
+            CUSTODY_AUTO_SEND_CEILING + 1,
+            "the user must be shown the spend's real value"
+        );
 
-        let err = SpendAuthorizer::authorize(&gate, &summary).unwrap_err();
-        assert!(
-            matches!(err, AccountError::PolicyIndeterminate(_)),
-            "an undeclared intent is unknown, not merely denied: {err}"
+        let approved = confirmed(escalated, crate::auth::provider::SpendDecision::Approve)
+            .await
+            .expect("a confirmed spend becomes signable");
+        assert_eq!(
+            approved.coin_spends(),
+            coin_spends.as_slice(),
+            "and it is the very spend that was confirmed"
+        );
+        assert_eq!(
+            ledger_total(&gate),
+            0,
+            "a human-confirmed spend does not consume the unattended allowance"
         );
     }
 
-    /// A summary may not borrow a permission by asserting a tier the profile's own policy would not
-    /// give it. Both directions are wrong and both must be refused: a large spend mislabelled
-    /// `AutoSend`, and a vault-policy spend mislabelled `AutoSend`.
-    #[test]
-    fn a_summary_whose_declared_tier_disagrees_with_the_custody_policy_is_indeterminate() {
+    /// A declined ceremony yields no approval and charges nothing — a refusal must never cost the
+    /// user their allowance.
+    #[tokio::test]
+    async fn a_declined_ceremony_yields_no_approval_and_charges_nothing() {
         let gate = gate_with(hot_custody(), permissive_auto_send());
-        let mislabelled = SpendSummary::new(
-            SpendTier::AutoSend,
-            vec![xch(&third_party_address(), CUSTODY_AUTO_SEND_CEILING + 1)],
-            0,
-        );
-        let err = gate
-            .authorize_op(&mislabelled, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+        let escalated = pending(gate.authorize_op(
+            &pays_third_party(CUSTODY_AUTO_SEND_CEILING + 1),
+            SpendOpClass::Tip,
+        ));
 
-        let vault_gate = gate_with(vault_custody(), permissive_auto_send());
-        let laundered =
-            SpendSummary::new(SpendTier::AutoSend, vec![xch(&third_party_address(), 1)], 0);
-        let err = vault_gate
-            .authorize_op(&laundered, SpendOpClass::Tip)
-            .unwrap_err();
+        let err = denial(
+            confirmed(
+                escalated,
+                crate::auth::provider::SpendDecision::Decline(None),
+            )
+            .await,
+        );
+        assert!(matches!(err, AccountError::UserDeclined(_)), "{err}");
+        assert_eq!(ledger_total(&gate), 0);
+    }
+
+    // ---------------------------------------------- fail-closed on the unevaluable
+
+    /// A bundle that hides `hidden_mojos` of native value behind a WRAPPER layer's puzzle hash.
+    ///
+    /// Two spends, exactly as the executed exploit ran them:
+    ///
+    /// 1. a wallet-held CAT is spent, its CAT change returning UN-HINTED to the wallet — this is what
+    ///    puts the CAT coin's puzzle hash into the set of "hashes this spend is spending from";
+    /// 2. a fat native coin is spent with a HINTED output paying that CAT-layer hash, plus a 1 mojo fee.
+    ///
+    /// Nothing here is malformed: value conserves per asset, every puzzle reveal binds to its coin, and
+    /// the whole bundle is signable. The attack is purely that the destination is a hash the spender
+    /// cannot pay to and still spend — so the mojos are destroyed, while a rule that excused any spent
+    /// coin's `puzzle_hash` read them as change and weighed the spend at its fee alone.
+    ///
+    /// The victim need not own a CAT deliberately: an airdrop of a dust CAT to their address is
+    /// permissionless and needs only the synthetic public key, which is public after any prior spend.
+    fn hides_value_behind_a_wrapper_layer(
+        hidden_mojos: u64,
+        fee: u64,
+    ) -> (Vec<CoinSpend>, Bytes32) {
+        use chia_wallet_sdk::driver::{Cat, CatSpend, SpendWithConditions};
+
+        let wallet_ph = spender().puzzle_hash();
+        const CAT_UNITS: u64 = 1_000;
+
+        // A CAT the wallet holds, issued in a THROWAWAY context so only the send below is judged.
+        let cat = {
+            let mut issue_ctx = SpendContext::new();
+            let genesis = Coin::new(Bytes32::new([9u8; 32]), wallet_ph, CAT_UNITS);
+            let hint = issue_ctx.hint(wallet_ph).unwrap();
+            let issue = Conditions::new().create_coin(wallet_ph, CAT_UNITS, hint);
+            let (_, cats) =
+                Cat::issue_with_coin(&mut issue_ctx, genesis.coin_id(), CAT_UNITS, issue).unwrap();
+            cats[0]
+        };
+        let wrapper_hash = cat.coin.puzzle_hash;
+
+        let mut ctx = SpendContext::new();
+
+        // (1) Spend the CAT, CAT change un-hinted back to the wallet's own p2.
+        let inner = StandardLayer::new(spender().public_key())
+            .spend_with_conditions(
+                &mut ctx,
+                Conditions::new().create_coin(wallet_ph, CAT_UNITS, Memos::None),
+            )
+            .unwrap();
+        Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner)]).unwrap();
+
+        // (2) Spend the fat native coin, paying the CAT LAYER's hash. Hinted, so this is not the
+        //     un-hinted hole — it is a fully-declared payment to an address that destroys the value.
+        let hint = ctx.hint(wrapper_hash).unwrap();
+        let mut conditions = Conditions::new().create_coin(wrapper_hash, hidden_mojos, hint);
+        if fee > 0 {
+            conditions = conditions.reserve_fee(fee);
+        }
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([3u8; 32]), wallet_ph, hidden_mojos + fee),
+                conditions,
+            )
+            .unwrap();
+
+        (ctx.take(), wrapper_hash)
+    }
+
+    /// REGRESSION (the wrapper-layer variant of #1698): value paid to a puzzle hash the spend is
+    /// spending from, but which is NOT a payable destination, is COUNTED — and so cannot be
+    /// auto-approved under limits it dwarfs.
+    ///
+    /// The ledger figure is the assertion that matters. Before the fix this bundle was `Approved` under
+    /// a 10-mojo per-transaction limit and a 10-mojo cap, the ledger was charged **1**, and
+    /// `sign_approved` produced a real aggregate over 999,999 mojos. Asserting only "not approved" would
+    /// pass against an implementation that refused for some incidental reason while still mis-accounting
+    /// the spend, which is the state that made the original defect invisible.
+    #[test]
+    fn value_hidden_behind_a_wrapper_layer_hash_is_counted_not_excused_as_change() {
+        let (coin_spends, wrapper_hash) = hides_value_behind_a_wrapper_layer(999_999, 1);
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(10),
+                period_cap_mojos: 10,
+                ..AutoSendPolicy::default()
+            },
+        );
+
+        let escalated = pending(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+
+        assert_eq!(
+            escalated.summary().checked_native_total_mojos().unwrap(),
+            1_000_000,
+            "the 999_999 hidden output plus the 1 mojo fee must be what the gate weighed"
+        );
+        assert_eq!(
+            ledger_total(&gate),
+            0,
+            "an escalated spend charges nothing — and it must never have been charged 1"
+        );
+
+        // The human is shown the destination, so the ceremony cannot present this as a bare fee.
+        let shown = escalated.summary().to_string();
         assert!(
-            matches!(err, AccountError::PolicyIndeterminate(_)),
-            "a vault-policy spend must not pass as an auto-send by claiming the tier: {err}"
+            shown.contains("999999"),
+            "the confirm line must state the hidden amount: {shown}"
+        );
+        assert!(
+            escalated
+                .summary()
+                .recipients
+                .iter()
+                .any(|r| r.amount_mojos == 999_999),
+            "the output must appear as a destination, not be filtered away"
+        );
+
+        // And the vault's destination rule now SEES it, so the clawback window cannot be skipped.
+        let denied = refusal(
+            gate_with(vault_custody(), permissive_auto_send())
+                .authorize_op(&coin_spends, SpendOpClass::Tip),
+        );
+        assert!(
+            matches!(&denied, AccountError::PolicyDenied(m) if m.contains("vault")),
+            "a vault outflow to a wrapper hash must be forbidden outright, not escalated: {denied}"
+        );
+
+        // Sanity on the fixture itself: the hidden destination really is a hash the bundle spends from,
+        // which is exactly why the old rule excused it.
+        assert!(
+            coin_spends
+                .iter()
+                .any(|spend| spend.coin.puzzle_hash == wrapper_hash),
+            "the fixture must pay a hash the spend is spending from, or it proves nothing"
+        );
+    }
+
+    /// THE CLASS, stated without naming a layer: **an output paying a puzzle hash that is not a proven
+    /// p2 destination of this spend is counted.**
+    ///
+    /// A test named for CATs would be walked past by the next wrapper — NFT, DID, singleton, offer —
+    /// because each has the same property: `coin.puzzle_hash` is a wrapper's hash rather than a payable
+    /// address. So this asserts the RULE at its own interface, over three kinds of non-proof, and pins
+    /// the one case that does qualify as a truthful control.
+    #[test]
+    fn only_a_proven_p2_destination_of_this_spend_counts_as_returning_to_the_spender() {
+        let wallet_ph = spender().puzzle_hash();
+
+        // The control: a bare p2 coin the spend really is spending. This MUST qualify, or the rule
+        // would count legitimate self-change and every ordinary send would escalate.
+        let plain = spend_paying(&[(third_party().puzzle_hash(), 10)], 0);
+        assert!(
+            crate::wallet::summary::p2_destinations(&plain).contains(&wallet_ph),
+            "a bare p2 puzzle whose curry reproduces its own coin hash is a payable destination"
+        );
+
+        // (a) A WRAPPED coin: its puzzle hash is not payable, so it must not qualify — and the rule
+        //     reaches that verdict by failing to PROVE p2-ness, never by recognising a CAT.
+        let (wrapped, wrapper_hash) = hides_value_behind_a_wrapper_layer(999, 1);
+        let proven = crate::wallet::summary::p2_destinations(&wrapped);
+        assert!(
+            !proven.contains(&wrapper_hash),
+            "a wrapper layer's hash is not a payable destination"
+        );
+        assert!(
+            proven.contains(&wallet_ph),
+            "the same bundle's plain p2 coin must still qualify, so (a) is the WRAPPER being \
+             excluded and not the whole bundle being distrusted"
+        );
+
+        // (b) An UNDECODABLE reveal proves nothing, so it qualifies for nothing. This is the arm that
+        //     makes the rule layer-agnostic: the verdict follows from absence of proof, so a wrapper
+        //     nobody has written yet is handled without this code changing.
+        let mut opaque = plain.clone();
+        opaque[0].puzzle_reveal = chia_protocol::Program::from(vec![0xFFu8, 0xFE, 0xFD]);
+        assert!(
+            !crate::wallet::summary::p2_destinations(&opaque).contains(&wallet_ph),
+            "a reveal that cannot be decoded cannot prove a destination"
+        );
+
+        // (c) A reveal that IS a bare p2 but is not THIS coin's puzzle proves nothing either: the curry
+        //     must reproduce the coin's own hash, so a p2 reveal cannot be borrowed for another coin.
+        let mut borrowed = plain.clone();
+        borrowed[0].coin.puzzle_hash = Bytes32::new([0xAB; 32]);
+        assert!(
+            crate::wallet::summary::p2_destinations(&borrowed).is_empty(),
+            "a p2 reveal that does not hash to its own coin proves no destination"
+        );
+    }
+
+    /// The confirmation-prompt ceiling binds, and the bound is on the COUNT of prompts.
+    ///
+    /// Pinned from both sides: the 64th escalation is still raised, the 65th is refused. Without the
+    /// lower half a ceiling that refused one prompt early — or refused all of them — would look
+    /// identical, and a ceiling that refuses every prompt is not protection, it is a spend path that
+    /// cannot be used.
+    ///
+    /// `PolicyIndeterminate` is the right refusal because the gate cannot obtain a trustworthy decision;
+    /// it has formed no opinion about the spend itself.
+    #[test]
+    fn the_confirmation_prompt_ceiling_is_pinned_at_the_bound_and_one_more_is_refused() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: false,
+                max_confirmations_per_period: 4,
+                ..permissive_auto_send()
+            },
+        );
+        let coin_spends = pays_third_party(100);
+
+        for raised in 1..=4 {
+            pending(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+            assert_eq!(gate.prompts.lock().unwrap().len(), raised);
+        }
+
+        let err = refusal(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+        assert!(
+            matches!(&err, AccountError::PolicyIndeterminate(m) if m.contains("ceiling")),
+            "past the ceiling the gate cannot obtain a decision, and must say so: {err}"
+        );
+    }
+
+    /// The rolling ledger cannot grow past [`MAX_LEDGER_ENTRIES`], and reaching the ceiling REFUSES
+    /// rather than evicting.
+    ///
+    /// The period cap bounds the ledger's total VALUE but not its LENGTH: a large cap admits an enormous
+    /// number of one-mojo approvals, each an entry. Evicting the oldest would be worse than refusing —
+    /// it would forgive a charge the cap is still supposed to be counting, handing allowance back under
+    /// exactly the load that produced the pressure. So the assertion is that the entry count STOPS at
+    /// the ceiling and the next spend is refused, not that the oldest entry disappeared.
+    #[test]
+    fn the_rolling_ledger_refuses_rather_than_growing_past_its_entry_ceiling() {
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                tip: OpClassLimits::enabled_up_to(1),
+                period_cap_mojos: u64::MAX,
+                ..AutoSendPolicy::default()
+            },
+        );
+        // One mojo per approval, so the VALUE cap can never be what refuses — only the entry count can.
+        let one_mojo = pays_third_party(1);
+
+        for _ in 0..MAX_LEDGER_ENTRIES {
+            approval(gate.authorize_op(&one_mojo, SpendOpClass::Tip));
+        }
+        assert_eq!(
+            gate.recent.lock().unwrap().len(),
+            MAX_LEDGER_ENTRIES,
+            "the ledger must have filled to exactly its ceiling"
+        );
+
+        let err = refusal(gate.authorize_op(&one_mojo, SpendOpClass::Tip));
+        assert!(
+            matches!(&err, AccountError::PolicyIndeterminate(m) if m.contains("ledger")),
+            "at the ceiling the cap cannot be measured over a further spend: {err}"
+        );
+        assert_eq!(
+            gate.recent.lock().unwrap().len(),
+            MAX_LEDGER_ENTRIES,
+            "and the refusal must not have evicted an entry to make room"
         );
     }
 
     /// A CAT amount is invisible to `native_total_mojos`, so a CAT-paying spend totals to its fee
     /// alone and would slip under any mojo limit. It must be INDETERMINATE — and specifically
-    /// indeterminate, not merely refused: asserting only "refused" would be satisfied by a guard
-    /// placed in the classifier instead, and would keep passing if this bound were later moved out of
-    /// the gate.
+    /// indeterminate rather than merely not-approved: asserting only "not approved" would be satisfied
+    /// by an escalation, and an unbounded spend must not be confirmable away either.
     #[test]
     fn a_spend_paying_a_non_native_asset_is_indeterminate_however_small_its_mojo_total() {
         let gate = gate_with(
@@ -930,44 +1533,17 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        // A billion base units of some CAT, alongside a 1 mojo fee: the native total is 1.
-        let summary = summary_under(
-            &hot_custody(),
-            vec![cat(&third_party_address(), 1_000_000_000, "deadbeef")],
-            1,
-        );
+        // A billion base units of a CAT, alongside a 1 mojo fee: the native total is 1.
+        let coin_spends = cat_spend_paying(1_000_000_000, 1);
+        let summary = SpendSummary::classified(&coin_spends, &hot_custody()).unwrap();
         assert_eq!(
             summary.native_total_mojos(),
             1,
-            "the CAT amount is invisible"
+            "the CAT amount is invisible to a mojo total: {summary:?}"
         );
         assert_eq!(summary.tier, SpendTier::AutoSend);
 
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
-    }
-
-    /// A CAT output smuggled alongside legitimate native ones is still unbounded.
-    #[test]
-    fn a_mixed_native_and_non_native_spend_is_indeterminate() {
-        let gate = gate_with(
-            hot_custody(),
-            AutoSendPolicy {
-                enabled: true,
-                tip: OpClassLimits::enabled_up_to(1_000),
-                period_cap_mojos: u64::MAX,
-                ..AutoSendPolicy::default()
-            },
-        );
-        let summary = summary_under(
-            &hot_custody(),
-            vec![
-                xch(&third_party_address(), 10),
-                cat(&third_party_address(), u64::MAX, "cafe"),
-            ],
-            0,
-        );
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
+        let err = refusal(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
         assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
     }
 
@@ -977,53 +1553,86 @@ mod tests {
     #[test]
     fn an_unreadable_clock_refuses_rather_than_assuming_an_empty_window() {
         let gate = PolicyAuthorizer::new(
+            GATE_PROFILE,
             hot_custody(),
             permissive_auto_send(),
-            &hot_wallet_address(),
+            &hot_wallet().address().unwrap(),
             Arc::new(UnreadableClock),
         )
         .unwrap();
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1)], 0);
-        let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
+        let err = refusal(gate.authorize_op(&pays_third_party(1), SpendOpClass::Tip));
         assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
     }
 
-    /// The structural invariant: every `SpendTier` that exists has an EXPLICIT decision here. The
-    /// exhaustive match is the load-bearing part — adding a variant to `SpendTier` breaks this test's
-    /// compilation, forcing the author to state the new tier's rule. It cannot be satisfied by
+    /// A spend the wallet backend cannot fully account for is refused AT THE GATE, before any approval
+    /// exists — not a second time inside the signer.
+    ///
+    /// The placement is the property, so the assertion is about WHERE: the fixture's delegated puzzle
+    /// is the solution-malleable identity program `1`, whose signature would authorize any conditions
+    /// its solution supplied. A test that only checked the signer refused it would keep passing on an
+    /// implementation that minted an approval for an unaccountable spend, which is precisely the state
+    /// this shape exists to make impossible.
+    #[test]
+    fn an_unaccountable_spend_is_refused_at_the_gate_before_any_approval_exists() {
+        use chia_wallet_sdk::driver::Spend;
+
+        let mut ctx = SpendContext::new();
+        let malleable = ctx.alloc(&1).unwrap();
+        let echoed = Conditions::new().create_coin(spender().puzzle_hash(), 1_000, Memos::None);
+        let solution = ctx.alloc(&echoed).unwrap();
+        let spend = StandardLayer::new(spender().public_key())
+            .delegated_inner_spend(
+                &mut ctx,
+                Spend {
+                    puzzle: malleable,
+                    solution,
+                },
+            )
+            .unwrap();
+        ctx.spend(
+            Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
+            spend,
+        )
+        .unwrap();
+        let coin_spends = ctx.take();
+
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let err = refusal(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
+        assert!(
+            matches!(err, AccountError::Spend(_)),
+            "the gate itself must refuse an unaccountable spend: {err}"
+        );
+    }
+
+    /// The structural invariant: every `SpendTier` that exists has an EXPLICIT decision in the gate.
+    /// The exhaustive match is the load-bearing part — adding a variant to `SpendTier` breaks this
+    /// test's compilation, forcing the author to state the new tier's rule. It cannot be satisfied by
     /// accident the way a count of refusals could.
     #[test]
     fn every_spend_tier_that_exists_has_an_explicit_enforced_decision() {
         let gate = gate_with(hot_custody(), permissive_auto_send());
         let vault_gate = gate_with(vault_custody(), permissive_auto_send());
-        let recipients = vec![xch(&third_party_address(), 100)];
 
         for tier in [SpendTier::AutoSend, SpendTier::Confirm, SpendTier::Vault] {
             match tier {
                 // Approvable, within bounds, with intent declared.
                 SpendTier::AutoSend => {
-                    let summary = summary_under(&hot_custody(), recipients.clone(), 0);
-                    assert_eq!(summary.tier, SpendTier::AutoSend);
-                    gate.authorize_op(&summary, SpendOpClass::Tip).unwrap();
+                    let approved =
+                        approval(gate.authorize_op(&pays_third_party(100), SpendOpClass::Tip));
+                    assert_eq!(approved.summary().tier, SpendTier::AutoSend);
                 }
                 // Never auto-approved: escalates to the confirm ceremony.
                 SpendTier::Confirm => {
-                    let summary = summary_under(
-                        &hot_custody(),
-                        vec![xch(&third_party_address(), CUSTODY_AUTO_SEND_CEILING + 1)],
-                        0,
-                    );
-                    assert_eq!(summary.tier, SpendTier::Confirm);
-                    let err = gate.authorize_op(&summary, SpendOpClass::Tip).unwrap_err();
-                    assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
+                    let escalated = pending(gate.authorize_op(
+                        &pays_third_party(CUSTODY_AUTO_SEND_CEILING + 1),
+                        SpendOpClass::Tip,
+                    ));
+                    assert_eq!(escalated.summary().tier, SpendTier::Confirm);
                 }
                 // Never auto-approved, at any amount; to a third party, forbidden outright.
                 SpendTier::Vault => {
-                    let summary = summary_under(&vault_custody(), recipients.clone(), 0);
-                    assert_eq!(summary.tier, SpendTier::Vault);
-                    let err = vault_gate
-                        .authorize_op(&summary, SpendOpClass::Tip)
-                        .unwrap_err();
+                    let err =
+                        refusal(vault_gate.authorize_op(&pays_third_party(100), SpendOpClass::Tip));
                     assert!(matches!(err, AccountError::PolicyDenied(_)), "{err}");
                 }
             }
@@ -1034,6 +1643,7 @@ mod tests {
     fn a_gate_cannot_be_built_on_an_undecodable_hot_wallet_address() {
         for address in ["", "nonsense", "xch1zzzz"] {
             let err = PolicyAuthorizer::new(
+                GATE_PROFILE,
                 hot_custody(),
                 permissive_auto_send(),
                 address,
@@ -1047,51 +1657,43 @@ mod tests {
         }
     }
 
-    /// GATING: the vault-ESCALATION rule needs its own witness.
+    /// GATING: the vault arm's OWN work needs a witness that the `Confirm` arm cannot provide.
     ///
-    /// `Vault` and `Confirm` both refuse with `RequireAuth`, so a test that only checks the variant
-    /// cannot tell which arm fired — and the earlier `if tier == Vault { … }` / `if tier != AutoSend
-    /// { … }` shape meant deleting the vault arm changed nothing observable. One arm per tier now
-    /// makes that mutant a compile error, and this test additionally pins that the two refusals are
-    /// DISTINGUISHABLE, so the vault path cannot silently become the generic one.
+    /// Both tiers escalate, so "it escalated" cannot tell which arm ran, and merging the two arms
+    /// (`Vault | Confirm => escalate`) would be an invisible change — except that the vault arm alone
+    /// runs the destination rule. So the witness is a spend to a THIRD PARTY: under a vault policy it
+    /// is denied outright, and under a hot policy at the same amount it merely escalates. Merge the
+    /// arms and the first assertion goes red.
     #[test]
-    fn a_vault_refusal_names_the_vault_and_is_not_the_generic_over_allowance_refusal() {
-        let vault_gate = gate_with(vault_custody(), permissive_auto_send());
-        let hot_gate = gate_with(hot_custody(), permissive_auto_send());
+    fn only_the_vault_arm_applies_the_destination_rule() {
+        let over_the_hot_ceiling = pays_third_party(CUSTODY_AUTO_SEND_CEILING + 1);
 
-        let vault_spend = summary_under(&vault_custody(), vec![xch(&hot_wallet_address(), 1)], 0);
-        let over_allowance = summary_under(
-            &hot_custody(),
-            vec![xch(&third_party_address(), CUSTODY_AUTO_SEND_CEILING + 1)],
-            0,
-        );
-
-        let vault_refusal = vault_gate
-            .authorize_op(&vault_spend, SpendOpClass::Tip)
-            .unwrap_err()
-            .to_string();
-        let confirm_refusal = hot_gate
-            .authorize_op(&over_allowance, SpendOpClass::Tip)
-            .unwrap_err()
-            .to_string();
-
-        assert!(
-            vault_refusal.contains("vault"),
-            "the vault refusal must say so: {vault_refusal}"
+        let denied = refusal(
+            gate_with(vault_custody(), permissive_auto_send())
+                .authorize_op(&over_the_hot_ceiling, SpendOpClass::Tip),
         );
         assert!(
-            !confirm_refusal.contains("vault"),
-            "the over-allowance refusal is not a vault refusal: {confirm_refusal}"
+            matches!(&denied, AccountError::PolicyDenied(m) if m.contains("vault")),
+            "a vault outflow to a third party is denied, and says why: {denied}"
         );
-        assert_ne!(vault_refusal, confirm_refusal);
+
+        let escalated = pending(
+            gate_with(hot_custody(), permissive_auto_send())
+                .authorize_op(&over_the_hot_ceiling, SpendOpClass::Tip),
+        );
+        assert_eq!(
+            escalated.summary().tier,
+            SpendTier::Confirm,
+            "the same spend under a hot policy is confirmable, not forbidden"
+        );
     }
 
     /// GATING: the rolling cap pinned at the bound, not only over it. A spend that brings the window
-    /// total to EXACTLY the cap must be permitted; one mojo more must not. Without the lower half, a
+    /// total to EXACTLY the cap must be approved; one mojo more must not. Without the lower half, a
     /// `>=` comparison would refuse the last honest mojo of the user's allowance and no test would
     /// notice.
     #[test]
-    fn a_spend_that_brings_the_rolling_total_exactly_to_the_cap_is_permitted_and_one_more_is_not() {
+    fn a_spend_that_brings_the_rolling_total_exactly_to_the_cap_is_approved_and_one_more_is_not() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -1101,134 +1703,12 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let six_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 600)], 0);
-        let four_hundred = summary_under(&hot_custody(), vec![xch(&third_party_address(), 400)], 0);
-        let one = summary_under(&hot_custody(), vec![xch(&third_party_address(), 1)], 0);
 
-        gate.authorize_op(&six_hundred, SpendOpClass::Tip).unwrap();
-        gate.authorize_op(&four_hundred, SpendOpClass::Tip)
-            .expect("600 + 400 is exactly the 1000 cap, which is within it");
+        approval(gate.authorize_op(&pays_third_party(600), SpendOpClass::Tip));
+        approval(gate.authorize_op(&pays_third_party(400), SpendOpClass::Tip));
+        assert_eq!(ledger_total(&gate), 1_000, "exactly the cap, and within it");
 
-        let err = gate.authorize_op(&one, SpendOpClass::Tip).unwrap_err();
-        assert!(matches!(err, AccountError::RequireAuth(_)), "{err}");
-    }
-
-    /// GATING: a native total that cannot be summed in a `u64` must be REFUSED, not wrapped.
-    ///
-    /// `u64::MAX - 100` plus `1_000` wraps to `899` — a number that sails under a 1_000 mojo
-    /// per-transaction limit and a 1_000 mojo period cap while the spend actually moves more value
-    /// than exists. The test asserts the total is NOT the wrapped value, so it fails on a wrapping
-    /// implementation rather than merely on a refusing one, and by completing at all it proves the
-    /// summation does not panic in a debug build.
-    #[test]
-    fn a_native_total_that_overflows_u64_is_refused_and_never_reported_as_its_wrapped_value() {
-        let gate = gate_with(
-            hot_custody(),
-            AutoSendPolicy {
-                enabled: true,
-                tip: OpClassLimits::enabled_up_to(1_000),
-                period_cap_mojos: 1_000,
-                ..AutoSendPolicy::default()
-            },
-        );
-        let overflowing = SpendSummary::new(
-            SpendTier::AutoSend,
-            vec![
-                xch(&third_party_address(), u64::MAX - 100),
-                xch(&third_party_address(), 1_000),
-            ],
-            0,
-        );
-
-        assert!(
-            overflowing.checked_native_total_mojos().is_err(),
-            "the total is not representable"
-        );
-        assert_ne!(
-            overflowing.native_total_mojos(),
-            899,
-            "the wrapped total would pass every limit"
-        );
-        assert_eq!(
-            overflowing.native_total_mojos(),
-            u64::MAX,
-            "saturating biases the unchecked accessor toward refusal"
-        );
-
-        // The MESSAGE matters, not just the variant: routing the decision through the SATURATING
-        // accessor also yields `PolicyIndeterminate`, but by way of a tier disagreement after the
-        // clamp — a different bug wearing the same error. Naming the overflow is what distinguishes
-        // "this total cannot be computed" from "this total disagrees with the declared tier", and
-        // without it the checked-vs-saturating choice on the decision path is pinned by nothing.
-        let err = gate
-            .authorize_op(&overflowing, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
-        assert!(
-            err.to_string().contains("overflow"),
-            "the refusal must name the overflow, not a tier disagreement: {err}"
-        );
-    }
-
-    /// The custody decision MUST use the CHECKED total, and this is the fixture that can tell.
-    ///
-    /// The earlier overflow tests declare `AutoSend`, which makes them blind to the choice: with the
-    /// saturating accessor the total clamps to `u64::MAX`, the policy classifies that `Confirm`, the
-    /// declared tier disagrees, and the TIER-MISMATCH branch returns `PolicyIndeterminate` — the very
-    /// outcome those tests assert. Both call sites could be reverted to the saturating form and nothing
-    /// went red.
-    ///
-    /// Declaring `Confirm` removes the mismatch, so the two computations diverge observably:
-    ///
-    /// - saturating: total clamps to `u64::MAX`, classifies `Confirm`, agrees with the declared tier,
-    ///   and the `Confirm` arm returns `RequireAuth` — an escalatable refusal for a spend whose value
-    ///   is not even computable.
-    /// - checked: the sum fails first, so the answer is `PolicyIndeterminate`.
-    ///
-    /// A `RequireAuth` here would mean the gate had formed an opinion about a figure it never had.
-    #[test]
-    fn an_unsummable_total_is_indeterminate_and_not_merely_escalated_to_a_confirmation() {
-        let gate = gate_with(hot_custody(), permissive_auto_send());
-        let overflowing = SpendSummary::new(
-            SpendTier::Confirm,
-            vec![
-                xch(&third_party_address(), u64::MAX - 100),
-                xch(&third_party_address(), 1_000),
-            ],
-            0,
-        );
-        // The saturating reading of this summary agrees with the declared tier, so the tier-mismatch
-        // guard cannot fire and this test sees only the arithmetic.
-        assert_eq!(
-            SpendTier::classify(&hot_custody(), overflowing.native_total_mojos()),
-            SpendTier::Confirm,
-        );
-
-        let err = gate
-            .authorize_op(&overflowing, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(
-            matches!(err, AccountError::PolicyIndeterminate(_)),
-            "an uncomputable total must be indeterminate, not escalated: {err}"
-        );
-        assert!(err.to_string().contains("overflow"), "{err}");
-    }
-
-    /// The fee is part of the same sum, so it overflows the same way and must refuse the same way.
-    #[test]
-    fn a_fee_that_overflows_the_native_total_is_refused() {
-        let gate = gate_with(hot_custody(), permissive_auto_send());
-        let overflowing = SpendSummary::new(
-            SpendTier::AutoSend,
-            vec![xch(&third_party_address(), u64::MAX)],
-            1,
-        );
-        assert!(overflowing.checked_native_total_mojos().is_err());
-        let err = gate
-            .authorize_op(&overflowing, SpendOpClass::Tip)
-            .unwrap_err();
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
-        assert!(err.to_string().contains("overflow"), "{err}");
+        pending(gate.authorize_op(&pays_third_party(1), SpendOpClass::Tip));
     }
 
     /// A zero-length rolling window cannot contain a spend, so the cap measured over it cannot be
@@ -1245,22 +1725,22 @@ mod tests {
             period_cap_mojos: 1_000,
             ..AutoSendPolicy::default()
         };
-        let summary = summary_under(&hot_custody(), vec![xch(&third_party_address(), 100)], 0);
+        let coin_spends = pays_third_party(100);
 
-        let err = gate_with(hot_custody(), policy)
-            .authorize_op(&summary, SpendOpClass::Tip)
-            .unwrap_err();
+        let err =
+            refusal(gate_with(hot_custody(), policy).authorize_op(&coin_spends, SpendOpClass::Tip));
         assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
 
-        gate_with(
-            hot_custody(),
-            AutoSendPolicy {
-                period_seconds: 1,
-                ..policy
-            },
-        )
-        .authorize_op(&summary, SpendOpClass::Tip)
-        .expect("control: the same spend passes once the window has a length");
+        approval(
+            gate_with(
+                hot_custody(),
+                AutoSendPolicy {
+                    period_seconds: 1,
+                    ..policy
+                },
+            )
+            .authorize_op(&coin_spends, SpendOpClass::Tip),
+        );
     }
 
     /// A zero-value approval consumes none of the cap, so remembering it could only grow the ledger
@@ -1277,11 +1757,10 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        let nothing = summary_under(&hot_custody(), vec![xch(&third_party_address(), 0)], 0);
-        assert_eq!(nothing.native_total_mojos(), 0);
+        let nothing = pays_third_party(0);
 
         for _ in 0..1_000 {
-            gate.authorize_op(&nothing, SpendOpClass::Tip).unwrap();
+            approval(gate.authorize_op(&nothing, SpendOpClass::Tip));
         }
         assert_eq!(
             gate.recent.lock().unwrap().len(),
@@ -1289,54 +1768,46 @@ mod tests {
             "a zero charge must leave no record behind"
         );
 
-        let full_allowance =
-            summary_under(&hot_custody(), vec![xch(&third_party_address(), 1_000)], 0);
-        gate.authorize_op(&full_allowance, SpendOpClass::Tip)
-            .expect("the whole allowance must still be available");
+        approval(gate.authorize_op(&pays_third_party(1_000), SpendOpClass::Tip));
     }
 
-    /// The layered invariant this gate deliberately does NOT hold alone: an un-hinted output is
-    /// change, excluded from the summary's recipients, so no amount limit here can see it. The
-    /// composition is what protects the wallet — the policy gate approves this summary (its whole
-    /// visible effect is a 1 mojo fee) and the money signer still refuses to sign, because the change
-    /// output pays a puzzle hash the wallet does not own.
+    /// **The value the gate charges is the value that LEAVES — the author cannot shrink it by
+    /// omitting a memo.**
+    ///
+    /// This is the #1702 exploit, and the fixture is built so that the *only* thing that can refuse it
+    /// is the rule under test. The destination is `ProfileIx(1)` of the spender's OWN seed: an address
+    /// `owns_puzzle_hash` accepts, inside the signer's `0..address_gap` window. So the downstream
+    /// "change must be wallet-owned" check — the thing that refused the previous version of this test,
+    /// where the destination was a stranger — is silent here by construction. Aim the same 999 mojos at
+    /// a stranger and it is impossible to tell which layer refused.
+    ///
+    /// Before the fix, `analyze` filed the un-hinted output as CHANGE, `recipients` was empty, the
+    /// summary read "no recipients, fee 1", the ledger was charged **1**, and the signature authorized
+    /// **999**. The human would have been shown a 1 mojo fee and asked to approve a spend of the coin.
     #[test]
-    fn refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves() {
-        use crate::wallet::money_signer::{LocalMoneySigner, MoneySigner};
-        use chia_protocol::Coin;
-        use chia_puzzle_types::Memos;
-        use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
-        use chia_wallet_sdk::types::Conditions;
-        use dig_wallet_backend::types::Network;
-
-        let seed = [0x5Cu8; 32];
-        let wallet = WalletKey::from_seed_at(&seed, ProfileIx::ROOT);
-        let stranger = WalletKey::from_seed_at(&[0xB2; 32], ProfileIx::ROOT).puzzle_hash();
+    fn an_unhinted_output_to_an_owned_derivation_is_counted_not_hidden() {
+        let attacker_owned = WalletKey::from_seed_at(&SPENDER_SEED, ProfileIx(1)).puzzle_hash();
+        assert_ne!(
+            attacker_owned,
+            spender().puzzle_hash(),
+            "the fixture must pay a DIFFERENT derivation, or it is testing genuine change"
+        );
 
         let mut ctx = SpendContext::new();
-        let coin = Coin::new(Bytes32::new([1u8; 32]), wallet.puzzle_hash(), 1_000);
-        StandardLayer::new(wallet.public_key())
+        StandardLayer::new(spender().public_key())
             .spend(
                 &mut ctx,
-                coin,
-                // Un-hinted: `analyze` files this as CHANGE, so it never reaches `recipients`.
+                Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
+                // No memo: `analyze` files this as change, so a hinted-recipient sum cannot see it.
                 Conditions::new()
-                    .create_coin(stranger, 999, Memos::None)
+                    .create_coin(attacker_owned, 999, Memos::None)
                     .reserve_fee(1),
             )
             .unwrap();
         let coin_spends = ctx.take();
 
-        let custody = hot_custody();
-        let summary = SpendSummary::classified(&coin_spends, &custody).unwrap();
-        assert!(
-            summary.recipients.is_empty(),
-            "an un-hinted output is invisible to the summary: {summary:?}"
-        );
-        assert_eq!(summary.native_total_mojos(), 1, "only the fee is visible");
-
         let gate = gate_with(
-            custody,
+            hot_custody(),
             AutoSendPolicy {
                 enabled: true,
                 rebalance: OpClassLimits::enabled_up_to(10),
@@ -1344,16 +1815,353 @@ mod tests {
                 ..AutoSendPolicy::default()
             },
         );
-        gate.authorize_op(&summary, SpendOpClass::Rebalance)
-            .expect("the policy gate can only bound what the summary shows");
 
-        let signer =
-            LocalMoneySigner::new_canonical(seed.to_vec(), ProfileIx::ROOT.0, Network::Mainnet)
-                .unwrap();
-        let err = signer.sign_coin_spends(&coin_spends).unwrap_err();
+        // Escalated, not approved: 1_000 is far past the 10 mojo per-transaction bound.
+        let escalated = pending(gate.authorize_op(&coin_spends, SpendOpClass::Rebalance));
+        let summary = escalated.summary();
+        assert_eq!(
+            summary.recipients.len(),
+            1,
+            "the un-hinted output must appear in the line the human confirms: {summary}"
+        );
+        assert_eq!(summary.recipients[0].amount_mojos, 999);
+        assert_eq!(
+            summary.native_total_mojos(),
+            1_000,
+            "the whole coin leaves, so the whole coin is what is weighed"
+        );
+        assert_eq!(
+            ledger_total(&gate),
+            0,
+            "nothing was auto-approved, so nothing was charged"
+        );
+    }
+
+    /// The truthful control for the test above: **genuine change is still free.**
+    ///
+    /// Identical spend, one field changed — the output pays the exact puzzle hash of the coin being
+    /// spent. Value demonstrably has not moved, so it is excluded, the total is the fee alone, and the
+    /// spend auto-approves under the same 10 mojo bound that escalated the exploit.
+    ///
+    /// Without this control the test above would also pass on an implementation that counted every
+    /// output unconditionally — which would make every real send unspendable while looking strict.
+    #[test]
+    fn change_returning_to_the_spent_coins_own_puzzle_hash_is_not_counted() {
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
+                Conditions::new()
+                    .create_coin(spender().puzzle_hash(), 999, Memos::None)
+                    .reserve_fee(1),
+            )
+            .unwrap();
+        let coin_spends = ctx.take();
+
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                rebalance: OpClassLimits::enabled_up_to(10),
+                period_cap_mojos: 10,
+                ..AutoSendPolicy::default()
+            },
+        );
+        let approved = approval(gate.authorize_op(&coin_spends, SpendOpClass::Rebalance));
         assert!(
-            matches!(err, AccountError::Spend(_)),
-            "the signer must refuse un-hinted value leaving the wallet: {err}"
+            approved.summary().recipients.is_empty(),
+            "returning change to the coin's own puzzle hash moves no value"
+        );
+        assert_eq!(approved.summary().fee, 1);
+        assert_eq!(ledger_total(&gate), 1, "only the fee is charged");
+    }
+
+    /// **Change paid to a FRESH derivation of the same wallet is counted. That is intended.**
+    ///
+    /// This is the deliberate cost of the rule above, recorded as behaviour rather than discovered as a
+    /// bug (`SPEC.md` §6.1.1). This layer holds no key: it cannot tell a fresh derivation of the user's
+    /// own wallet from a stranger's address, and the only way it could would be to accept "any owned
+    /// derivation" as change — which is exactly the exfiltration target the exploit above uses.
+    ///
+    /// So the rule over-counts, and a legitimate send whose change goes to a fresh address escalates to
+    /// the human instead of auto-sending. Over-counting asks a person; under-counting signs. Only one
+    /// of those is a custody failure.
+    #[test]
+    fn change_to_a_fresh_derivation_is_deliberately_overcounted_and_escalates() {
+        let fresh_change = WalletKey::from_seed_at(&SPENDER_SEED, ProfileIx(9)).puzzle_hash();
+
+        let mut ctx = SpendContext::new();
+        let recipient = third_party().puzzle_hash();
+        let hint = ctx.hint(recipient).unwrap();
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
+                Conditions::new()
+                    .create_coin(recipient, 5, hint)
+                    .create_coin(fresh_change, 994, Memos::None)
+                    .reserve_fee(1),
+            )
+            .unwrap();
+        let coin_spends = ctx.take();
+
+        let gate = gate_with(
+            hot_custody(),
+            AutoSendPolicy {
+                enabled: true,
+                rebalance: OpClassLimits::enabled_up_to(10),
+                period_cap_mojos: 1_000,
+                ..AutoSendPolicy::default()
+            },
+        );
+
+        // The genuine payment is 5 mojos, well inside the 10 mojo bound. It escalates anyway, because
+        // the 994 of change to an address this layer cannot vouch for is counted as leaving.
+        let escalated = pending(gate.authorize_op(&coin_spends, SpendOpClass::Rebalance));
+        assert_eq!(
+            escalated.summary().native_total_mojos(),
+            1_000,
+            "the fresh-derivation change is counted, by design"
+        );
+    }
+
+    /// **The vault destination rule inherits the same fix — an un-hinted outflow is not invisible.**
+    ///
+    /// The exploit above is a hot-wallet one: omitting a memo shrank the CHARGED total. The vault arm
+    /// fails differently and worse. `reject_vault_outflow_to_anyone_but_the_hot_wallet` iterates
+    /// `summary.recipients`, so while that list held only HINTED outputs, a vault spend paying a
+    /// stranger with no memo presented an EMPTY recipient list: the destination rule looped zero times
+    /// and returned `Ok`, the spend escalated as if it were an ordinary vault move, and the 24-hour
+    /// clawback window — the entire reason the rule exists — never applied to it.
+    ///
+    /// The fixture is the hinted third-party vault spend that is already refused
+    /// (`a_vault_spend_to_a_third_party_is_forbidden_outright...`) with ONE field varied: the memo is
+    /// dropped. Holding everything else equal is what makes the refusal attributable to hint-blindness
+    /// rather than to any other vault rule, and pairing it with that hinted sibling gives the property
+    /// a truthful control on the other side.
+    #[test]
+    fn an_unhinted_vault_outflow_to_a_third_party_is_refused_exactly_like_a_hinted_one() {
+        let stranger = third_party().puzzle_hash();
+        assert_ne!(
+            stranger,
+            hot_wallet().puzzle_hash(),
+            "the fixture must pay someone other than the hot wallet, or nothing is being tested"
+        );
+
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
+                // No memo. `analyze` files this under `change`, which is precisely how it used to
+                // slip past a destination rule that only ever read `recipients`.
+                Conditions::new()
+                    .create_coin(stranger, 999, Memos::None)
+                    .reserve_fee(1),
+            )
+            .unwrap();
+
+        let gate = gate_with(vault_custody(), permissive_auto_send());
+        let denied = refusal(gate.authorize_op(&ctx.take(), SpendOpClass::SmallSend));
+        assert!(
+            matches!(denied, AccountError::PolicyDenied(_)),
+            "an un-hinted vault outflow must be forbidden outright, exactly as the hinted one is — \
+             an escalation here would mean the clawback window can be skipped by omitting a memo, \
+             got: {denied}"
+        );
+    }
+
+    /// A coin-spend set whose INPUT amounts do not sum in a `u64` is refused rather than judged.
+    ///
+    /// This is the guard over `dig-wallet-backend` 0.16's unchecked input accumulation
+    /// (`client/verify.rs:153`): without it this very fixture panics in a debug build and, in a release
+    /// build, has its input total WRAP — after which the wrapped figure is what value conservation is
+    /// checked against. The amounts come from an unsigned skeleton a dapp supplies, so they are
+    /// attacker-chosen and need not name coins that exist.
+    ///
+    /// The truthful control matters here more than usual: the same two-coin shape at halved amounts
+    /// sums fine and is judged normally, so what follows is the SUM being unrepresentable and not the
+    /// gate refusing multi-coin spends.
+    #[test]
+    fn a_spend_whose_input_amounts_do_not_sum_in_a_u64_is_refused_rather_than_wrapped() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+
+        let err =
+            refusal(gate.authorize_op(&two_coin_spend(u64::MAX, u64::MAX), SpendOpClass::Tip));
+        assert!(
+            matches!(&err, AccountError::PolicyIndeterminate(m) if m.contains("sum in a u64")),
+            "an unsummable input total must be indeterminate, and say so: {err}"
+        );
+
+        // Control: two coins whose amounts DO sum are judged on their merits.
+        let judged = gate.authorize_op(&two_coin_spend(1_000, 2_000), SpendOpClass::Tip);
+        assert!(
+            !matches!(&judged, Err(AccountError::PolicyIndeterminate(_))),
+            "the same two-coin shape must be judgeable when its total is representable"
+        );
+    }
+
+    /// The rolling ledger's projection is checked, so a charge that would push the window total past
+    /// `u64::MAX` is indeterminate rather than wrapped into a small, comfortably-under-cap number.
+    ///
+    /// Reachable only under a `u64::MAX` cap, which is why the fixture uses one: charge the whole
+    /// `u64::MAX` allowance, then ask for one mojo more.
+    #[test]
+    fn a_charge_that_would_overflow_the_rolling_total_is_indeterminate_not_wrapped() {
+        let gate = gate_with(
+            CustodyPolicy::Hot(HotWallet {
+                auto_send_limit: u64::MAX,
+            }),
+            permissive_auto_send(),
+        );
+
+        approval(gate.authorize_op(&pays_third_party(u64::MAX), SpendOpClass::Tip));
+        assert_eq!(ledger_total(&gate), u64::MAX);
+
+        let err = refusal(gate.authorize_op(&pays_third_party(1), SpendOpClass::Tip));
+        assert!(
+            matches!(&err, AccountError::PolicyIndeterminate(m) if m.contains("overflows u64")),
+            "the projection must refuse rather than wrap to 0: {err}"
+        );
+    }
+
+    /// A standard-layer spend of `coin_amount` that creates one hinted output per entry in
+    /// `outputs`, with NO total pre-check — the fixture the summable-total rules need.
+    ///
+    /// `spend_paying` deliberately refuses to build an unrepresentable total (it `checked_add`s and
+    /// panics), which is right for every fixture that must be a *well-formed* spend. The rules below
+    /// are about the spends that are NOT well-formed, so they need a builder that will emit one.
+    fn spend_creating(coin_amount: u64, outputs: &[(Bytes32, u64)]) -> Vec<CoinSpend> {
+        let mut ctx = SpendContext::new();
+        let mut conditions = Conditions::new();
+        for (puzzle_hash, amount) in outputs {
+            let hint = ctx.hint(*puzzle_hash).unwrap();
+            conditions = conditions.create_coin(*puzzle_hash, *amount, hint);
+        }
+        StandardLayer::new(spender().public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(
+                    Bytes32::new([9u8; 32]),
+                    spender().puzzle_hash(),
+                    coin_amount,
+                ),
+                conditions,
+            )
+            .unwrap();
+        ctx.take()
+    }
+
+    /// **A spend whose CREATED-OUTPUT amounts do not sum in a `u64` never becomes an approval.**
+    ///
+    /// This is the value-conservation bypass, and it is a bypass precisely because the wrap makes the
+    /// spend look conserving. A `1_000`-mojo coin creating `u64::MAX` and `1_001` sums, modulo 2^64,
+    /// back to exactly `1_000` — so an implementation that accumulates output amounts with a wrapping
+    /// `+=` finds `xch_in == xch_out`, declares value conserved, and hands back an effect describing
+    /// a spend of every mojo that will ever exist. The dependency's security gate showed
+    /// `LocalSigner::sign_unsigned` will emit a real aggregated BLS signature over such a spend, so
+    /// the refusal has to happen before an approval exists, not at the signature.
+    ///
+    /// The fixture's amounts are chosen FROM the bound rather than picked large: `u64::MAX + 1_001`
+    /// is the smallest pair that both overflows and lands back on a plausible coin amount, so the
+    /// test cannot pass merely because the numbers were too big to be believed.
+    ///
+    /// Requires `dig-wallet-backend` >= 0.16.1, where all four accumulation sites route through a
+    /// fallible `accumulate`. Pinned by EXECUTION against 0.16.0, where it fails in both build
+    /// profiles for the same underlying reason: debug panics on the unchecked `+=` at
+    /// `client/verify.rs:165`, release wraps and the gate returns an approval. That version
+    /// difference is the whole content of the guarantee, which is why the dependency floor is
+    /// `0.16.1` and not `0.16`.
+    #[test]
+    fn a_spend_whose_output_amounts_overflow_is_never_approved() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let overflowing = spend_creating(
+            1_000,
+            &[
+                (third_party().puzzle_hash(), u64::MAX),
+                (third_party().puzzle_hash(), 1_001),
+            ],
+        );
+
+        let err = refusal(gate.authorize_op(&overflowing, SpendOpClass::Tip));
+
+        assert!(
+            matches!(&err, AccountError::Spend(_)),
+            "an unaccountable spend must be refused at the derivation, before any approval or              signature exists: {err}"
+        );
+    }
+
+    /// THE OTHER SIDE OF THE SAME BOUND — the refusal above must be about overflow, not about size.
+    ///
+    /// A guard tested only from over the bound cannot distinguish "rejects what does not sum" from
+    /// "rejects large amounts", and the second would refuse every legitimate whale spend while every
+    /// test stayed green. So the largest total that DOES sum — outputs of `u64::MAX - 1` and `1`,
+    /// exactly `u64::MAX`, from a coin of exactly `u64::MAX` — must be accounted for and reach a
+    /// ruling.
+    #[test]
+    fn a_spend_whose_output_amounts_sum_to_exactly_u64_max_is_still_accountable() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let at_the_bound = spend_creating(
+            u64::MAX,
+            &[
+                (third_party().puzzle_hash(), u64::MAX - 1),
+                (third_party().puzzle_hash(), 1),
+            ],
+        );
+
+        // It escalates rather than auto-sends (it is far over the hot allowance), which is a RULING:
+        // the derivation accounted for it. The point is that it is not refused as unaccountable.
+        let ruling = gate.authorize_op(&at_the_bound, SpendOpClass::Tip);
+        assert!(
+            !matches!(&ruling, Err(AccountError::Spend(_))),
+            "a spend whose outputs sum to exactly u64::MAX is accountable and must not be refused              as though it overflowed"
+        );
+        let _ = pending(ruling);
+    }
+
+    /// **SPEC §6.3.1 CONFORMANCE: the two refusals a host must distinguish are different variants.**
+    ///
+    /// The wire mapping gives `SPEND_DENIED -33053` to a user's refusal and `SPEND_NOT_AUTHORIZED
+    /// -33052` to a structural one. That mapping is only a function if the crate hands back a
+    /// different value for each, and for one revision it did not: both arrived as `PolicyDenied`, so
+    /// the table named two codes for one value and no conforming host could exist.
+    ///
+    /// Both halves are produced HERE, in one test, from ONE gate. Two separate tests each asserting
+    /// its own variant would pass just as happily if a refactor merged the variants and only one of
+    /// them was updated — it is the DIFFERENCE that the host depends on, so the difference is what is
+    /// asserted.
+    #[tokio::test]
+    async fn a_user_refusal_and_a_structural_refusal_are_distinguishable_outcomes() {
+        // Structural: a vault outflow may only ever pay this profile's own hot wallet.
+        let vault = gate_with(vault_custody(), permissive_auto_send());
+        let structural = refusal(vault.authorize_op(&pays_third_party(1_000), SpendOpClass::Tip));
+
+        // Human: the same gate escalates a payment to its OWN hot wallet, and the user says no.
+        let escalated = pending(vault.authorize_op(
+            &spend_paying(&[(hot_wallet().puzzle_hash(), 1_000)], 0),
+            SpendOpClass::Tip,
+        ));
+        let human = denial(
+            confirmed(
+                escalated,
+                crate::auth::provider::SpendDecision::Decline(None),
+            )
+            .await,
+        );
+
+        assert!(
+            matches!(structural, AccountError::PolicyDenied(_)),
+            "a structural refusal must map to SPEND_NOT_AUTHORIZED -33052: {structural}"
+        );
+        assert!(
+            matches!(human, AccountError::UserDeclined(_)),
+            "a user's refusal must map to SPEND_DENIED -33053: {human}"
+        );
+        assert_ne!(
+            std::mem::discriminant(&structural),
+            std::mem::discriminant(&human),
+            "the wire mapping is a function only if these are different values; collapsing them              leaves a host unable to tell 'you said no' from 'the rules say no'"
         );
     }
 }

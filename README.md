@@ -11,16 +11,25 @@ This crate owns the object model, unlock policy + keystore crypto, the in-proces
 signer, per-profile key/DEK derivation, the DID+dig-store mint, and all wallet ops. It never draws
 UI — the host harness (dig-app) injects a UI/auth provider that this crate calls back through.
 
-`PolicyAuthorizer` is the custody gate a host puts in front of signing. It enforces the two-tier
-custody policy and the user's auto-send policy: a vault-tier spend always requires a full
-authorization ceremony and may only ever pay the profile's own hot wallet (via `VaultMove`, a
-24-hour clawback the user can cancel); a hot-wallet spend auto-signs only within its op class, its
-per-transaction limit, and a rolling period cap. Every default refuses.
+`PolicyAuthorizer` is the custody gate, and **it is not optional.** It enforces the two-tier custody
+policy and the user's auto-send policy: a vault-tier spend always requires a full authorization
+ceremony and may only ever pay the profile's own hot wallet (via `VaultMove`, a 24-hour clawback the
+user can cancel); a hot-wallet spend auto-signs only within its op class, its per-transaction limit,
+and a rolling period cap. Every default refuses.
 
-**The gate is something a host must USE, not something this crate applies for you.** dig-account
-does not compose a send path: the money signer is reachable without the gate, and nothing binds an
-authorization to the coin spends that get signed. `SPEC.md` §6.1.1 states the obligations a host
-takes on, and exactly which of them this crate can and cannot check.
+**The gate cannot be bypassed, and the thing it approved is the thing that gets signed.** You hand
+`authorize_op` the coin spends — never a description of them — and it derives the summary itself. What
+it returns is a `SpendApproval` that *owns those exact coin spends*, and `sign_approved` is the only
+signing entry point in the crate. So there is no unauthorized route to a signature, and nothing to
+compare that could compare the wrong bytes. Single-use, unmintable outside the gate, and unclonable —
+each held by the type system rather than by a runtime check.
+
+The ruling has three outcomes, not two: approved, **requires confirmation** (run the ceremony, then
+`confirmed`), or refused. That third state is why a spend needing a human reaches the human instead of
+being silently declined.
+
+`SPEC.md` §6.2 is the normative statement, including the limits this layer still does NOT provide
+(§6.1.1).
 
 ## The recovery phrase
 

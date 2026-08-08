@@ -159,15 +159,45 @@ Idle-relock (Phase-1 status): the idle-relock LIFECYCLE PRIMITIVE ships as
 `auth::policy::UnlockGate` — a clock-injected holder that runs the `AuthPolicy` + keystore unlock and,
 while unlocked AND within the idle window, hands out a live `UnlockedAccount` via `unlock()` / `access()`
 (refreshing the deadline), relocks (drops + zeroizes the seed) after the idle window, and supports
-explicit `lock()`. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
+explicit `lock()`. **One unlock yields exactly ONE `Residency`, shared by every `UnlockedAccount` the
+gate hands out from it and by every capability derived from those handles.** `UnlockGate::lock()`, idle
+expiry, a superseding `unlock()`, and dropping the gate MUST each REVOKE that token, so a `LocalMoneySigner`
+retained across any of them fails with `Locked` rather than continuing to sign. (Which capabilities read
+that token is stated below: in Phase 1, only the money signer does.) Revocation is required rather than implied by dropping the seed: the seed's `Arc` is
+shared with every handle already issued, so dropping the gate's reference alone leaves those handles
+fully working.
+
+**Idle expiry MUST be a property of TIME, not of calling the gate.** The `Residency` carries its own
+idle deadline, refreshed by each `access()` the gate serves; once the clock passes that deadline the
+token reports not-live — with no `access()`, no `lock()`, and no other gate call required. Evaluating
+the window inside `access()` instead would make the bound conditional on the host that stopped calling,
+which is exactly the unattended process the window exists to bound.
+
+**Exactly ONE capability observes that token in Phase 1: the money signer.** A `LocalMoneySigner`
+obtained through `UnlockedAccount::wallet_ops()` re-reads the residency on every signing attempt and
+fails with `Locked` the instant the deadline passes, with no gate call required. The other four
+capability surfaces reachable from a retained `UnlockedAccount` — `profile_signer()`, `dek()`,
+`profile_sealing_key()` and `recovery_phrase()` — do NOT yet observe the residency, and a handle
+retained past the idle deadline continues to serve them, including the full 24-word recovery phrase.
+A host MUST therefore treat a retained `UnlockedAccount` as live key material until it drops that
+handle; the idle window bounds spending, not disclosure. Closing that gap is the deferred follow-up
+described below.
+
+The seed BYTES are dropped and zeroized when the LAST handle holding them drops — consistent with the
+shared `Arc` described above, dropping the gate's own reference does not zeroize anything while any
+issued `UnlockedAccount` survives. `is_unlocked()` reports the same observed liveness as the residency,
+so the gate and the money signer can never disagree. Consistent with §8, `UnlockGate` NEVER returns a raw seed: the
 `Arc<UnlockedMasterSeed>` lives only in its private state, and both `unlock()` and `access()` return
 `UnlockedAccount` (the same shape as `AccountSession`). A host that needs idle-relock today holds the
-account through an `UnlockGate`. Wiring idle-relock directly onto the `UnlockedAccount` capability
-lifecycle (so `signer()`/`wallet_ops()`/`dek()` re-check the idle window and return locked once expired)
-is a deferred v0.1.x follow-up: it changes those accessors to fallible and is a deliberate, tested
-lifecycle change rather than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained
-directly from `AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained
-via `UnlockGate::access()` is idle-bounded by the gate.
+account through an `UnlockGate` and drops each `UnlockedAccount` promptly. Extending idle-relock to the
+REMAINING `UnlockedAccount` capabilities (so `profile_signer()`, `dek()`, `profile_sealing_key()` and
+`recovery_phrase()` re-check the residency and return locked once expired) is a deferred v0.1.x
+follow-up: it changes those accessors to fallible and is a deliberate, tested lifecycle change rather
+than a rushed one in a custody crate. Until then, an `UnlockedAccount` obtained directly from
+`AccountSession` relocks on drop/`lock()` but does NOT auto-relock on idle; one obtained via
+`UnlockGate::unlock()`/`access()` has its MONEY-SIGNING capability idle-bounded and revoked by the gate,
+while its identity-signing, DEK, sealing-key and recovery-phrase surfaces remain usable for as long as
+the host retains the handle.
 
 ### 4.2 AuthPolicy / SecondFactor evaluation (pure, in-crate)
 
@@ -186,9 +216,10 @@ identity path ONLY (session-attach challenges, `dign sign`, directed-message aut
 `try_sign` MUST return `None` when locked (never a bogus all-zero signature); `sign` /
 `signing_public_key` MUST NOT be called on a locked signer. `ProfileSigner::locked` is a key-less handle.
 
-### 5.2 Money signer (v0.1.1: dig-wallet-backend LocalSigner)
+### 5.2 Money signer (dig-wallet-backend LocalSigner)
 
-`MoneySigner` is the trait that signs verified coin spends and returns the aggregate BLS signature. Its
+`MoneySigner` is the trait that signs an APPROVED spend and returns the broadcast-ready `SpendBundle`;
+its sole method is `sign_approved(SpendApproval)`, and no other route to a signature exists (§6.2). Its
 sole concrete implementation, `LocalMoneySigner`, routes through `dig-wallet-backend`'s `LocalSigner`
 constructed via `LocalSigner::new_canonical` (the CANONICAL
 `master_to_wallet_unhardened(seed, ix).derive_synthetic()` money-key scheme — the derivation funds
@@ -196,8 +227,9 @@ actually live at, byte-identical to `WalletKey`; the legacy `m/44'` profile sche
 controls a distinct never-funded key set and would fund-lock coins). It is constructed INSIDE dig-account
 so the money key never leaves the crate, and MUST:
 
-1. Re-derive every required signature from the VERIFIED `coin_spends` — never sign caller-supplied opaque
-   bytes. An engine-supplied required-signature list is UNTRUSTED (cross-checked against the re-derived
+1. Re-derive every required signature from the approval's OWN `coin_spends` — never sign caller-supplied
+   opaque bytes, and never re-derive the summary a second time (the approval carries the gate's, §6.4).
+   Two derivations of one spend are two answers that can differ. An engine-supplied required-signature list is UNTRUSTED (cross-checked against the re-derived
    set, never the signing source), so it cannot be used as a signing oracle.
 2. Be `AGG_SIG_ME`-only and fail-closed: refuse (error on the whole bundle) any `AGG_SIG_UNSAFE` /
    non-coin-bound required signature (the signing-oracle guard), and any condition it cannot fully
@@ -252,52 +284,153 @@ derived from the coins being spent, and this specification does not claim otherw
   mismatch. **The caller MUST construct the authorizer that matches the coins it is spending.**
 - **Vault protection is a property of the AUTHORIZER, not of the funds.** An implementation MUST NOT
   present these rules to a user as protection that attaches to money held in a vault.
-- **Enforcement is opt-in.** `WalletOps::money_signer` is public and returns a signer that signs any
-  spend it can verify (§5.2). dig-account does NOT compose a send path that forces a spend through the
-  gate, so a caller that uses the signer directly is bound by §5.2 only. A host that wants these rules
-  enforced MUST route every spend through a `PolicyAuthorizer` before signing.
-- **The authorization is not bound to the signed bytes.** The gate decides over a `SpendSummary` while
-  the money signer signs over `[CoinSpend]`, and `SpendSummary::new` is public, so a caller can have a
-  one-mojo summary authorized and then sign a spend of any size; the signer re-derives its own summary
-  and checks it against itself, which catches a malformed spend but not a mismatched authorization.
-  **A host MUST pass the `SpendSummary::from_coin_spends`-derived summary of the EXACT coin spends it
-  is about to sign, and MUST NOT hand-construct one.** THIS CRATE DOES NOT AND CANNOT CHECK THAT
-  OBLIGATION — it is a host requirement, not a guarantee. Closing it requires a shape change
-  (authorizing over the coin spends, or issuing an approval token the signer demands) and is tracked
-  separately as a blocker on the money-send wire contract.
-- **Only HINTED value is visible to the amount bounds** (§6.4). An un-hinted output is change and is
-  excluded from `SpendSummary::recipients`, so no limit here weighs it; §5.2's change-ownership check
-  bounds where such value may go (a puzzle hash under the same seed) but does not subject it to any
-  policy. A future tier-to-coin linkage and a composed, gate-enforcing send path are both tracked
-  separately; until they exist, the guarantees above are the whole of what this layer provides.
+- **Value is counted by DESTINATION, never by hint status** (§6.4). An output is weighed unless it pays
+  the exact puzzle hash of a coin the spend is itself spending — the one case where value demonstrably
+  has not moved. Hint status is never consulted, so an author cannot move value out of the charged total
+  or out of the vault destination rule by omitting a memo.
+- **This deliberately OVERCOUNTS change sent to a fresh derivation.** This layer holds no key, so it
+  cannot distinguish a fresh derivation of the user's own wallet from a stranger's address. The only
+  rule that could is "any owned derivation is change", and that is precisely an attacker's exfiltration
+  target — an address the signer's `0..address_gap` window accepts. So a legitimate send whose change
+  goes to a fresh address is counted in full and escalates to the human instead of auto-sending. This is
+  intended, specified behaviour and MUST NOT be "fixed" by widening what counts as change: overcounting
+  asks a person, undercounting signs.
+- A future tier-to-coin linkage is tracked separately; until it exists, the guarantees above are the
+  whole of what this layer provides.
 
-### 6.2 WalletOps + SpendAuthorizer seam + money-signer invariants
+Two limitations previously recorded here — that enforcement was opt-in, and that the authorization was
+not bound to the signed bytes — are no longer true. §6.2 states what replaced them.
+
+### 6.2 The authorization IS the signed bytes (`SpendApproval`)
 
 `WalletOps` is the per-profile money-path handle. Its public surface exposes ONLY the wallet's public
 identifiers (`public_key`, `puzzle_hash`, `address`); `wallet_key()` (which holds the raw synthetic
 secret) is `pub(crate)` (§8). `WalletOps::money_signer(network) -> LocalMoneySigner` builds the concrete
-canonical-wallet signer, and `WalletOps::summarize(coin_spends, policy) -> SpendSummary` re-derives + tiers
-a spend. `SpendAuthorizer::authorize(&SpendSummary) -> Result<()>` is the custody gate: a spend MUST be
-authorized (`Ok`) before it is signed, and a host MUST fail-closed (never sign) on `Err`. **This MUST
-binds the HOST and has no enforcement point inside this crate** (§6.1.1): `LocalMoneySigner` consults
-no authorizer, so the invariants of §5.2 — independent re-derivation, value conservation, wallet-owned
-change, quote-form delegated puzzles — are the only checks that apply unconditionally to a signature.
+canonical-wallet signer.
 
-`PolicyAuthorizer` is the crate's concrete ENFORCING implementation of that seam (§6.4).
+**A spend MUST be authorized before it is signed, and this crate MUST ENFORCE that rather than require
+it of a host.** The enforcement is structural:
 
-### 6.3 The three refusals are distinct
+- `PolicyAuthorizer::authorize_op(&[CoinSpend], SpendOpClass) -> Result<SpendRuling>` is the ONLY
+  custody gate. It takes the coin spends and DERIVES the summary itself. **A caller MUST NOT be able to
+  supply a description of a spend, nor an amount, nor a tier** — there is then no caller-supplied account
+  of the spend for the gate's own account to disagree with.
+- A permitted spend is expressed as a `SpendApproval`, which **OWNS the exact `CoinSpend`s it
+  authorized** together with the summary derived from them. It MUST NOT merely reference, hash, or
+  otherwise describe them: a comparison of two values is a step that can be skipped, mis-scoped, or run
+  over the wrong bytes, whereas a single owned value cannot be mismatched.
+- `MoneySigner::sign_approved(SpendApproval) -> Result<SpendBundle>` MUST be the only signing entry
+  point on the money path. **The CAPABILITY of turning caller-supplied coin spends into a signature
+  MUST NOT be obtainable by any route other than presenting a `SpendApproval`** — whatever form that
+  route would take: a free function, an inherent method, a trait method or its implementation, an
+  `async`/`unsafe`/`const`/`extern` function, or any visibility short of module-private. An
+  unauthorized spend therefore has no type that can reach a signer, which is what makes the ordering
+  rule above an enforcement point rather than a sentence in a specification.
 
-A refusal MUST state WHICH kind it is, because a caller acts differently on each:
+  The MUST is stated over the capability rather than over a parameter type or a list of visibility
+  keywords deliberately. A rule spelled as a keyword list exempts, silently, every form it fails to
+  spell; the enforcing guard (`tests/the_shape_is_unwritable.rs`) is therefore stated over the
+  CAPABILITY too — it flags any function whose name begins `sign` that receives coin spends in any
+  spelling (`&[CoinSpend]`, `Vec<CoinSpend>`, a generic `AsRef<[CoinSpend]>`, or the fully-qualified
+  `chia_protocol::CoinSpend`), under any visibility or none, and carries its single permitted
+  exception by exact name rather than by name prefix. The guard is a textual scan of production
+  sources, so it is a strong backstop and not a proof: a door that avoids the name `sign` or names the
+  type through an alias is outside its reach, and those remain the reviewer's job.
+- The DID mint (§6A) is the one signing path that does NOT run through a `SpendApproval`, and is the
+  one exception the guard names. It builds its own spends rather than accepting a caller's, and it
+  MUST gate them under its own whitelist (§6A.4) before signing. Its signing helper MUST stay
+  module-private and MUST live in exactly one module, so it remains unreachable except through
+  `mint_did`; the exception lapses automatically if either ceases to hold. Unifying the two gates is a
+  future change, not a licence to add a second door.
+- The returned bundle carries the approval's OWN coin spends, so a caller MUST NOT be able to pair the
+  resulting signature with different bytes.
 
-| Variant | Meaning | May a confirmation ceremony permit it? |
+**The approval's remaining properties are properties of its TYPE, and MUST stay so:**
+
+| Property | Held by |
+|---|---|
+| Single-use | `sign_approved` takes the approval BY VALUE and `SpendApproval` is not `Clone`/`Copy`. Reuse is a compile error; there is deliberately NO nonce and no spent-set. |
+| Unmintable by a consumer | Every field is private and both constructors are `pub(crate)`, so `PolicyAuthorizer` is mechanically the only minter of a permission. |
+| Not transferable across a trust boundary | `SpendApproval` and `PendingApproval` MUST NOT implement `Serialize`/`Deserialize`. A deserializable approval makes "a dapp mints its own approval" a one-line change in a consumer. |
+| Not loggable | Neither type implements `Debug`. |
+| Not expiring | Deliberate. The rolling cap is charged when the approval is minted, so an aged approval cannot re-spend an allowance. A user re-locking DURING an async ceremony is a lock question, answered by building the signer after the ceremony from the live residency — not by dating the approval. |
+
+**Safety comes from the approval OWNING its spends. A same-bytes comparison is NOT a guard, and this
+crate MUST NOT claim one as a custody property.** The approval carries a `TransactionSummary` because
+the dependency's signer takes it as a required parameter, and that signer compares it against its own
+re-derivation. Both sides descend from the same `coin_spends` the approval owns, so the comparison can
+only ever agree: it is structurally incapable of detecting anything, and its value here is zero. It is
+passed to satisfy a signature and is explicitly NON-LOAD-BEARING. A genuine second opinion would require
+an INDEPENDENT derivation — which is the two-answers-can-disagree shape §6.2 exists to remove, so no such
+comparison SHOULD be reintroduced as a substitute for ownership.
+
+`SpendSummary::new` and `WalletOps::summarize` remain public and confer NO authority: since no API
+accepts a `&SpendSummary` for a custody decision, a hand-built summary is a display value with nowhere
+to go.
+
+There is deliberately **no `SpendAuthorizer` trait**. A custody gate MUST NOT be an interface whose
+simplest implementation returns success; `PolicyAuthorizer` is the concrete gate, and a host that needs a
+test double drives the real gate with a test policy and the public `FixedClock`.
+
+### 6.3 Three outcomes, and the two refusals stay distinct
+
+`authorize_op` has three possible outcomes, and an implementation MUST NOT reduce them to two:
+
+| Outcome | Meaning | May a confirmation ceremony permit it? |
 |---|---|---|
-| `AccountError::RequireAuth` | Not auto-approved by policy | YES — escalate to the ceremony |
-| `AccountError::PolicyDenied` | Forbidden by a structural custody rule | NO |
-| `AccountError::PolicyIndeterminate` | The policy could not be EVALUATED | NO — the condition must be fixed |
+| `Ok(SpendRuling::Approved(approval))` | Auto-approved by policy; the rolling cap is ALREADY charged its real value | — (already permitted) |
+| `Ok(SpendRuling::RequiresConfirmation(pending))` | Not auto-approved, but the user MAY permit it. Nothing charged | YES — this IS the escalation |
+| `Err(AccountError::PolicyDenied)` | Forbidden by a structural custody rule | NO |
+| `Err(AccountError::UserDeclined)` | The user was asked and refused | NO — the human has already answered |
+| `Err(AccountError::PolicyIndeterminate)` | The policy could not be EVALUATED | NO — the condition must be fixed |
 
-An implementation MUST NOT collapse "denied by policy" with "could not determine policy" into one
-refusal: doing so both hides a malfunctioning gate and lets a caller escalate a forbidden spend into an
-approved one.
+**The escalatable outcome MUST be an `Ok` value, not an error.** A return type that can only say "yes"
+or "no" forces a caller to collapse "ask the human" into a refusal, which makes the confirm ceremony
+unreachable for exactly the `Confirm` and `Vault` tiers that exist to require it. `AccountError`
+therefore carries NO escalatable variant: every variant in it is terminal for the spend, so collapsing
+them can lose detail but can no longer lose a permission.
+
+`PendingApproval::confirm_with(&dyn AuthProvider, AccountId, ProfileIx) -> Result<SpendApproval>` is the
+ONLY route from "needs a human" to a signable approval, and it MUST run THROUGH the consent seam rather
+than accept an assertion of consent: there MUST be no public method taking a `SpendDecision` directly, or
+a host could mint an approval in one line without asking anyone. A host that cannot render a ceremony
+MUST return `Decline`. It MUST consume `self`, so one prompt yields at most one approval, and it
+MUST return `UserDeclined` on `Decline`, NOT `PolicyDenied` — the human has already been asked, so
+re-prompting would turn a refusal into a prompt-until-mis-click, and the two facts have different
+deciders. An implementation MUST NOT return one variant for both: a host holding a single variant cannot
+tell "you said no" from "the rules say no", cannot render an honest UI, and cannot satisfy §6.3.1's
+mapping, which requires each outcome to name exactly one wire code. A declined or escalated spend MUST NOT consume the rolling
+allowance; nor does a human-confirmed one, since that cap bounds what moves UNATTENDED.
+
+An implementation MUST NOT collapse "denied by policy" with "could not determine policy": doing so both
+hides a malfunctioning gate and lets a caller escalate a forbidden spend into an approved one.
+
+#### 6.3.1 The wire codes a host MUST map these to
+
+A host exposing this gate over a wire protocol MUST keep the outcomes distinct there too. The `SPEND_*`
+taxonomy itself lives in the host's loopback layer rather than in this crate; the normative mapping is:
+
+| Outcome | Wire code | Escalatable? |
+|---|---|---|
+| `Err(UserDeclined)` (the ceremony ran and the user refused) | `SPEND_DENIED` `-33053` | NO |
+| `Err(PolicyDenied)` (a structural custody rule forbids it) | `SPEND_NOT_AUTHORIZED` `-33052` | NO |
+| `Err(PolicyIndeterminate)` | `SPEND_POLICY_INDETERMINATE` `-33056` | NO |
+| verify failure (`Err(AccountError::Spend)`) | `SPEND_REFUSED` `-33051` | NO |
+| decode failure, or a forbidden field present | `SPEND_BAD_PAYLOAD` `-33050` | NO |
+
+**This mapping MUST be a function of the crate outcome alone.** Each row's left-hand side is a distinct
+`AccountError` variant, so a host maps by matching the variant and never by reconstructing which decider
+refused. An earlier revision keyed one row on a SEQUENCE of events ("`RequiresConfirmation`, then the user
+declines") while another keyed on `PolicyDenied`, and both resolved to `PolicyDenied` — so the table named
+two codes for one value and a conforming host could not exist. `UserDeclined` is what makes it total.
+
+`SPEND_POLICY_INDETERMINATE` `-33056` MUST exist as its own code. Without it, "the policy could not be
+evaluated" collapses into `SPEND_NOT_AUTHORIZED` — the very defect §6.3 forbids, one layer up.
+
+A host MUST NOT accept a summary, an amount, an op class, or any other DESCRIPTION of a spend on the
+wire: the requester supplies unsigned coin spends and nothing else, and a request carrying such a field
+MUST be rejected rather than ignored. A request arriving from outside the process is therefore always
+`SpendOpClass::Undeclared`, and can never auto-approve.
 
 ### 6.4 Auto-send policy enforcement (`PolicyAuthorizer`)
 
@@ -315,34 +448,46 @@ build a gate per spend. The cap is also per-process-lifetime rather than per-wal
 restart re-earns the full allowance — so a host MUST NOT present it to a user as a durable daily
 limit. Persisting the ledger is tracked separately.
 
-`authorize_op(&SpendSummary, SpendOpClass) -> Result<()>` decides, in order:
+`authorize_op(&[CoinSpend], SpendOpClass) -> Result<SpendRuling>` decides, in order:
 
-1. **Re-classify.** The tier is re-derived from the profile's own `CustodyPolicy` over
-   `checked_native_total_mojos()`; a summary whose declared `tier` disagrees is `PolicyIndeterminate`.
-   The tier a summary carries MUST NOT be trusted as a permission.
-2. **Vault.** Every recipient MUST be the hot wallet's puzzle hash, else `PolicyDenied`; a recipient
-   address that cannot be decoded is `PolicyIndeterminate`. A vault-tier spend then always returns
-   `RequireAuth`.
-3. **One arm per tier.** Only `SpendTier::AutoSend` may proceed. Every tier MUST be decided by
-   exactly one arm of a wildcard-free match, so (a) a `SpendTier` variant added later is a compile error
-   rather than a variant inheriting some other tier's decision, and (b) no two guards can produce the
-   same outcome for one tier — which would leave the narrower rule pinned by nothing.
-4. **Global switch.** `AutoSendPolicy::enabled == false` implies `RequireAuth` for everything.
-5. **Op class.** `SpendOpClass::Undeclared` implies `PolicyIndeterminate` (the untyped `SpendAuthorizer`
-   seam supplies `Undeclared`, so it can never auto-approve). A disabled class implies `RequireAuth`.
+1. **Derive, once.** The spend is re-parsed through `dig-wallet-backend`'s verify gate and tiered under
+   the profile's own `CustodyPolicy`. The tier, every amount limit, and the summary the user is shown MUST
+   all come from this ONE derivation: two derivations of one spend are two answers that can differ.
+   A spend the driver cannot fully account for is `AccountError::Spend`, refused HERE — before any
+   approval exists — rather than a second time inside the signer.
+   The spent coins' amounts MUST be summed CHECKED before that derivation runs, and an unsummable input
+   total MUST be `PolicyIndeterminate`: the amounts arrive in an unsigned skeleton, so they are
+   caller-chosen and need not name coins that exist, and an unchecked accumulation of them would wrap
+   before value conservation was judged against it.
+2. **Vault.** Every entry of the charged destination list (§6.4, which is every output that is not a
+   proven p2 destination of the spend — never only the hinted ones) MUST be the hot wallet's puzzle hash,
+   else `PolicyDenied`; a destination that cannot be decoded is `PolicyIndeterminate`. A vault-tier spend
+   then always yields `RequiresConfirmation`.
+3. **One arm per tier.** Only `SpendTier::AutoSend` may proceed to the auto-send bounds. Every tier MUST
+   be decided by exactly one arm of a wildcard-free match, so (a) a `SpendTier` variant added later is a
+   compile error rather than a variant inheriting some other tier's decision, and (b) no two guards can
+   produce the same outcome for one tier — which would leave the narrower rule pinned by nothing.
+4. **Global switch.** `AutoSendPolicy::enabled == false` implies `RequiresConfirmation` for everything.
+5. **Op class.** `SpendOpClass::Undeclared` implies `RequiresConfirmation`: no intent was declared, so no
+   configured bound applies and the answer belongs to the human. It MUST NOT be a refusal — a request
+   arriving from outside the process is inherently undeclared, and refusing it would make such a spend
+   permanently unspendable rather than confirmable. A disabled class also implies `RequiresConfirmation`.
 6. **Boundable units.** Any recipient with an `asset_id` (a CAT) implies `PolicyIndeterminate`: its
-   amount is not counted by `native_total_mojos()`, so no mojo limit can bound it.
+   amount is not counted by `native_total_mojos()`, so no mojo limit can bound it. This MUST NOT be an
+   escalation — an unbounded spend must not be confirmable away either.
 7. **Per-transaction limit.** The checked native total (amounts PLUS fee) MUST be `<=`
-   `per_tx_limit_mojos`, else `RequireAuth`.
+   `per_tx_limit_mojos`, else `RequiresConfirmation`.
 8. **Rolling period cap.** `period_seconds` MUST be non-zero, else `PolicyIndeterminate`: a
    zero-length window contains no spend, so obeying it would discard every record on every call and
    degrade the cap into a second per-transaction limit with no bound on how often it applies. The sum
    of approvals inside the last `period_seconds` plus this spend MUST be `<= period_cap_mojos`, else
-   `RequireAuth`. Only a NON-ZERO charge is recorded, so repeated zero-value approvals cannot grow the
-   ledger without bound. An approval recorded at `t` MUST still count at
-   `t + period_seconds - 1` and MUST have expired at `t + period_seconds`. Only an APPROVED spend is
-   recorded; a refused spend MUST NOT consume the allowance. An unreadable clock is
-   `PolicyIndeterminate` — never an empty window.
+   `RequiresConfirmation`; a projection that cannot be summed in a `u64` is `PolicyIndeterminate` rather
+   than wrapped. Only a NON-ZERO charge is recorded, so repeated zero-value approvals cannot grow the
+   ledger without bound. An approval recorded at `t` MUST still count at `t + period_seconds - 1` and
+   MUST have expired at `t + period_seconds`. **Only an `Approved` ruling is charged, and it MUST be
+   charged the spend's REAL value** — a spend that escalates, is declined, or is confirmed by hand MUST
+   NOT consume the unattended allowance. An unreadable clock is `PolicyIndeterminate` — never an empty
+   window.
 
 `AutoSendPolicy::default()` MUST auto-approve nothing: global switch off, every op class disabled, every
 bound zero. A partially-loaded or empty persisted policy therefore refuses.
@@ -354,18 +499,41 @@ small allowance while the spend moves an enormous amount) and MUST NOT panic (`f
 `SpendSummary::native_total_mojos()` SATURATES at `u64::MAX` so no caller can observe a wrapped figure;
 `checked_native_total_mojos()` is the form every custody decision MUST use.
 
-**Known shape gap — an undeclared intent is not escalatable while auto-send is ON.** With the global
-switch off, everything yields `RequireAuth`, which routes to the human. With it on, an undeclared
-intent yields `PolicyIndeterminate`, which §6.3 defines as not escalatable. A dapp-originated spend
-request has inherently undeclared intent, so it meets a non-escalatable refusal precisely when the user
-has enabled auto-send. Neither tempting remedy is acceptable: letting a dapp declare an op class hands
-the intent model to the attacker, and collapsing the two refusals destroys the distinction §6.3 exists
-to draw. The correct shape is a THIRD outcome — escalatable, "no intent supplied, route to the human" —
-and it is tracked against the money-send wire contract rather than introduced here.
+**The charged total MUST be computed by destination, and a destination MUST be PROVEN.**
+`SpendSummary` accounts for every created output — hinted or not — plus the fee, EXCEPT one paying a
+**proven p2 destination of that same spend**: a puzzle hash shown to be a bare
+`p2_delegated_puzzle_or_hidden_puzzle` curried over a key some coin in the spend is itself locked under,
+where currying reproduces that coin's own `puzzle_hash`. Every other output is charged. Because hint
+status is never consulted, the total cannot be made incomplete by omitting a memo.
 
-`SpendSummary` accounts for HINTED outputs plus the fee, so no bound here can see an un-hinted output.
-The complementary invariant — un-hinted value MUST NOT leave the wallet — is enforced by the money
-signer's change-ownership check (§5.2). Both layers are required.
+**A spent coin's `puzzle_hash` MUST NOT be treated as a payable destination.** The two coincide only for
+a bare p2 coin. For a WRAPPED coin — CAT, NFT, DID, singleton, offer settlement — `coin.puzzle_hash` is
+the wrapper's hash, and value paid there is not returned to the spender but rendered PERMANENTLY
+UNSPENDABLE (a CAT layer, for instance, demands a lineage proof no XCH parent can supply). Excusing such
+an output would let an attacker hide any amount behind a wrapper hash the wallet happens to be spending
+and have the gate weigh only the fee — defeating the per-transaction limit, the rolling cap, the vault
+destination rule and the clawback window at once. A wallet can hold a wrapped coin without ever asking
+to (a CAT airdrop needs only its public synthetic key), so this MUST NOT be treated as an unusual
+configuration.
+
+**The rule MUST be an allowlist requiring proof, never a denylist of known wrappers.** An implementation
+MUST charge the output whenever it cannot prove the destination — an unparseable reveal, a wrapper, a
+driver error, a curry that does not reproduce its coin's hash. Failing that way over-counts, which
+escalates a spend to a human; failing the other way approves one. A denylist would be walked past by the
+next layer added to the ecosystem, whereas a proof obligation is layer-agnostic by construction.
+
+§6.1.1 records the deliberate overcount this implies. The vault destination rule (§6.1) reads the same
+list, so an un-hinted or wrapper-directed vault outflow is subject to the hot-wallet-only rule exactly as
+a hinted one is. The money signer's change-ownership check (§5.2) remains a required second layer.
+
+**Output-amount arithmetic MUST be checked at both layers.** `dig-wallet-backend` **0.16.1** — the
+minimum this crate requires — routes all four of its value accumulations through a fallible `accumulate`,
+so an unsummable output total is a refusal from the dependency rather than a debug panic or a release
+wrap. `checked_native_total_mojos()` remains REQUIRED regardless: it is where an unsummable total becomes
+`PolicyIndeterminate` instead of a clamped figure judged against a limit, and the bound it enforces must
+not depend on a dependency's arithmetic continuing to be careful.
+`a_spend_whose_output_amounts_overflow_is_never_approved` pins the boundary against the real dependency,
+not a mock.
 
 ### 6.5 Vault to hot-wallet moves (`VaultMove`)
 
@@ -553,9 +721,11 @@ the policy/crypto evaluation stays in-crate (§4.2).
 
 `AccountError` (`#[non_exhaustive]`) is the single public error type: `Locked`, `ProfileNotFound`,
 `DefaultProfileInvariant`, `Keystore`, `Auth`, `Spend` (money-path verification/derivation/signing
-refusals, fail-closed), `RequireAuth`, `PolicyDenied`, and `PolicyIndeterminate` (the three distinct
-custody refusals, §6.3). The mint path returns `MintError` (`#[non_exhaustive]`): `InsufficientFunds`,
-`Rejected`, `ChainUnreachable`, `Build` and `Refused` (§6A.3/§6A.5). Every other fallible public operation returns
+refusals, fail-closed), `PolicyDenied`, and `PolicyIndeterminate` (the two terminal custody refusals,
+§6.3). It carries NO escalatable variant: "not yet, ask the human" is `SpendRuling::RequiresConfirmation`,
+an `Ok` value, precisely so a caller cannot collapse a permission into a refusal (§6.3). The mint path
+returns `MintError` (`#[non_exhaustive]`): `InsufficientFunds`, `Rejected`, `ChainUnreachable`, `Build`
+and `Refused` (§6A.3/§6A.5). Every other fallible public operation returns
 `Result<T, AccountError>`. Error `Display` strings MUST NOT contain secret material.
 
 ## 10. Versioning & back-compat

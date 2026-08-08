@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `pending`
+  --> tests/compile_fail/confirm_a_ceremony_twice.rs:11:18
+   |
+ 9 | fn confirm_twice(pending: PendingApproval, provider: &dyn AuthProvider, account: AccountId) {
+   |                  ------- move occurs because `pending` has type `PendingApproval`, which does not implement the `Copy` trait
+10 |     let _first = pending.confirm_with(provider, account.clone(), ProfileIx::ROOT);
+   |                  ------- value moved here
+11 |     let _again = pending.confirm_with(provider, account, ProfileIx::ROOT);
+   |                  ^^^^^^^ value used here after move

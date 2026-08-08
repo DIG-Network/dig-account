@@ -1,0 +1,9 @@
+error[E0382]: use of moved value: `approval`
+  --> tests/compile_fail/reuse_an_approval.rs:12:40
+   |
+10 | fn sign_twice<S: MoneySigner>(signer: &S, approval: SpendApproval) {
+   |                                           -------- move occurs because `approval` has type `SpendApproval`, which does not implement the `Copy` trait
+11 |     let _first = signer.sign_approved(approval);
+   |                                       -------- value moved here
+12 |     let _replay = signer.sign_approved(approval);
+   |                                        ^^^^^^^^ value used here after move

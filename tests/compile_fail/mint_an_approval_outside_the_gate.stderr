@@ -1,0 +1,31 @@
+error[E0624]: associated function `new` is private
+  --> tests/compile_fail/mint_an_approval_outside_the_gate.rs:15:44
+   |
+15 |       let _mint_an_approval = SpendApproval::new;
+   |                                              ^^^ private associated function
+   |
+  ::: src/wallet/approval.rs
+   |
+   | /     pub(crate) fn new(
+   | |         coin_spends: Vec<CoinSpend>,
+   | |         summary: SpendSummary,
+   | |         verified: TransactionSummary,
+   | |         scope: CustodyScope,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
+
+error[E0624]: associated function `new` is private
+  --> tests/compile_fail/mint_an_approval_outside_the_gate.rs:16:53
+   |
+16 |       let _mint_a_pending_approval = PendingApproval::new;
+   |                                                       ^^^ private associated function
+   |
+  ::: src/wallet/approval.rs
+   |
+   | /     pub(crate) fn new(
+   | |         coin_spends: Vec<CoinSpend>,
+   | |         summary: SpendSummary,
+   | |         verified: TransactionSummary,
+   | |         scope: CustodyScope,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
