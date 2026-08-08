@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -24,6 +24,14 @@ dig-identity = "0.5"
 dig-keystore = "0.4.1"
 dig-constants = "0.9"
 dig-ipc-protocol = "0.3"
+# The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
+# signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
+# spend bundle; it supplies the funding coin, signs what dig-did reports, and broadcasts.
+dig-did = "0.4"
+# The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
+# through this trait, so dig-account depends on no concrete provider and can never be handed a
+# bespoke reader that lies about confirmation.
+dig-chainsource-interface = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.26"
 chia-protocol = "0.26"
@@ -43,6 +51,9 @@ anyhow = "1"
 hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt"] }
 serde_json = "1"
+# The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
+# validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
+chia-sdk-test = "0.30"
 
 [lints.rust]
 unsafe_code = "forbid"

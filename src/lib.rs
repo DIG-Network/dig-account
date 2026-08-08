@@ -28,8 +28,10 @@
 //! (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` — the canonical
 //! `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner) over
 //! `dig-wallet-backend`'s `LocalSigner`, with the structured [`SpendSummary`](wallet::summary::SpendSummary))
-//! carry real, tested implementations. The identity-signer and mint modules still expose their FINAL
-//! public signatures with `todo!()` bodies, filled in a later phase.
+//! carry real, tested implementations, as does the **on-chain DID mint** ([`mint`] — build, sign,
+//! push, and prove a `did:chia:` against real chain evidence). The full-profile mint
+//! ([`ProfileMinter::mint`]) still exposes its FINAL public signature with a `todo!()` body, awaiting
+//! the dig-store half.
 
 // Phase 1 stubs: several modules expose final signatures with `todo!()`/`unimplemented!()` bodies.
 #![allow(clippy::todo)]
@@ -38,6 +40,7 @@ pub mod auth;
 pub mod error;
 pub mod id;
 pub mod keys;
+pub mod mint;
 pub mod model;
 pub mod profile_mint;
 pub mod session;
@@ -54,6 +57,10 @@ pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;
 pub use keys::wallet_key::WalletKey;
+pub use mint::{
+    ChainUnavailable, MintError, MintNetwork, MintOptions, MintResult, MintedDid, PendingMint,
+    PushOutcome, SpendPublisher,
+};
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;
 pub use session::AccountSession;
