@@ -1029,7 +1029,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-account"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1037,9 +1037,13 @@ dependencies = [
  "chia-bls 0.26.0",
  "chia-protocol",
  "chia-puzzle-types",
+ "chia-sdk-test",
+ "chia-secp",
  "chia-wallet-sdk",
  "clvmr",
+ "dig-chainsource-interface",
  "dig-constants 0.9.0",
+ "dig-did",
  "dig-identity 0.5.0",
  "dig-ipc-protocol",
  "dig-keystore",
@@ -1049,6 +1053,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
  "tokio",
  "x25519-dalek",

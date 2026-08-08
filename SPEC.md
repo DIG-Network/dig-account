@@ -13,15 +13,17 @@ forever (§10 back-compat).
 dig-account is the DIG Network **user Account**: the fat, strictly-logical, zero-UI, headless-testable
 encapsulation of everything an account can do. It owns the Account+Profile object model, the
 multi-account keystore, the unlock policy, per-profile key/DEK derivation, the in-process identity
-signer, and the money-path seams (wallet ops, spend authorization, money-signer).
+signer, the money-path seams (wallet ops, spend authorization, money-signer), and the on-chain DID mint
+(§6A).
 
 It MUST NOT draw UI, collect a password, render a spend prompt, or drive an OS auth ceremony. Those
 belong to the host harness (dig-app), which injects an [`AuthProvider`] (§7) that dig-account calls back
 through. The private key material MUST NOT leave the crate; the UI MUST NOT see a raw seed or a raw
 private key.
 
-Out of scope: chain I/O / broadcast, DID resolution transport, and the concrete `dig-wallet-backend`
-`LocalSigner` (wired in v0.1.1, §5.2).
+Out of scope: chain I/O and broadcast — dig-account performs NEITHER. It reads through the caller's
+`ChainSource` and pushes through the caller's `SpendPublisher` (§6A.6); it opens no socket itself. Also
+out of scope: DID resolution transport.
 
 ## 2. Object model
 
@@ -407,6 +409,115 @@ reopen the vault-to-third-party path the rule exists to close.
 Spend construction MUST carry the DIG spend-branding memo per the ecosystem normative contract (NC-11);
 the concrete memo wiring lands with the spend-building path.
 
+## 6A. The on-chain DID mint
+
+### 6A.1 Shape
+
+`ProfileMinter::begin_did_mint` builds, signs and broadcasts ONE spend bundle that mints a `did:chia:`
+singleton for a profile, and `ProfileMinter::mint_status` turns that mint's on-chain confirmation into
+`MintedDid` evidence. The bundle contains exactly two halves:
+
+1. a standard-layer spend of ONE selected wallet coin, creating a 1-mojo funding coin at the wallet's own
+   puzzle hash, the change (also to the wallet), and the fee; and
+2. `dig-did`'s create — the funding-coin spend that creates the launcher, the launcher spend that creates
+   the eve DID, and the settle spend that makes the DID wallet-parseable.
+
+Every DID coin spend MUST be produced by `dig-did` (which builds them with `chia-wallet-sdk` drivers) and
+every signature message MUST come from `dig_did::sign::required_signatures`. dig-account MUST NOT
+construct a puzzle, encode a condition, or compose a signature message itself.
+
+### 6A.2 The evidence invariant (normative)
+
+A DID is recorded ONLY from evidence of an actual on-chain mint.
+
+`MintedDid` carries a NON-OPTIONAL `confirmed_height`, and its sole constructor is private to the mint
+module. That constructor MUST reject a coin record unless ALL of the following hold:
+
+1. the record is the exact coin the pushed bundle creates;
+2. it carries a confirmed height (a mempool observation — a real record of the right coin, from a
+   reachable node, with no confirmed height — is NOT evidence);
+3. that height is not `0` (no coin is created in genesis);
+4. that height is not below the chain peak observed immediately BEFORE the push (a mint cannot appear in
+   a block that already existed when it was broadcast); and
+5. the coin is buried under at least `MIN_CONFIRMATION_DEPTH` blocks, so a shallow reorg cannot undo a
+   DID already recorded as permanent. This also rejects a height beyond the source's own peak, whose
+   depth is 1; `MIN_CONFIRMATION_DEPTH` MUST therefore exceed 1.
+
+A source that cannot report a peak height MUST make the mint fail closed with `ChainUnreachable`: without
+a peak, none of the bounds above can be evaluated.
+
+A successful push yields a `PendingMint`, which is not a DID and MUST NOT be recorded as one. Its
+`pending_did_string` is for display of a pending mint only.
+
+**Scope of the guarantee.** The type makes "no height" unrepresentable; it cannot make a height TRUE.
+Every field of the evidence is asserted by the chain source, and in a typical deployment that source is
+the same node the bundle was pushed to — the `did_coin_id` is not a secret from it. `pushed_at_height`,
+`peak` and `confirmed_height` all come from that one source, so satisfying rules 3–5 costs a dishonest
+source nothing: it picks three consistent integers in a single round trip and returns a `Confirmed` DID
+for a bundle it never broadcast. The rules buy two real things — reorg safety against an HONEST source
+(the case that actually occurs), and rejection of degenerate values a buggy source might emit — and they
+buy no defence at all against deliberate deceit. Callers MUST therefore pass a trusted or aggregating
+`ChainSource`, never the same unvetted node used to broadcast.
+
+### 6A.2a Mint status (normative)
+
+`mint_status` MUST distinguish three states, because a caller cannot poll safely on an `Option`:
+`Confirmed` (evidence per §6A.2), `Awaiting` (carrying the blocks elapsed since the push), and `Failed` —
+the mint's source coin is reported spent while no DID coin exists, which can only mean another spend
+consumed it, since the bundle is atomic. A `Failed` mint MUST NOT be polled as though it might still
+confirm.
+
+`Failed` covers exactly ONE proven-dead cause, the one the chain can attest to. It is NOT a general
+death signal: a mint EVICTED from the mempool (the likelier death with the default zero fee) leaves the
+source coin unspent and is, on chain, indistinguishable from a slow mint — so it MUST report `Awaiting`.
+Callers MUST therefore impose their own deadline on `blocks_since_push` and re-mint when it elapses; the
+contract is that a caller always has either a proof of death or a monotonically growing number to time
+out on, never an unchanging absence.
+
+The status query MUST NOT report `Failed` for a mint whose DID coin already exists: an included mint has
+spent its source coin by way of its own bundle, and reporting that as a different spend would make a
+caller re-mint a DID it had already paid for.
+
+### 6A.3 The three outcomes are distinct (normative)
+
+`MintError::InsufficientFunds`, `MintError::Rejected` and `MintError::ChainUnreachable` MUST stay distinct
+variants and MUST NOT be collapsed: they mean "add funds", "the network answered no", and "the network did
+not answer, so the outcome is unknown". A chain read that fails MUST NOT be degraded into an empty coin
+list (which would report a funded wallet as empty), and a `mint_status` that cannot reach the chain MUST
+return `ChainUnreachable`, never `Ok(None)`.
+
+### 6A.4 Coin selection and change
+
+The funding coin is the SMALLEST confirmed, unspent coin whose amount is at least `1 + fee`. Unconfirmed
+and spent coins are neither selected nor counted toward the `available` amount reported by
+`InsufficientFunds`.
+
+A change output of exactly 1 mojo MUST NOT be created: it would share `(parent, puzzle_hash, amount)` with
+the funding coin — the same coin id twice in one spend — which consensus rejects as a duplicate output.
+Because the build is deterministic, that rejection would recur on every retry and a wallet holding exactly
+`fee + 2` mojos could never mint. The colliding mojo MUST be folded into the fee instead.
+
+### 6A.5 The signing gate (normative)
+
+Before signing, the mint MUST refuse — as `MintError::Refused` — anything outside this whitelist:
+
+- every required signature is BLS, under THIS profile's wallet key, and `AGG_SIG_ME` (a signature with no
+  domain string, i.e. `AGG_SIG_UNSAFE`, is refused); and
+- the bundle spends exactly ONE pre-existing coin — a coin whose parent is not itself spent in the same
+  bundle — and that coin pays this wallet's puzzle hash. Every other spent coin is created by the bundle.
+  (The rule is OWNERSHIP of that coin, not identity with the coin selection chose; on the single-call path
+  they are the same coin.)
+
+The general money path's `LocalMoneySigner` verifier decodes standard and CAT spends and fails closed on a
+singleton launch; it is NOT weakened for the mint. This narrower, whitelist gate applies instead.
+
+### 6A.6 The custody boundary
+
+Signing happens in-process against the unlocked account's own wallet key. The `SpendPublisher` seam
+accepts an ALREADY-SIGNED bundle and has no other method, so a node implementing it can broadcast and can
+never receive key material. The chain-read seam is the canonical `dig_chainsource_interface::ChainSource`,
+which cannot broadcast by construction.
+
 ## 7. The injected UI/auth-provider seam (host boundary)
 
 The host harness implements `AuthProvider`: `collect_factors(UnlockRequest) -> AuthFactors` (the unlock
@@ -431,6 +542,11 @@ the policy/crypto evaluation stays in-crate (§4.2).
   zeroizing the returned DEK buffer is a tracked follow-up.)
 - Every unlock/auth/custody decision is fail-closed: ambiguity resolves to an error, never a silent
   success.
+- A DID is recorded ONLY from on-chain evidence (§6A.2): `MintedDid` is unconstructible without a
+  confirmed, sufficiently-buried coin record of the exact coin the pushed mint bundle creates, whose
+  height is bounded by the chain's peak and by the peak observed before the push. The residual — a chain
+  source that lies coherently about all of them — is stated in §6A.2 and is the caller's to mitigate by
+  choosing a trusted source.
 - The crate forbids `unsafe` code (`unsafe_code = "forbid"`).
 
 ## 9. Error model
@@ -438,7 +554,8 @@ the policy/crypto evaluation stays in-crate (§4.2).
 `AccountError` (`#[non_exhaustive]`) is the single public error type: `Locked`, `ProfileNotFound`,
 `DefaultProfileInvariant`, `Keystore`, `Auth`, `Spend` (money-path verification/derivation/signing
 refusals, fail-closed), `RequireAuth`, `PolicyDenied`, and `PolicyIndeterminate` (the three distinct
-custody refusals, §6.3). Every fallible public operation returns
+custody refusals, §6.3). The mint path returns `MintError` (`#[non_exhaustive]`): `InsufficientFunds`,
+`Rejected`, `ChainUnreachable`, `Build` and `Refused` (§6A.3/§6A.5). Every other fallible public operation returns
 `Result<T, AccountError>`. Error `Display` strings MUST NOT contain secret material.
 
 ## 10. Versioning & back-compat

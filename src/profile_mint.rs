@@ -1,16 +1,20 @@
 //! Minting a new profile: a DID + dig-store are launched on-chain and bound together via
 //! `dig_social_profile::IdentityProfile`, signed with the account seed's key at the profile index.
 //!
-//! # Phase 1: signatures only
+//! # What is implemented
 //!
-//! The mint builds unsigned spends via `IdentityProfile::mint_from_did`; the account signs them with
-//! its wallet key and the node broadcasts. The full flow (DID launch, dig-store create, SMT seed,
-//! broadcast) lands in Phase 2 — this module fixes the public shape.
+//! The **DID half is live**: [`ProfileMinter::begin_did_mint`](crate::mint) builds, signs and pushes
+//! a real `did:chia:` mint, and [`ProfileMinter::mint_status`](crate::mint) turns its on-chain
+//! confirmation into [`MintedDid`](crate::mint::MintedDid) evidence. See [`crate::mint`].
+//!
+//! [`mint`](ProfileMinter::mint) — the FULL profile (DID + dig-store + SMT seed, bound into an
+//! `IdentityProfile`) — still awaits the dig-store half; it fixes the public shape only.
 
 use std::sync::Arc;
 
-use dig_session::UnlockedMasterSeed;
+use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
 use dig_social_profile::IdentityProfile;
+use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::id::ProfileIx;
@@ -26,6 +30,12 @@ impl ProfileMinter {
     /// Build a minter backed by the account's unlocked `seed`.
     pub fn new(seed: Arc<UnlockedMasterSeed>) -> Self {
         Self { seed }
+    }
+
+    /// The account's master seed bytes. `pub(crate)`: the mint derives the profile's wallet key from
+    /// them in-process, and they never cross the public API.
+    pub(crate) fn master_seed(&self) -> Zeroizing<[u8; MASTER_SEED_LEN]> {
+        self.seed.master_seed()
     }
 
     /// Mint a new profile at HD index `ix`: launch its DID + dig-store and bind them into an
