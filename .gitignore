@@ -1,1 +1,4 @@
 target/
+
+# cargo-mutants scratch output (regenerable; a full run is minutes of CPU, never a build input)
+mutants.out*/

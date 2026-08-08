@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
+use crate::session_residency::Residency;
 use crate::signer::ProfileSigner;
 use crate::wallet::authorizer::WalletOps;
 
@@ -34,6 +35,9 @@ pub struct UnlockedAccount {
     account: AccountId,
     seed: Arc<UnlockedMasterSeed>,
     default_profile_ix: ProfileIx,
+    /// The liveness token every capability derived from this unlock shares, so
+    /// [`lock`](Self::lock) revokes them all rather than merely dropping one reference to the seed.
+    residency: Arc<Residency>,
 }
 
 impl UnlockedAccount {
@@ -47,7 +51,16 @@ impl UnlockedAccount {
             account,
             seed,
             default_profile_ix,
+            residency: Arc::new(Residency::new()),
         }
+    }
+
+    /// The liveness token for this unlock — live until [`lock`](Self::lock).
+    ///
+    /// Exposed so a host can ask whether the capabilities it holds are still valid without having to
+    /// attempt an operation. It cannot be revoked through this handle.
+    pub fn residency(&self) -> Arc<Residency> {
+        self.residency.clone()
     }
 
     /// The account this handle unlocked.
@@ -66,8 +79,16 @@ impl UnlockedAccount {
     }
 
     /// The wallet-ops handle for the default profile (money-path derivations + signing seam).
+    ///
+    /// The handle observes this unlock's [`Residency`], so a money signer built from it stops signing
+    /// the moment [`lock`](Self::lock) is called — it does not hold a snapshot that outlives the
+    /// session.
     pub fn wallet_ops(&self) -> WalletOps {
-        WalletOps::new(self.seed.clone(), self.default_profile_ix)
+        WalletOps::new(
+            self.seed.clone(),
+            self.default_profile_ix,
+            self.residency.clone(),
+        )
     }
 
     /// The per-profile data-encryption key (DEK) for profile `ix` — 32 bytes, derived from the seed
@@ -113,10 +134,16 @@ impl UnlockedAccount {
         self.seed.master_seed()
     }
 
-    /// Relock immediately, dropping the live seed.
+    /// Relock immediately: revoke every capability derived from this unlock, and drop the seed.
+    ///
+    /// Revoking is what makes this authoritative. Consuming `self` drops only ONE reference to the
+    /// seed, so a surviving [`WalletOps`] would otherwise keep the bytes resident AND keep signing;
+    /// after this call such a handle refuses with [`Locked`](crate::error::AccountError::Locked)
+    /// regardless of who else still holds the seed.
     pub fn lock(self) {
-        // Consuming `self` drops the `Arc<UnlockedMasterSeed>`; when the last handle drops, the seed
-        // is zeroized.
+        self.residency.revoke();
+        // Dropping `self` releases this handle's `Arc<UnlockedMasterSeed>`; the bytes are zeroized
+        // once the last surviving handle drops.
     }
 }
 

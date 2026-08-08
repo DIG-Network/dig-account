@@ -26,28 +26,57 @@
 //! exposes NO accessor to the seed or money key — signing is the only operation. It deliberately
 //! implements neither `Debug`, `Clone`, nor `Serialize`.
 
-use chia_bls::Signature;
-use chia_protocol::{Bytes32, CoinSpend};
+use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature as SdkRequiredSignature};
-use dig_wallet_backend::client::{derive_summary, LocalSigner, MasterKey};
+use dig_wallet_backend::client::{LocalSigner, MasterKey};
 use dig_wallet_backend::types::{
     IdentityRef, Network, RequiredSignature, SignedBundle, UnsignedSpend, WalletId,
 };
 
-use crate::error::{AccountError, Result};
+use std::sync::Arc;
 
-/// Signs verified coin spends for the money path.
+use dig_session::UnlockedMasterSeed;
+
+use crate::error::{AccountError, Result};
+use crate::id::ProfileIx;
+use crate::keys::wallet_key::WalletKey;
+use crate::session_residency::Residency;
+use crate::wallet::approval::SpendApproval;
+
+/// Signs an APPROVED spend for the money path.
 ///
-/// Implementations re-derive the required aggregate signature from the coin spends themselves; they
+/// # This is the crate's only route to a signature, and it demands an approval
+///
+/// There is deliberately no method that turns `&[CoinSpend]` into a signature. "Authorized before
+/// signed" used to be a sentence in the specification with nothing enforcing it; now an unauthorized
+/// spend simply has no type that can reach a signer, because the only argument this trait accepts is a
+/// [`SpendApproval`] and the only minter of one is
+/// [`PolicyAuthorizer`](crate::wallet::enforcer::PolicyAuthorizer).
+///
+/// Implementations re-derive the required aggregate signature from the approval's own coin spends; they
 /// never sign opaque caller-supplied bytes. See the module docs for the fail-closed contract the sole
 /// concrete impl ([`LocalMoneySigner`]) honours.
 pub trait MoneySigner: Send + Sync {
-    /// Verify and sign the given `coin_spends`, returning the aggregate BLS signature.
+    /// Sign the spends `approval` carries, returning the broadcast-ready [`SpendBundle`].
     ///
-    /// Fail-closed: a coin-spend set that cannot be independently verified — value not conserved, a
-    /// non-quote delegated puzzle, a non-`AGG_SIG_ME` requirement, an output that leaves the wallet
-    /// without being an accounted-for recipient — is refused, never signed.
-    fn sign_coin_spends(&self, coin_spends: &[CoinSpend]) -> Result<Signature>;
+    /// Takes the approval **by value**, and [`SpendApproval`] is not `Clone` — so signing the same
+    /// approval twice is a use-after-move compile error rather than a runtime replay check.
+    ///
+    /// The returned bundle pairs the signature with the approval's OWN coin spends, so a caller cannot
+    /// pair the signature it receives with different bytes.
+    ///
+    /// Fail-closed: before any `bls_sign` runs, the vetted core re-derives the value flow from these
+    /// very coin spends and requires value conservation, quote-form delegated puzzles, a sole
+    /// `AGG_SIG_ME` per coin, and wallet-owned change.
+    ///
+    /// It ALSO compares the `UnsignedSpend.summary` parameter against its own re-derivation. **That
+    /// comparison is not a check this crate relies on, and this crate does not claim it as one:** the
+    /// parameter is the gate's derivation of the same bytes, so the two sides can only ever agree. It is
+    /// a required field being filled correctly, not a second opinion — a second opinion would have to
+    /// come from an independent derivation, which is precisely the two-answers-can-disagree shape the
+    /// owned approval exists to remove. The property that protects the caller is that the bytes signed
+    /// are the bytes the gate judged, because they are the same `Vec`.
+    fn sign_approved(&self, approval: SpendApproval) -> Result<SpendBundle>;
 }
 
 /// The concrete money signer: a canonical-wallet `dig-wallet-backend` [`LocalSigner`] wrapped so the
@@ -60,27 +89,63 @@ pub trait MoneySigner: Send + Sync {
 /// authorize spends of the wallet's real coins. The legacy `m/44'` profile scheme is NEVER used: it
 /// controls a distinct, never-funded key set and would fund-lock coins.
 pub struct LocalMoneySigner {
-    /// The vetted verify+sign core, holding the master key inside the client seam. No accessor
-    /// exposes the key; signing is the only operation.
-    inner: LocalSigner,
+    /// The LIVE unlocked seed, shared with the [`UnlockedAccount`](crate::unlocked::UnlockedAccount)
+    /// that produced this signer — never a copy of the bytes. The money key is derived per signature,
+    /// so there is no long-lived key material here to outlive the session.
+    seed: Arc<UnlockedMasterSeed>,
+    /// The unlock's liveness. Checked before every signature, so `lock()` is a revocation rather than
+    /// a hint.
+    residency: Arc<Residency>,
+    profile_ix: ProfileIx,
+    network: Network,
 }
 
 impl LocalMoneySigner {
-    /// Build a canonical-wallet money signer from raw master-seed bytes, for `profile_ix` on
-    /// `network`.
+    /// Build a canonical-wallet money signer scoped to one unlock.
     ///
-    /// `pub(crate)`: only the in-crate money path (via `WalletOps`) constructs one, so the seed bytes
-    /// never cross the public API. The bytes are moved into the signer's zeroizing master-key buffer.
+    /// `pub(crate)`: only the in-crate money path (via `WalletOps`) constructs one, so neither the seed
+    /// nor its residency crosses the public API.
+    ///
+    /// Nothing is derived here. The money key is derived per signature from the SHARED live seed, which
+    /// is what makes `lock()` effective: a signer that had copied the seed at construction would keep
+    /// signing after the session ended, and no amount of documentation asking hosts to rebuild it would
+    /// change that.
     pub(crate) fn new_canonical(
-        seed_bytes: Vec<u8>,
-        profile_ix: u32,
+        seed: Arc<UnlockedMasterSeed>,
+        residency: Arc<Residency>,
+        profile_ix: ProfileIx,
         network: Network,
-    ) -> Result<Self> {
-        let identity = IdentityRef::new(WalletId(0)).with_profile(profile_ix);
-        let master = MasterKey::from_seed_bytes(seed_bytes);
-        let inner = LocalSigner::new_canonical(identity, master, network)
-            .map_err(|e| AccountError::Spend(format!("cannot build money signer: {e}")))?;
-        Ok(Self { inner })
+    ) -> Self {
+        Self {
+            seed,
+            residency,
+            profile_ix,
+            network,
+        }
+    }
+
+    /// The vetted verify+sign core for the CURRENT session, or [`Locked`](AccountError::Locked).
+    ///
+    /// Called once per signature. The liveness check comes FIRST, so no key material is derived for a
+    /// relocked account — a revoked residency does not merely fail the operation, it prevents the
+    /// derivation happening at all.
+    fn live_signer(&self) -> Result<LocalSigner> {
+        if !self.residency.is_live() {
+            return Err(AccountError::Locked);
+        }
+        let identity = IdentityRef::new(WalletId(0)).with_profile(self.profile_ix.0);
+        let master = MasterKey::from_seed_bytes(self.seed.master_seed().to_vec());
+        LocalSigner::new_canonical(identity, master, self.network)
+            .map_err(|e| AccountError::Spend(format!("cannot build money signer: {e}")))
+    }
+
+    /// The puzzle hash of the wallet this signer signs for, derived from the LIVE seed.
+    ///
+    /// Derived here rather than stored so it comes from the session rather than from whatever was
+    /// true at construction — which is what makes the scope check a comparison of two independently
+    /// obtained facts rather than a restatement of one.
+    fn wallet_puzzle_hash(&self) -> Bytes32 {
+        WalletKey::from_seed_at(&self.seed.master_seed()[..], self.profile_ix).puzzle_hash()
     }
 
     /// Verify and sign an engine-supplied [`UnsignedSpend`], returning the broadcast-ready bundle.
@@ -88,11 +153,18 @@ impl LocalMoneySigner {
     /// The engine-supplied `required_signatures` are NOT trusted as a signing source: the inner
     /// signer re-derives the authoritative set from the coin spends, cross-checks the engine's claim
     /// against it, and signs ONLY the re-derived set — so a mismatched or padded engine claim is
-    /// refused fail-closed (the signing-oracle defense). Use this when a spend already carries a
-    /// summary + required-signature claim to verify; use [`sign_coin_spends`](Self::sign_coin_spends)
-    /// when only the coin spends are on hand.
-    pub fn sign_unsigned(&self, unsigned: &UnsignedSpend) -> Result<SignedBundle> {
-        self.inner
+    /// refused fail-closed (the signing-oracle defense).
+    ///
+    /// `pub(crate)`: it accepts an [`UnsignedSpend`] whose `summary` field is a CALLER'S CLAIM, which
+    /// is the same defect one layer over — a public door into signing that no custody gate stands in
+    /// front of. Only [`sign_approved`](MoneySigner::sign_approved) calls it, with a summary the gate
+    /// derived itself.
+    pub(crate) fn sign_unsigned(
+        &self,
+        signer: &LocalSigner,
+        unsigned: &UnsignedSpend,
+    ) -> Result<SignedBundle> {
+        signer
             .sign_unsigned(unsigned)
             .map_err(|e| AccountError::Spend(format!("spend signing refused: {e}")))
     }
@@ -104,9 +176,12 @@ impl LocalMoneySigner {
     /// inside [`sign_unsigned`](Self::sign_unsigned) passes for a legitimate spend. A non-`AGG_SIG_ME`
     /// requirement is carried through unchanged and refused by the inner signer (which re-derives and
     /// rejects it); a `secp` requirement — never expected in a wallet spend — is refused here.
-    fn required_signatures(&self, coin_spends: &[CoinSpend]) -> Result<Vec<RequiredSignature>> {
+    fn required_signatures(
+        signer: &LocalSigner,
+        coin_spends: &[CoinSpend],
+    ) -> Result<Vec<RequiredSignature>> {
         let mut allocator = clvmr::Allocator::new();
-        let constants = AggSigConstants::new(Bytes32::new(self.inner.agg_sig_me_extra_data()));
+        let constants = AggSigConstants::new(Bytes32::new(signer.agg_sig_me_extra_data()));
         let extracted =
             SdkRequiredSignature::from_coin_spends(&mut allocator, coin_spends, &constants)
                 .map_err(|e| {
@@ -132,19 +207,25 @@ impl LocalMoneySigner {
 }
 
 impl MoneySigner for LocalMoneySigner {
-    fn sign_coin_spends(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {
-        // The authoritative summary comes from the coin spends themselves (#1058), never a caller
-        // claim; deriving it also runs the independent verify gate (value conservation, quote-form,
-        // sole-AGG_SIG_ME) and fails closed before any signing.
-        let summary = derive_summary(coin_spends)
-            .map_err(|e| AccountError::Spend(format!("cannot derive spend summary: {e}")))?;
-        let required_signatures = self.required_signatures(coin_spends)?;
+    fn sign_approved(&self, approval: SpendApproval) -> Result<SpendBundle> {
+        // Liveness first: a relocked session must not even derive a key, let alone use one.
+        let signer = self.live_signer()?;
+
+        // Then admission: this permission must have been minted by the gate for THIS wallet. The
+        // gate judges a spend's outputs and never learns whose key controls the inputs, so without
+        // this a permission from any profile's gate would authorize any profile's signer.
+        approval
+            .scope()
+            .assert_signable_by(self.profile_ix, self.wallet_puzzle_hash())?;
+
+        // The summary is the gate's OWN derivation, carried by the approval — not re-derived here.
+        // Two derivations of the same spend are two answers that could differ; one answer cannot.
         let unsigned = UnsignedSpend {
-            coin_spends: coin_spends.to_vec(),
-            required_signatures,
-            summary,
+            coin_spends: approval.coin_spends().to_vec(),
+            required_signatures: Self::required_signatures(&signer, approval.coin_spends())?,
+            summary: approval.verified().clone(),
         };
-        Ok(self.sign_unsigned(&unsigned)?.bundle.aggregated_signature)
+        Ok(self.sign_unsigned(&signer, &unsigned)?.bundle)
     }
 }
 
@@ -153,26 +234,117 @@ mod tests {
     use super::*;
     use crate::id::ProfileIx;
     use crate::keys::wallet_key::WalletKey;
+    use crate::wallet::summary::{SpendSummary, SpendTier};
     use chia_bls::{aggregate_verify, PublicKey};
     use chia_protocol::{Bytes, Coin};
     use chia_puzzle_types::Memos;
     use chia_wallet_sdk::driver::{Spend, SpendContext, StandardLayer};
     use chia_wallet_sdk::types::conditions::AggSigUnsafe;
     use chia_wallet_sdk::types::{Condition, Conditions};
+    use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
+    use dig_wallet_backend::client::derive_summary;
 
-    // A deterministic, all-`0x42` seed — the SAME fixture the WalletKey golden vector is pinned on,
-    // so the cross-round-trip test proves the signer signs the golden money key.
-    const SEED: [u8; 32] = [0x42; 32];
+    // A deterministic, all-`0x42` BIP-39 ENTROPY — the SAME fixture the WalletKey golden vector is
+    // pinned on, so the cross-round-trip test proves the signer signs the golden money key.
+    const ENTROPY: [u8; 32] = [0x42; 32];
     const PROFILE: u32 = 0;
 
-    /// The account's canonical money key for `SEED` at the default profile — its synthetic public key
-    /// curries the coins the signer must be able to spend.
+    /// The account's master HD root for `ENTROPY`, expanded INDEPENDENTLY through the `bip39` crate
+    /// rather than through dig-session.
+    ///
+    /// Since dig-account 0.2.0 the custody root is the 64-byte BIP-39 expansion of the enrolled
+    /// entropy, not the entropy itself, so deriving the fixture key straight from `ENTROPY` names a
+    /// wallet the signer does not hold. Expanding here — from the standard, not from the dependency —
+    /// keeps the golden below anchored to BIP-39 rather than to whatever dig-session happens to do.
+    fn master_root() -> [u8; MASTER_SEED_LEN] {
+        bip39::Mnemonic::from_entropy_in(bip39::Language::English, &ENTROPY)
+            .expect("32 bytes is valid 24-word BIP-39 entropy")
+            .to_seed("")
+    }
+
+    /// The account's canonical money key for `ENTROPY` at the default profile — its synthetic public
+    /// key curries the coins the signer must be able to spend.
+    ///
+    /// This is the derivation `WalletOps::wallet_key` runs on the LIVE session root, so the coins
+    /// these fixtures build are the coins the signer actually owns.
     fn money_key() -> WalletKey {
-        WalletKey::from_seed_at(&SEED, ProfileIx(PROFILE))
+        WalletKey::from_seed_at(&master_root()[..], ProfileIx(PROFILE))
+    }
+
+    /// The all-`0x42` seed, enrolled into a real session so the signer holds a LIVE residency rather
+    /// than a copy of the bytes — the same construction `WalletOps` uses.
+    fn unlocked_seed() -> Arc<UnlockedMasterSeed> {
+        use dig_keystore::{BackendKey, MemoryBackend};
+        use dig_session::{Password, Session};
+        Arc::new(
+            Session::enroll_master_seed(
+                Arc::new(MemoryBackend::new()),
+                BackendKey::new("money-signer-tests".to_string()),
+                Password::new("pw"),
+                &ENTROPY,
+            )
+            .expect("the fixture seed must enrol"),
+        )
     }
 
     fn signer() -> LocalMoneySigner {
-        LocalMoneySigner::new_canonical(SEED.to_vec(), PROFILE, Network::Mainnet).unwrap()
+        signer_for(Arc::new(Residency::new()))
+    }
+
+    /// A signer scoped to `residency`, so a test can revoke the session out from under it.
+    fn signer_for(residency: Arc<Residency>) -> LocalMoneySigner {
+        LocalMoneySigner::new_canonical(
+            unlocked_seed(),
+            residency,
+            ProfileIx(PROFILE),
+            Network::Mainnet,
+        )
+    }
+
+    /// The vetted core for a live session — what the signer derives per signature.
+    fn live_core() -> LocalSigner {
+        signer().live_signer().expect("a live session must derive")
+    }
+
+    /// Run the derivation the CUSTODY GATE runs, which is what stands between a spend and an approval.
+    ///
+    /// These refusal tests are claims about dig-account's own gate, so they must go through
+    /// dig-account's own entry point. Asserting on the dependency's `derive_summary` directly would
+    /// put no dig-account symbol under test at all: the tests would keep passing if this crate stopped
+    /// calling it, which is precisely the regression they exist to catch.
+    fn gate_derivation(coin_spends: &[CoinSpend]) -> Result<SpendSummary> {
+        SpendSummary::from_coin_spends(coin_spends, SpendTier::AutoSend)
+    }
+
+    /// Mint an approval over `coin_spends` the way the custody gate would, so the signer can be
+    /// exercised in ISOLATION.
+    ///
+    /// The gate refuses several of the malformed spends below before a signature is ever contemplated
+    /// — which is the correct ordering, and is asserted over in `enforcer.rs`. That ordering would,
+    /// however, leave the SIGNER's own fail-closed arms (the required-signature cross-check, the
+    /// `AGG_SIG_ME`-only rule, the quote-form rule) untestable from outside, and a defense that cannot
+    /// be tested is a defense nobody is holding. Minting here is possible only because these tests live
+    /// INSIDE the crate: `SpendApproval::new` is `pub(crate)`, so no consumer can do this.
+    fn approval_over(coin_spends: &[CoinSpend]) -> SpendApproval {
+        let verified = derive_summary(coin_spends).expect("fixture must be derivable");
+        let summary = SpendSummary::from_coin_spends(coin_spends, SpendTier::AutoSend)
+            .expect("fixture must be summarizable");
+        // Scoped to the very wallet `signer()` signs with, so these tests exercise the signer's own
+        // fail-closed arms rather than tripping the admission check, which has its own tests.
+        let scope = crate::wallet::policy::CustodyScope::new(
+            ProfileIx(PROFILE),
+            &crate::wallet::policy::CustodyPolicy::Hot(Default::default()),
+            money_key().puzzle_hash(),
+        );
+        SpendApproval::new(coin_spends.to_vec(), summary, verified, scope)
+    }
+
+    /// Sign `coin_spends` through a freshly-minted approval, returning just the aggregate signature —
+    /// the shape the pre-0.5.0 `sign_coin_spends` had, kept only as a test convenience.
+    fn sign(coin_spends: &[CoinSpend]) -> Result<chia_bls::Signature> {
+        signer()
+            .sign_approved(approval_over(coin_spends))
+            .map(|bundle| bundle.aggregated_signature)
     }
 
     /// A coin sitting at the wallet's own standard puzzle hash — the signer must own it to spend it.
@@ -216,12 +388,12 @@ mod tests {
     #[test]
     fn legit_standard_send_signs_and_verifies() {
         let coin_spends = legit_xch_send(600, 10, 1_000);
-        let signature = signer().sign_coin_spends(&coin_spends).unwrap();
+        let signature = sign(&coin_spends).unwrap();
 
         // Re-derive the (public key, message) pairs the spend requires and confirm the aggregate
         // verifies against every one — a real signature over the real spend, not merely "no error".
         let mut allocator = clvmr::Allocator::new();
-        let constants = AggSigConstants::new(Bytes32::new(signer().inner.agg_sig_me_extra_data()));
+        let constants = AggSigConstants::new(Bytes32::new(live_core().agg_sig_me_extra_data()));
         let pairs: Vec<(PublicKey, Vec<u8>)> =
             SdkRequiredSignature::from_coin_spends(&mut allocator, &coin_spends, &constants)
                 .unwrap()
@@ -276,7 +448,7 @@ mod tests {
         Cat::spend_all(&mut ctx, &[CatSpend::new(cat, inner)]).unwrap();
 
         let coin_spends = ctx.take();
-        let result = signer().sign_coin_spends(&coin_spends);
+        let result = sign(&coin_spends);
         assert!(
             result.is_ok(),
             "a conserving CAT send from the wallet's own key must sign: {result:?}"
@@ -291,7 +463,8 @@ mod tests {
     fn engine_supplied_required_signatures_are_not_an_oracle() {
         let coin_spends = legit_xch_send(600, 10, 1_000);
         let summary = derive_summary(&coin_spends).unwrap();
-        let honest = signer().required_signatures(&coin_spends).unwrap();
+        let core = live_core();
+        let honest = LocalMoneySigner::required_signatures(&core, &coin_spends).unwrap();
 
         // A malicious engine appends an extra AGG_SIG_ME over an attacker-chosen message for the
         // wallet's own key — a blank-check it hopes the signer will blindly honour.
@@ -306,12 +479,18 @@ mod tests {
             summary,
         };
 
-        let err = signer().sign_unsigned(&unsigned).unwrap_err();
+        let err = signer().sign_unsigned(&core, &unsigned).unwrap_err();
         assert!(matches!(err, AccountError::Spend(_)), "{err:?}");
     }
 
     /// (b) `AGG_SIG_ME`-only: a spend whose delegated puzzle emits an `AGG_SIG_UNSAFE` (a raw,
-    /// coin-unbound, attacker-chosen message) is refused fail-closed rather than signed.
+    /// coin-unbound, attacker-chosen message) is refused fail-closed rather than signed — and refused
+    /// so early that NO APPROVAL CAN EXIST for it.
+    ///
+    /// The assertion is about WHERE, not merely that it fails: the refusal happens in the derivation
+    /// the custody gate runs, so the spend never becomes signable in the first place. Asserting only
+    /// that the signer refused would keep passing on an implementation that minted an approval for a
+    /// blank-check spend and then declined to use it — a state this shape exists to make unreachable.
     #[test]
     fn agg_sig_unsafe_requirement_is_refused() {
         let mut ctx = SpendContext::new();
@@ -330,14 +509,18 @@ mod tests {
             .spend(&mut ctx, wallet_coin(1_000, 1), conditions)
             .unwrap();
 
-        let err = signer().sign_coin_spends(&ctx.take()).unwrap_err();
-        assert!(matches!(err, AccountError::Spend(_)), "{err:?}");
+        let refused = gate_derivation(&ctx.take()).unwrap_err();
+        assert!(
+            refused.to_string().contains("AGG_SIG_ME"),
+            "the gate's derivation must refuse a non-AGG_SIG_ME requirement by name: {refused}"
+        );
     }
 
     /// (c) Quote-form required: a standard-layer coin whose delegated puzzle is the solution-malleable
     /// IDENTITY program (`1`, an echo that returns its solution as the condition list) rather than the
     /// canonical `(q . conditions)` quote is refused — the signed message (a tree-hash of the
-    /// delegated puzzle) would not commit to the actual outputs, so the signer will not sign it.
+    /// delegated puzzle) would not commit to the actual outputs. As with the `AGG_SIG_UNSAFE` case, the
+    /// gate's own derivation refuses it, so no approval over such a spend can be minted.
     #[test]
     fn solution_malleable_delegated_puzzle_is_refused() {
         let mut ctx = SpendContext::new();
@@ -357,38 +540,45 @@ mod tests {
             .unwrap();
         ctx.spend(wallet_coin(1_000, 1), spend).unwrap();
 
-        let err = signer().sign_coin_spends(&ctx.take()).unwrap_err();
-        assert!(matches!(err, AccountError::Spend(_)), "{err:?}");
+        let refused = gate_derivation(&ctx.take()).unwrap_err();
+        assert!(
+            refused.to_string().contains("quote-form"),
+            "the gate's derivation must refuse a solution-malleable puzzle by name: {refused}"
+        );
     }
 
-    /// An empty coin-spend set is refused fail-closed (no signature over nothing).
+    /// An empty coin-spend set is refused fail-closed — and refused BY THE GATE, before an approval
+    /// could exist: `derive_summary` cannot account for a spend of nothing, so `approval_over` never
+    /// gets to mint one.
     #[test]
-    fn empty_coin_spends_are_refused() {
-        let err = signer().sign_coin_spends(&[]).unwrap_err();
-        assert!(matches!(err, AccountError::Spend(_)));
+    fn empty_coin_spends_are_refused_before_an_approval_can_be_minted() {
+        assert!(
+            gate_derivation(&[]).is_err(),
+            "no approval can be minted over an empty spend set"
+        );
     }
 
     /// CROSS-ROUND-TRIP GOLDEN: the key the canonical signer signs with is byte-identical to
     /// dig-account's `WalletKey` money key for the same seed — the pinned golden
-    /// (pk `884cc9a2…`). A legit send's required signature names exactly that public key, and the
+    /// (pk `adffff01…`). A legit send's required signature names exactly that public key, and the
     /// produced aggregate verifies against it. This proves WalletOps' money address == what
     /// `LocalSigner::new_canonical` signs (the whole point of the canonical constructor).
     #[test]
     fn signs_the_pinned_golden_money_key() {
         const GOLDEN_SYNTHETIC_PK: [u8; 48] = [
-            0x88, 0x4c, 0xc9, 0xa2, 0xb2, 0x8a, 0x0a, 0xef, 0xe6, 0x2a, 0xb1, 0xcc, 0xc6, 0xc5,
-            0xe6, 0x38, 0xe4, 0x82, 0x24, 0xd1, 0xa1, 0x8a, 0x01, 0x52, 0x60, 0xb4, 0x05, 0x87,
-            0xe0, 0x7c, 0x91, 0x32, 0xe9, 0x29, 0xc3, 0xc3, 0xc1, 0x13, 0x54, 0x94, 0xcd, 0x11,
-            0xcc, 0x70, 0xb3, 0x6d, 0x7c, 0x34,
+            0xad, 0xff, 0xff, 0x01, 0x8d, 0xd7, 0xe4, 0x5e, 0x51, 0x71, 0x79, 0x6d, 0x8c, 0xa0,
+            0x04, 0xd7, 0xc7, 0xca, 0xdd, 0x10, 0x02, 0x58, 0xfb, 0xdb, 0x5f, 0x65, 0xa2, 0xda,
+            0x40, 0x48, 0x42, 0x4a, 0x32, 0x41, 0xf5, 0x47, 0x63, 0x72, 0xf7, 0xc4, 0x26, 0xf3,
+            0xc7, 0xc0, 0xa4, 0xef, 0x3a, 0x58,
         ];
         // Sanity: the fixture key IS the pinned golden money key.
         assert_eq!(money_key().public_key().to_bytes(), GOLDEN_SYNTHETIC_PK);
 
         let coin_spends = legit_xch_send(600, 10, 1_000);
-        let signature = signer().sign_coin_spends(&coin_spends).unwrap();
+        let signature = sign(&coin_spends).unwrap();
 
         let mut allocator = clvmr::Allocator::new();
-        let constants = AggSigConstants::new(Bytes32::new(signer().inner.agg_sig_me_extra_data()));
+        let constants = AggSigConstants::new(Bytes32::new(live_core().agg_sig_me_extra_data()));
         let golden_pk = PublicKey::from_bytes(&GOLDEN_SYNTHETIC_PK).unwrap();
         let message =
             SdkRequiredSignature::from_coin_spends(&mut allocator, &coin_spends, &constants)

@@ -2,16 +2,60 @@
 //! re-derived effect of a spend, never an engine-supplied claim.
 //!
 //! A [`SpendSummary`] is built from the coin spends alone via
-//! [`derive_summary`](dig_wallet_backend::client::derive_summary) (which re-parses the coin spends
-//! through the chia-wallet-sdk drivers and reconstructs the recipients + fee, SPEC §4/#1058) plus a
-//! [`SpendTier`] classifying how the spend must be handled under the profile's
+//! [`analyze`](dig_wallet_backend::client::analyze) (which re-parses them through the chia-wallet-sdk
+//! drivers and reconstructs every created coin plus the fee, SPEC §4/#1058) plus a [`SpendTier`]
+//! classifying how the spend must be handled under the profile's
 //! [`CustodyPolicy`](crate::wallet::policy::CustodyPolicy). The harness renders this structure so the
-//! user confirms the EXACT recipients + amounts the signature will authorize.
+//! user confirms the EXACT destinations + amounts the signature will authorize.
+//!
+//! # Why every output counts, hinted or not
+//!
+//! `analyze` splits created coins into HINTED "recipients" and un-hinted "change". Summarizing only
+//! the hinted half would make the summary a view **the spend's author chooses what appears in**:
+//! dropping a memo moves an output out of sight, and with it out of the amount limits, out of the
+//! vault's destination rule, and out of the line the human confirms. A one-mojo fee could then be
+//! displayed and charged while the signature authorized six orders of magnitude more.
+//!
+//! So a [`SpendSummary`] counts **every** created coin except those paying a **proven p2 destination
+//! of this very spend** — a puzzle hash shown to be a bare
+//! `p2_delegated_puzzle_or_hidden_puzzle` curried over the key that a coin being spent is itself
+//! locked under. That is the one case where value demonstrably has not moved: it went back to an
+//! address whose spending conditions the spender just demonstrated they satisfy. Hint status is never
+//! consulted, so no output can hide by not being hinted.
+//!
+//! # Why "a puzzle hash the spend is spending from" is NOT the same question
+//!
+//! An earlier form of this rule excused any output paying any spent coin's `coin.puzzle_hash`. For a
+//! plain XCH coin those coincide, so it looked equivalent. **For every WRAPPED coin they do not.** A
+//! CAT coin's `puzzle_hash` is the CAT layer curried over its tail and inner puzzle; paying mojos there
+//! does not return them to the spender, it makes them permanently **unspendable**, because the CAT
+//! layer demands a lineage proof no XCH parent can supply. The same holds for an NFT, a DID, a
+//! singleton or an offer-settlement coin: each is a wrapper whose hash is not a payable destination.
+//! Since the wallet may hold ANY of those — a dust CAT can be airdropped to it without permission — an
+//! attacker could hide a 999,999-mojo output behind such a hash and have the gate weigh 1 mojo.
+//!
+//! The repair is not a list of wrapper layers to exclude; the next layer would walk past it. It is to
+//! invert the burden and **require proof of p2-ness**, so an output is excused only when this crate can
+//! show where the value went. Anything it cannot prove — an unparseable reveal, a wrapper, a reveal
+//! whose curry does not reproduce its own coin's hash — is COUNTED. Same reasoning that made the owned
+//! approval better than a digest: ask the question you actually mean.
+//!
+//! It is deliberately CONSERVATIVE in the safe direction: change sent to a fresh derivation of the same
+//! wallet is counted, because this layer holds no key and cannot tell that address from a stranger's.
+//! Over-counting escalates a spend to the human; under-counting approves one. Only the latter is a
+//! custody failure.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
-use chia_protocol::CoinSpend;
-use dig_wallet_backend::client::derive_summary;
+use chia_protocol::{Bytes32, CoinSpend};
+use chia_puzzle_types::standard::StandardArgs;
+use chia_wallet_sdk::driver::{Layer, Puzzle, StandardLayer};
+use chia_wallet_sdk::utils::Address;
+use clvmr::serde::node_from_bytes;
+use clvmr::Allocator;
+use dig_wallet_backend::client::{analyze, DecodedOutput, SpendEffect};
+use dig_wallet_backend::types::{Amount, AssetId, SpendOutput, TransactionSummary};
 
 use crate::error::{AccountError, Result};
 use crate::wallet::policy::CustodyPolicy;
@@ -78,12 +122,10 @@ impl SpendSummary {
     /// # This constructor is not safe to authorize against
     ///
     /// A hand-built summary describes whatever its caller says it describes, and nothing connects it
-    /// to any coin spend. A custody gate that authorizes one of these has approved a FICTION: the
-    /// money signer signs `[CoinSpend]`, re-derives its own summary, and checks it against itself, so
-    /// a one-mojo summary can be authorized and a billion-mojo spend signed with every advertised
-    /// bound satisfied. Use [`from_coin_spends`](Self::from_coin_spends) — over the EXACT coin spends
-    /// about to be signed — for anything a policy will judge; this constructor is for tests and for
-    /// rendering a summary that was derived elsewhere.
+    /// to any coin spend. **It also has nowhere to go:** since 0.5.0 no API in this crate accepts a
+    /// `&SpendSummary` for a custody decision — the gate takes `&[CoinSpend]` and derives its own, and
+    /// the signer takes only a [`SpendApproval`](crate::wallet::approval::SpendApproval) minted by
+    /// that gate. So this constructor builds a value for DISPLAY and for tests, carrying no authority.
     pub fn new(tier: SpendTier, recipients: Vec<SpendRecipient>, fee: u64) -> Self {
         Self {
             tier,
@@ -94,38 +136,46 @@ impl SpendSummary {
 
     /// Re-derive a summary straight from `coin_spends`, tagging it with `tier`.
     ///
-    /// The recipients + fee come from [`derive_summary`] — the coin spends re-parsed through the
-    /// chia-wallet-sdk drivers — so the confirm surface shows what the signature will ACTUALLY
-    /// authorize, never an engine-supplied summary. Fail-closed: a coin-spend set the driver cannot
-    /// fully account for is refused (the same gate the money signer enforces before signing).
+    /// Counts every created coin that leaves — see the module docs for why hinted-vs-un-hinted is not
+    /// a distinction a custody summary may rely on. Fail-closed: a coin-spend set the driver cannot
+    /// fully account for is refused, before any custody decision or signature exists.
     pub fn from_coin_spends(coin_spends: &[CoinSpend], tier: SpendTier) -> Result<Self> {
-        let derived = derive_summary(coin_spends)
-            .map_err(|e| AccountError::Spend(format!("cannot derive spend summary: {e}")))?;
-        let recipients = derived
-            .outputs
-            .into_iter()
-            .map(|output| SpendRecipient {
-                address: output.address.0,
-                amount_mojos: output.amount.mojos(),
-                asset_id: output.asset_id.map(|asset| asset.0),
-            })
-            .collect();
-        Ok(Self {
+        Ok(Self::from_effect(
+            &derive_effect(coin_spends)?,
+            coin_spends,
             tier,
-            recipients,
-            fee: derived.fee.mojos(),
-        })
+        ))
     }
 
     /// Re-derive a summary from `coin_spends` and classify its [`SpendTier`] under `policy`.
     ///
-    /// Convenience over [`from_coin_spends`](Self::from_coin_spends) +
-    /// [`SpendTier::classify`]: derives the recipients + fee, then tiers the spend by its native total
-    /// (XCH moved plus fee) against the profile's custody policy.
+    /// A display-side convenience (`WalletOps::summarize`). A custody decision goes through
+    /// [`DerivedSpend::derive`], which produces this same summary ALONGSIDE the checked total and the
+    /// dependency-facing derivation the signer needs, so the gate parses the spend exactly once.
     pub fn classified(coin_spends: &[CoinSpend], policy: &CustodyPolicy) -> Result<Self> {
-        let mut summary = Self::from_coin_spends(coin_spends, SpendTier::Confirm)?;
-        summary.tier = SpendTier::classify(policy, summary.checked_native_total_mojos()?);
-        Ok(summary)
+        Ok(DerivedSpend::derive(coin_spends, policy)?.summary)
+    }
+
+    /// Project the driver's re-parse into this crate's display/policy view, tagged with `tier`.
+    ///
+    /// Recipients and change are treated ALIKE and filtered by DESTINATION: an output is counted unless
+    /// it pays a [`p2_destinations`] member — a puzzle hash PROVEN to be a payable address of this
+    /// spend. Everything else is counted, including every wrapper layer's hash, because value sent
+    /// there has left the spender's control (see the module docs).
+    fn from_effect(effect: &SpendEffect, coin_spends: &[CoinSpend], tier: SpendTier) -> Self {
+        let returns_to_spender = p2_destinations(coin_spends);
+
+        Self {
+            tier,
+            recipients: effect
+                .recipients
+                .iter()
+                .chain(effect.change.iter())
+                .filter(|output| !returns_to_spender.contains(&output.puzzle_hash))
+                .map(destination_line)
+                .collect(),
+            fee: effect.fee,
+        }
     }
 
     /// The total NATIVE value the spend moves (XCH recipient amounts plus fee), in mojos — the figure
@@ -193,6 +243,191 @@ impl fmt::Display for SpendSummary {
             }
         }
         write!(f, " (fee {} mojos)", self.fee)
+    }
+}
+
+/// The puzzle hashes an output may pay WITHOUT the value having left the spender.
+///
+/// A hash qualifies only when some coin in `coin_spends` is locked under a bare
+/// `p2_delegated_puzzle_or_hidden_puzzle`, AND currying that puzzle over the very key its reveal
+/// carries reproduces that coin's own `puzzle_hash`. Both halves are load-bearing:
+///
+/// - **Requiring a bare p2** is what makes this layer-agnostic. A CAT, NFT, DID, singleton or
+///   offer-settlement coin is a WRAPPER: its `puzzle_hash` is not an address anything can pay to and
+///   still spend, so value sent there is destroyed rather than returned. None of them parse as a bare
+///   p2, so none of them qualify — and neither will the next wrapper, without this function changing.
+///   An allowlist that demands proof cannot be walked past by a layer nobody has thought of yet, which
+///   a denylist of known wrappers can.
+/// - **Requiring the curry to reproduce the coin's own hash** means a reveal cannot merely *contain* a
+///   p2 puzzle: it must BE this coin's puzzle. `analyze` already binds each reveal to its coin, so this
+///   is belt-and-braces — but the braces are cheap and the belt belongs to a dependency.
+///
+/// **Fail-safe by omission.** Every uncertain case — an undecodable reveal, a non-curried puzzle, a
+/// driver error, a curry that does not match — omits the hash, which COUNTS any output paying it. The
+/// failure mode is therefore over-counting, which escalates a spend to a human; the alternative failure
+/// mode is excusing an output nobody can account for, which approves it.
+pub(crate) fn p2_destinations(coin_spends: &[CoinSpend]) -> BTreeSet<Bytes32> {
+    let mut allocator = Allocator::new();
+    let mut destinations = BTreeSet::new();
+
+    for spend in coin_spends {
+        let Ok(puzzle_ptr) = node_from_bytes(&mut allocator, &spend.puzzle_reveal) else {
+            continue;
+        };
+        let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
+        let Ok(Some(p2)) = StandardLayer::parse_puzzle(&allocator, puzzle) else {
+            continue;
+        };
+        let curried = Bytes32::new(StandardArgs::curry_tree_hash(p2.synthetic_key).to_bytes());
+        if curried == spend.coin.puzzle_hash {
+            destinations.insert(spend.coin.puzzle_hash);
+        }
+    }
+
+    destinations
+}
+
+/// One line of the summary, for a created coin that leaves.
+///
+/// The address is encoded from the puzzle hash `analyze` decoded, so it names exactly the destination
+/// the condition creates. `xch` is the mainnet human-readable part; the vault destination rule decodes
+/// it straight back to a puzzle hash, so the string is a display form and never the thing compared.
+fn destination_line(output: &DecodedOutput) -> SpendRecipient {
+    SpendRecipient {
+        address: Address::new(output.puzzle_hash, "xch".to_string())
+            .encode()
+            // An `Address` built from a 32-byte puzzle hash and a valid HRP always encodes; a
+            // bech32m failure here would be a defect in the encoder rather than a property of the
+            // spend, and a summary line must exist for every output either way. The raw hash is the
+            // honest fallback: unusable as an address, and impossible to mistake for one.
+            .unwrap_or_else(|_| hex::encode(output.puzzle_hash)),
+        amount_mojos: output.amount,
+        asset_id: output.asset_id.map(hex::encode),
+    }
+}
+
+/// Re-parse `coin_spends` through `dig-wallet-backend`'s verify gate.
+///
+/// This is the crate's ONE call into [`analyze`]: value conservation, quote-form delegated puzzles and
+/// the sole-`AGG_SIG_ME` rule are checked here, so a spend the driver cannot fully account for is
+/// refused before any custody decision — and before any signature — exists.
+///
+/// # Why the input amounts are summed first, even though the driver now sums them too
+///
+/// `dig-wallet-backend` 0.16.1 routes all four of its accumulations through a fallible `accumulate`
+/// (#1708), so an unsummable total is refused there rather than panicking in debug and wrapping in
+/// release. This pre-check is therefore no longer the only thing standing between an attacker-chosen
+/// amount and a wrapped total — but it is kept, and deliberately:
+///
+/// - It makes the ANSWER right, not merely the refusal. An unsummable input total is
+///   [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) — the spend cannot be JUDGED — whereas
+///   the driver's own refusal arrives as [`Spend`](AccountError::Spend), "this spend is malformed".
+///   Those are different facts, and `SPEC.md` §6.3 forbids collapsing them.
+/// - The amounts come from an unsigned skeleton a dapp supplies, so they are attacker-chosen and need
+///   not correspond to coins that exist. A custody crate does not delegate its fail-closed behaviour
+///   to a dependency's minor version.
+///
+/// `a_spend_whose_input_amounts_do_not_sum_in_a_u64_is_refused_rather_than_wrapped` pins the variant,
+/// which is what makes this guard load-bearing rather than a duplicate of the driver's.
+fn derive_effect(coin_spends: &[CoinSpend]) -> Result<SpendEffect> {
+    coin_spends
+        .iter()
+        .try_fold(0u64, |sum, spend| sum.checked_add(spend.coin.amount))
+        .ok_or_else(|| {
+            AccountError::PolicyIndeterminate(
+                "the spent coins' amounts do not sum in a u64, so this spend's value cannot be \
+                 accounted for"
+                    .to_string(),
+            )
+        })?;
+
+    analyze(coin_spends)
+        .map_err(|e| AccountError::Spend(format!("cannot derive spend summary: {e}")))
+}
+
+/// The hinted-recipient summary the `dig-wallet-backend` signer takes as a PARAMETER.
+///
+/// [`UnsignedSpend`](dig_wallet_backend::types::UnsignedSpend) requires a `summary` field, and the
+/// signer re-derives its own and compares. **That comparison is not a check this crate relies on** —
+/// both sides come from the same bytes, so it can only ever agree; see
+/// [`MoneySigner::sign_approved`](crate::wallet::money_signer::MoneySigner::sign_approved). This
+/// reproduces the shape `derive_summary` would produce (hinted outputs only) so the parameter is
+/// well-formed, and it is deliberately NOT the policy view above: a custody decision must count every
+/// output that leaves, whereas this field must match what the dependency expects.
+fn dependency_facing_summary(effect: &SpendEffect) -> TransactionSummary {
+    TransactionSummary {
+        outputs: effect
+            .recipients
+            .iter()
+            .map(|output| {
+                let line = destination_line(output);
+                SpendOutput {
+                    address: dig_wallet_backend::types::Address(line.address),
+                    amount: Amount(output.amount),
+                    asset_id: output.asset_id.map(|asset| AssetId(hex::encode(asset))),
+                }
+            })
+            .collect(),
+        fee: Amount(effect.fee),
+    }
+}
+
+/// Everything a custody decision needs about a spend, derived from the coin spends exactly once.
+///
+/// The fields must agree, and the only way to guarantee that is to compute them together: the tier is
+/// decided from `native_total_mojos`, and every amount limit is weighed against that same figure. When
+/// the tier and the per-transaction check each summed the amounts separately, the two computations could
+/// disagree while every test stayed green.
+pub(crate) struct DerivedSpend {
+    /// The tiered, human-renderable view of the spend — every output that leaves.
+    pub(crate) summary: SpendSummary,
+    /// The hinted-only summary the dependency's signer takes as a parameter. Not a check; see
+    /// [`dependency_facing_summary`].
+    pub(crate) verified: TransactionSummary,
+    /// The CHECKED native total (value leaving plus fee) the tier and every mojo limit are decided from.
+    pub(crate) native_total_mojos: u64,
+}
+
+impl DerivedSpend {
+    /// Derive and tier `coin_spends` under `policy`.
+    ///
+    /// Fail-closed at each step: an unaccountable spend is refused by the verify gate, and one whose
+    /// native amounts cannot be summed in a `u64` is
+    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) rather than clamped to `u64::MAX` and
+    /// then tiered as though the clamp were its value.
+    ///
+    /// # The checked sum is now UNREACHABLE here, and is kept anyway — read why before removing it
+    ///
+    /// Against `dig-wallet-backend` >= 0.16.1 no input can reach this `?`. The proof is short: the
+    /// driver accumulates EVERY created XCH coin into `xch_out` through its fallible `accumulate`,
+    /// accumulates the fee the same way, and then requires `xch_in == xch_out + fee` with `xch_in`
+    /// itself checked. This summary's native total is a SUBSET of those same created coins (change
+    /// returning to a spent puzzle hash is dropped, CAT outputs are excluded) plus that same fee, so
+    /// it is bounded above by `xch_in`, which fits in a `u64` by construction.
+    ///
+    /// It is retained as defence-in-depth because that proof rests entirely on an invariant INSIDE a
+    /// dependency, which no test in this crate can enforce and a patch release could weaken. What the
+    /// crate can pin is the boundary itself, and
+    /// `a_spend_whose_output_amounts_overflow_is_never_approved` does: it fails against 0.16.0, so the
+    /// `0.16.1` floor is load-bearing rather than cosmetic. `scripts/probe-guards.sh` records this
+    /// guard as knowingly vacuous, and that exemption self-expires the moment any input makes it RED.
+    ///
+    /// The accessor must nonetheless stay the CHECKED one. Were it the saturating form and the
+    /// dependency ever regressed, an overflowing spend would total `u64::MAX`, classify `Confirm`, and
+    /// be offered to a human as a spend of every mojo that will ever exist — a fiction presented as a
+    /// figure.
+    pub(crate) fn derive(coin_spends: &[CoinSpend], policy: &CustodyPolicy) -> Result<Self> {
+        let effect = derive_effect(coin_spends)?;
+        // Tiered `Confirm` first — the stricter of the two hot tiers, so a bug that skipped the
+        // classification below would fail safe — then immediately classified for real.
+        let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm);
+        let native_total_mojos = summary.checked_native_total_mojos()?;
+        summary.tier = SpendTier::classify(policy, native_total_mojos);
+        Ok(Self {
+            summary,
+            verified: dependency_facing_summary(&effect),
+            native_total_mojos,
+        })
     }
 }
 
@@ -294,6 +529,36 @@ mod tests {
             0,
         );
         assert!(summary.to_string().contains("7 cafe -> xch1cat"));
+    }
+
+    /// A multi-recipient summary renders each recipient SEPARATED, in order, on one line.
+    ///
+    /// Two recipients is the smallest fixture that can see the separator at all: with one, the
+    /// "is this the first?" test is true every time, so every wrong form of it — `>=`, `<`, `==` —
+    /// renders identically and the branch is pinned by nothing. The whole line is asserted rather
+    /// than a `contains`, since a `contains` cannot see a missing or duplicated separator either.
+    #[test]
+    fn a_multi_recipient_summary_separates_its_recipients_in_order() {
+        let summary = SpendSummary::new(
+            SpendTier::Confirm,
+            vec![
+                SpendRecipient {
+                    address: "xch1first".into(),
+                    amount_mojos: 100,
+                    asset_id: None,
+                },
+                SpendRecipient {
+                    address: "xch1second".into(),
+                    amount_mojos: 250,
+                    asset_id: Some("cafe".into()),
+                },
+            ],
+            7,
+        );
+        assert_eq!(
+            summary.to_string(),
+            "Confirm: 100 XCH -> xch1first, 250 cafe -> xch1second (fee 7 mojos)"
+        );
     }
 
     /// The happy path: a real standard-layer XCH send re-derives to the expected recipient + fee and
