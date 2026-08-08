@@ -36,6 +36,13 @@ struct SimulatorChain {
     offline: bool,
     /// When set, the mempool rejects every push with this reason.
     reject_with: Option<String>,
+    /// When set, READS succeed and only the PUSH cannot be delivered — the node is reachable enough
+    /// to answer questions and the bundle still did not get through.
+    push_undeliverable: bool,
+    /// Coin ids this node reports as UNCONFIRMED coin states — what a mempool-aware node (and the
+    /// coinset API, whose `CoinState.created_height` is `None` for a mempool coin) really returns
+    /// while a bundle waits for a block.
+    mempool_observed: RefCell<Vec<chia_protocol::Coin>>,
 }
 
 impl SimulatorChain {
@@ -45,7 +52,15 @@ impl SimulatorChain {
             mempool: RefCell::new(Vec::new()),
             offline: false,
             reject_with: None,
+            push_undeliverable: false,
+            mempool_observed: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Make this node report `coin` the way a mempool-aware node reports a coin it has seen but no
+    /// block has confirmed: the real coin, with no confirmed height.
+    fn observe_in_mempool(&self, coin: chia_protocol::Coin) {
+        self.mempool_observed.borrow_mut().push(coin);
     }
 
     fn offline() -> Self {
@@ -87,11 +102,24 @@ impl ChainSource for SimulatorChain {
         if self.offline {
             return self.unavailable();
         }
-        Ok(self
-            .sim
+        if let Some(state) = self.sim.borrow().coin_state(coin_id) {
+            return Ok(Some(CoinRecord::from_coin_state(state)));
+        }
+        if let Some(coin) = self
+            .mempool_observed
             .borrow()
-            .coin_state(coin_id)
-            .map(CoinRecord::from_coin_state))
+            .iter()
+            .find(|coin| coin.coin_id() == coin_id)
+        {
+            return Ok(Some(CoinRecord {
+                coin: *coin,
+                confirmed_height: None,
+                spent_height: None,
+                timestamp: None,
+                coinbase: false,
+            }));
+        }
+        Ok(None)
     }
 
     fn coin_records_by_puzzle_hash(
@@ -154,7 +182,7 @@ impl ChainSource for SimulatorChain {
 
 impl SpendPublisher for SimulatorChain {
     fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome, ChainUnavailable> {
-        if self.offline {
+        if self.offline || self.push_undeliverable {
             return Err(ChainUnavailable::new("simulated: no node answered"));
         }
         if let Some(reason) = &self.reject_with {
@@ -250,6 +278,63 @@ fn a_pushed_but_unfarmed_mint_is_not_yet_a_did() -> anyhow::Result<()> {
     // confirmation and not about a mint that simply never worked.
     chain.farm()?;
     assert!(minter.confirm(&pending, &chain)?.is_some());
+    Ok(())
+}
+
+/// Mints on a throwaway chain and farms it, returning the real DID coin the mint creates.
+fn farmed_did_coin(
+    seed: &Arc<UnlockedMasterSeed>,
+    network: &MintNetwork,
+) -> anyhow::Result<chia_protocol::Coin> {
+    let minter = ProfileMinter::new(seed.clone());
+    let chain = SimulatorChain::new();
+    chain.fund(wallet_puzzle_hash(seed, ProfileIx::ROOT), 1_000_000);
+    let pending = minter.begin_did_mint(
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        network,
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+    let coin = chain
+        .sim
+        .borrow()
+        .coin_state(pending.did_coin_id())
+        .expect("a farmed mint has a DID coin")
+        .coin;
+    Ok(coin)
+}
+
+/// A node that REPORTS the DID coin, with no confirmed height, is reporting a mempool observation.
+/// It is the nearest-miss to evidence — a real record, of the right mint, from a reachable node —
+/// and it is still not a DID. (The unfarmed test above cannot see this: there the node returns no
+/// record at all, so a `confirm` that ignored the height entirely would still pass it.)
+#[test]
+fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()> {
+    let seed = unlocked_seed();
+    let minter = ProfileMinter::new(seed.clone());
+    let chain = SimulatorChain::new();
+    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+
+    let pending = minter.begin_did_mint(
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &simulator_network(),
+        &MintOptions::default(),
+    )?;
+    // The DID coin exactly as it will exist on chain — learned by farming this same mint on a
+    // second, throwaway chain, so the record under test differs from real evidence in ONE respect:
+    // it has no confirmed height.
+    let did_coin = farmed_did_coin(&seed, &simulator_network())?;
+    assert_eq!(did_coin.coin_id(), pending.did_coin_id());
+    chain.observe_in_mempool(did_coin);
+
+    assert!(
+        minter.confirm(&pending, &chain)?.is_none(),
+        "a coin the node has merely SEEN is not a coin the chain has confirmed"
+    );
     Ok(())
 }
 
@@ -402,22 +487,20 @@ fn a_rejected_push_is_reported_as_a_rejection_with_the_node_reason() {
 fn an_undeliverable_push_is_unreachable_rather_than_rejected() {
     let seed = unlocked_seed();
     let minter = ProfileMinter::new(seed.clone());
-    let funded_but_offline = SimulatorChain {
-        offline: true,
+    // Reads work and the wallet is funded, so selection and building both succeed: the ONLY thing
+    // that fails is the delivery of the bundle. A double that was offline for reads too would fail
+    // at coin selection and never exercise the push at all.
+    let reachable_but_undeliverable = SimulatorChain {
+        push_undeliverable: true,
         ..SimulatorChain::new()
     };
-    // Fund BEFORE the chain goes offline, so this wallet genuinely has money: the failure can only
-    // be the unreachable node.
-    funded_but_offline
-        .sim
-        .borrow_mut()
-        .new_coin(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    reachable_but_undeliverable.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
 
     let error = minter
         .begin_did_mint(
             ProfileIx::ROOT,
-            &funded_but_offline,
-            &funded_but_offline,
+            &reachable_but_undeliverable,
+            &reachable_but_undeliverable,
             &simulator_network(),
             &MintOptions::default(),
         )

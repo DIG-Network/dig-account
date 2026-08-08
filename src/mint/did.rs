@@ -411,6 +411,22 @@ mod tests {
         );
     }
 
+    /// A bundle whose one pre-existing coin belongs to somebody ELSE is refused. Counting roots is
+    /// not enough on its own: a bundle can spend exactly one coin and still have that coin be a
+    /// stranger's, which is precisely what a mint must never sign.
+    #[test]
+    fn a_bundle_rooted_in_a_coin_this_wallet_does_not_own_is_refused() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
+        let foreign_coin = Coin::new(Bytes32::new([3; 32]), stranger.puzzle_hash(), 1_000_000);
+        let (coin_spends, _) =
+            build_mint_spends(&wallet, foreign_coin, &MintOptions::default()).expect("builds");
+
+        let error = gate(&wallet, &coin_spends, &[], &network())
+            .expect_err("the funding coin must be this wallet's own");
+        assert!(error.to_string().contains("not this wallet's"), "{error}");
+    }
+
     /// A signature demanded under a key that is not this profile's wallet key is refused: the
     /// account never signs for a stranger's coin.
     #[test]
@@ -457,7 +473,9 @@ mod tests {
     #[test]
     fn selection_prefers_the_smallest_sufficient_coin() {
         let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
-        let amounts = [900_u64, 50, 5_000, 20];
+        // 5_000 comes FIRST, so a first-fit selection would take it: the order distinguishes
+        // "smallest sufficient" from "first sufficient" as well as from "largest".
+        let amounts = [5_000_u64, 900, 50, 20];
         let chain = FixedChain::new(
             amounts
                 .iter()
