@@ -737,6 +737,30 @@ mod tests {
         assert_eq!(split_change_and_fee(101, 100), (0, 100), "no change at all");
     }
 
+    /// The MAX_MINT_FEE is a hard security bound on money spent in a DID mint operation.
+    /// This test asserts its exact value to prevent inadvertent mutation or drift.
+    /// The constant is deliberately pinned and must not be changed except as an explicit security decision.
+    #[test]
+    fn max_mint_fee_mojos_is_pinned_as_a_security_bound() {
+        // Exact mojo value: 10 billion mojos = 0.01 XCH
+        // This is a hard security ceiling; changing it is a deliberate money policy decision.
+        assert_eq!(
+            MAX_MINT_FEE_MOJOS, 10_000_000_000,
+            "MAX_MINT_FEE_MOJOS is a security bound pinned at 10 billion mojos (0.01 XCH); \
+             mutating it changes the spending ceiling for DID mints"
+        );
+
+        // Cross-check: verify the mojo count equals 0.01 XCH
+        // (1 XCH = 1 trillion mojos, so 0.01 XCH = 10 billion mojos)
+        const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
+        assert_eq!(
+            MAX_MINT_FEE_MOJOS * 100,
+            MOJOS_PER_XCH,
+            "MAX_MINT_FEE_MOJOS must equal exactly 0.01 XCH (10_000_000_000 mojos); \
+             this value is not a knob to tune, it is a deliberate security bound"
+        );
+    }
+
     /// A chain source over a fixed set of coin records — enough to exercise selection without a
     /// simulator.
     struct FixedChain {
