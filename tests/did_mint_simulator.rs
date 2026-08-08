@@ -39,6 +39,9 @@ struct SimulatorChain {
     /// When set, READS succeed and only the PUSH cannot be delivered — the node is reachable enough
     /// to answer questions and the bundle still did not get through.
     push_undeliverable: bool,
+    /// When set, the source answers reads but exposes NO peak height — the shape of a provider that
+    /// simply does not track one.
+    no_peak: bool,
     /// Coin ids this node reports as UNCONFIRMED coin states — what a mempool-aware node (and the
     /// coinset API, whose `CoinState.created_height` is `None` for a mempool coin) really returns
     /// while a bundle waits for a block.
@@ -57,6 +60,7 @@ impl SimulatorChain {
             offline: false,
             reject_with: None,
             push_undeliverable: false,
+            no_peak: false,
             mempool_observed: RefCell::new(Vec::new()),
             spent_elsewhere: RefCell::new(Vec::new()),
         };
@@ -208,6 +212,9 @@ impl ChainSource for SimulatorChain {
     fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
         if self.offline {
             return self.unavailable();
+        }
+        if self.no_peak {
+            return Ok(None);
         }
         Ok(Some(self.sim.borrow().height()))
     }
@@ -726,5 +733,57 @@ fn a_mint_whose_input_was_spent_elsewhere_is_failed_not_awaiting() -> anyhow::Re
         "a mint whose sole input is gone can never confirm: {status:?}"
     );
     assert!(status.minted().is_none());
+    Ok(())
+}
+
+/// A source that answers reads but exposes no peak cannot have its confirmation heights bounded at
+/// all, so the mint refuses to evaluate evidence rather than accept an unbounded height. `Ok(None)`
+/// here is not an absence to work around — treating a missing peak as height 0 would make every
+/// fabricated height pass the checks that exist to catch one.
+#[test]
+fn a_source_without_a_peak_height_cannot_establish_evidence() -> anyhow::Result<()> {
+    let seed = unlocked_seed();
+    let minter = ProfileMinter::new(seed.clone());
+
+    // The control: with a peak, this same chain mints and confirms.
+    let chain = SimulatorChain::new();
+    chain.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    let pending = minter.begin_did_mint(
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &simulator_network(),
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+    assert!(minter.mint_status(&pending, &chain)?.minted().is_some());
+
+    // The same confirmed mint, read through a source that reports no peak, is refused.
+    let peakless = SimulatorChain {
+        no_peak: true,
+        ..SimulatorChain::new()
+    };
+    let error = minter
+        .mint_status(&pending, &peakless)
+        .expect_err("without a peak a claimed height cannot be checked");
+    assert!(matches!(error, MintError::ChainUnreachable(_)), "{error}");
+
+    // And a mint cannot even be STARTED against such a source, since the pre-push peak is what a
+    // later back-dated confirmation is measured against.
+    let unstartable = SimulatorChain {
+        no_peak: true,
+        ..SimulatorChain::new()
+    };
+    unstartable.fund(wallet_puzzle_hash(&seed, ProfileIx::ROOT), 1_000_000);
+    assert!(matches!(
+        minter.begin_did_mint(
+            ProfileIx::ROOT,
+            &unstartable,
+            &unstartable,
+            &simulator_network(),
+            &MintOptions::default(),
+        ),
+        Err(MintError::ChainUnreachable(_))
+    ));
     Ok(())
 }
