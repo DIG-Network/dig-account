@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -47,7 +47,9 @@ dig-did = "0.4"
 dig-chainsource-interface = "0.1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.26"
-chia-protocol = "0.26"
+# The `serde` feature is required: coin ids and launcher ids are persisted in the profile
+# registry as canonical 0x-hex strings (SPEC §2.4).
+chia-protocol = { version = "0.26", features = ["serde"] }
 chia-puzzle-types = "0.26"
 chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
 clvmr = "0.14"
@@ -56,6 +58,9 @@ hex = "0.4"
 thiserror = "2"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
+# The profile registry persists itself as JSON (`ProfileRegistry::to_json`/`from_json`), so this is
+# a runtime dependency, not a test-only one.
+serde_json = "1"
 zeroize = "1"
 
 [dev-dependencies]

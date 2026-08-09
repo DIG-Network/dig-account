@@ -49,6 +49,10 @@ fn the_unauthorized_call_shapes_do_not_compile() {
     cases.compile_fail("tests/compile_fail/mint_an_approval_outside_the_gate.rs");
     cases.compile_fail("tests/compile_fail/reuse_an_approval.rs");
     cases.compile_fail("tests/compile_fail/confirm_a_ceremony_twice.rs");
+    // The profile registry's two type-system properties: an anchor needs BOTH halves of a mint,
+    // and an active-profile handle cannot survive the switch that invalidates it.
+    cases.compile_fail("tests/compile_fail/an_anchor_needs_both_halves.rs");
+    cases.compile_fail("tests/compile_fail/a_stale_active_handle.rs");
 }
 
 /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module stripped.
