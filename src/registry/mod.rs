@@ -21,6 +21,13 @@ pub mod active;
 pub mod anchor;
 pub mod entry;
 pub mod journal;
+// The registry IS this module's subject; `registry::registry::ProfileRegistry` re-exported as
+// `registry::ProfileRegistry` reads correctly at every call site, and splitting the type across a
+// differently-named file to satisfy the lint would only hide it.
+#[allow(
+    clippy::module_inception,
+    reason = "the file holds the module's namesake type"
+)]
 pub mod registry;
 pub mod visibility;
 

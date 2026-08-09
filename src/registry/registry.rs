@@ -489,7 +489,7 @@ mod tests {
             .unwrap();
         assert!(!registry.get(ProfileIx(1)).unwrap().is_shown());
 
-        registry.set_active(ProfileIx(1)).unwrap();
+        let _switch = registry.set_active(ProfileIx(1)).unwrap();
 
         assert!(registry.get(ProfileIx(1)).unwrap().is_shown());
         assert_eq!(registry.shown().count(), 2);

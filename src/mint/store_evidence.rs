@@ -51,6 +51,14 @@ pub struct PendingStoreLaunch {
     pushed_at_height: u32,
 }
 
+// Nothing PRODUCES a store launch yet: the spend that does lands with the profile mint
+// (dig_ecosystem#2342). The types, their invariants and their tests are complete and exercised;
+// only the caller is missing, so the crate is warning-clean rather than silently shipping a
+// half-checked evidence path later.
+#[allow(
+    dead_code,
+    reason = "constructed by the profile mint, which lands next"
+)]
 impl PendingStoreLaunch {
     /// Record what a pushed store launch is, and when. `pub(crate)`: only the mint flow constructs
     /// one, and only from the bundle it actually built and pushed.
@@ -116,6 +124,10 @@ pub struct ConfirmedStore {
     committed_root: [u8; 32],
 }
 
+#[allow(
+    dead_code,
+    reason = "from_confirmed is called by the profile mint, which lands next"
+)]
 impl ConfirmedStore {
     /// The ONLY way to obtain a [`ConfirmedStore`].
     ///
