@@ -1074,6 +1074,18 @@ where
         let Some(spent_height) = read(*source_id)?.and_then(|record| record.spent_height) else {
             continue;
         };
+        // GENESIS FLOOR, mirroring the one `ConfirmedTransfer::from_confirmed` and the mint's
+        // evidence apply to a confirmation height. No coin is spent in block 0, so a `Some(0)` is a
+        // height the chain cannot have produced — most plausibly a source that zero-filled the field
+        // rather than leaving it `None`.
+        //
+        // Without this floor that value is the WORST possible input: a spend at height 0 computes a
+        // burial depth of `peak + 1`, so it sails past the burial requirement and yields `Failed` —
+        // and `Failed` tells the caller to build a new transfer, which is the double payment. A
+        // fabricated height must not be the most convincing evidence in the system.
+        if spent_height == 0 {
+            continue;
+        }
         // The confirming block is the first of the depth, hence the +1 — the same arithmetic
         // `ConfirmedTransfer::from_confirmed` uses to judge the payment coin's burial.
         let spend_depth = peak_height.saturating_sub(spent_height).saturating_add(1);
@@ -3720,6 +3732,57 @@ mod tests {
             ),
             "exactly MIN_CONFIRMATION_DEPTH blocks of burial is enough to declare death"
         );
+    }
+
+    /// **A source coin reported as spent at GENESIS is not a proof of death.**
+    ///
+    /// No coin is spent in block 0, so `spent_height: Some(0)` is a height the chain cannot have
+    /// produced — most plausibly a source that zero-filled the field instead of leaving it `None`.
+    ///
+    /// It is also the worst possible input to the burial rule: a spend at height 0 computes a depth
+    /// of `peak + 1`, which clears `MIN_CONFIRMATION_DEPTH` by a wider margin than any genuine spend
+    /// ever could. So without the floor, the ONE value that is certainly fabricated becomes the most
+    /// convincing evidence in the system — and it produces `Failed`, which tells the caller to build
+    /// a new transfer and pay the recipient a second time.
+    ///
+    /// The peak here is deep enough that burial alone would pass, which is what makes this pin the
+    /// genesis rule specifically rather than the depth rule.
+    #[test]
+    fn a_source_coin_spent_at_genesis_is_not_a_proof_of_death() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let chain = FixedChain::with_records(vec![record(input, Some(PEAK - 100), Some(0))])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
+
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Awaiting { .. }
+            ),
+            "a spend the chain could not have recorded must not be the evidence that kills a transfer"
+        );
+    }
+
+    /// The other side: the SAME fixture with the spend at height 1 — the first height a spend can
+    /// really occupy — IS a proof of death. Without it the refusal above would be equally satisfied
+    /// by an implementation that had stopped reporting `Failed`.
+    #[test]
+    fn a_source_coin_spent_at_the_first_real_height_is_a_proof_of_death() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let chain = FixedChain::with_records(vec![record(input, Some(PEAK - 100), Some(1))])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
+
+        assert!(matches!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Failed { .. }
+        ));
     }
 
     /// **The control that makes the failure test load-bearing, and it must be an INCONSISTENT one.**

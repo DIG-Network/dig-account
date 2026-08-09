@@ -869,7 +869,10 @@ fabricating source would have to contradict is one it also supplied.
   treated as evidence, however deep the chain has since advanced.
 - `Awaiting { blocks_since_push }` — in flight, or dead in a way the chain cannot attest to. This MUST be
   a real elapsed block count so a caller can set a deadline rather than poll an unchanging absence.
-- `Failed { reason }` — an input coin was spent while NO payment coin exists, so a different spend
+- `Failed { reason }` — an input coin was spent, that spend is BURIED under `MIN_CONFIRMATION_DEPTH`
+  blocks, and its `spent_height` is not `0` (no coin is spent in genesis, and an unfloored zero
+  computes the deepest possible burial, making the one certainly-fabricated height the most convincing
+  evidence in the system), while NO payment coin exists, so a different spend
   consumed it and this bundle can never be included. The payment coin is checked for EXISTENCE, not
   confirmation: a payment coin seen in the mempool is this bundle succeeding, and calling that a failure
   would be the worse error.
