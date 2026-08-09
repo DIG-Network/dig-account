@@ -55,6 +55,13 @@ use crate::wallet::policy::CustodyPolicy;
 /// would arrive after the push rather than before it.
 pub const MAX_TRANSFER_INPUT_COINS: usize = 12;
 
+/// The only human-readable prefix a transfer will pay: Chia mainnet's.
+///
+/// The same literal [`WalletKey::address`](crate::WalletKey::address) encodes with and the confirm
+/// ceremony's `destination_line` re-encodes for display, so a recipient bearing any other prefix is a
+/// destination this crate would DISPLAY as an `xch` address while paying something else entirely.
+pub const MAINNET_ADDRESS_PREFIX: &str = "xch";
+
 /// The message the lead coin announces and every secondary input asserts.
 ///
 /// See [`build_transfer_spends`] for why the binding exists at all.
@@ -124,6 +131,16 @@ pub enum TransferError {
     #[error("a transfer must move a positive number of mojos")]
     ZeroAmount,
 
+    /// The wallet's spendable coins sum to more than a `u64` can hold, so no shortfall check is
+    /// meaningful.
+    ///
+    /// Unreachable on a real chain, where the mojo supply is bounded — which is exactly why it must
+    /// be an explicit refusal rather than a clamp: a total silently pinned at `u64::MAX` would pass
+    /// every "do I have enough" test, and the condition would surface later as arithmetic rather than
+    /// as the unreadable balance it is.
+    #[error("the wallet's spendable coins total more than u64 can represent, so the balance cannot be judged")]
+    BalanceUnjudgeable,
+
     /// The amount plus the fee does not fit in a `u64`, so no wallet could ever cover it.
     #[error("the amount ({amount}) plus the fee ({fee}) overflows u64")]
     AmountOverflow {
@@ -177,11 +194,38 @@ impl TransferRequest {
     ///
     /// The address is decoded HERE so an unusable one is a named error before any chain read, rather
     /// than a comparison that silently never matches later.
+    ///
+    /// # The PREFIX is checked, and that check is what stops funds being burned
+    ///
+    /// `Address::decode` validates two things — that the string is bech32m, and that its payload is
+    /// 32 bytes. It does NOT validate the human-readable part; it hands it back and leaves the
+    /// decision to the caller. So `nft1…`, `did:chia:…`, `cat1…`, `txch1…` and outright invented
+    /// prefixes all decode successfully and yield a puzzle hash.
+    ///
+    /// Nothing downstream would catch it. A payment to an NFT launcher id or a DID conserves value,
+    /// returns honest change, signs, confirms, and reports [`TransferStatus::Confirmed`] — truthfully,
+    /// because the coin really does exist at a puzzle hash nobody holds a preimage for. The funds are
+    /// permanently burned. Worse, the confirmation ceremony re-encodes the destination for display
+    /// with a hard-coded `xch` prefix, so the user is shown a plausible mainnet address that is NOT
+    /// the string they pasted, differing only in a prefix they have no reason to inspect.
+    ///
+    /// Refusing anything but [`MAINNET_ADDRESS_PREFIX`] is therefore the only place this class can be
+    /// stopped, and the error names the offending prefix so the user learns what they actually pasted.
     pub fn to_address(address: &str, amount_mojos: u64) -> TransferResult<Self> {
         let decoded = Address::decode(address).map_err(|e| TransferError::InvalidRecipient {
             address: address.to_string(),
             reason: e.to_string(),
         })?;
+        if decoded.prefix != MAINNET_ADDRESS_PREFIX {
+            return Err(TransferError::InvalidRecipient {
+                address: address.to_string(),
+                reason: format!(
+                    "it is a {:?} address, not an {MAINNET_ADDRESS_PREFIX} payment address; paying \
+                     the puzzle hash inside one would burn the funds",
+                    decoded.prefix
+                ),
+            });
+        }
         Ok(Self::to_puzzle_hash(decoded.puzzle_hash, amount_mojos))
     }
 
@@ -685,15 +729,22 @@ where
         .map(|record| record.coin)
         .collect();
     // Coin id breaks ties, so two coins of equal value are ordered by something stable rather than by
-    // whatever order the chain source happened to answer in.
-    spendable.sort_by_key(|coin| (coin.amount, coin.coin_id()));
+    // whatever order the chain source happened to answer in. CACHED, because the plain `sort_by_key`
+    // re-invokes its closure on every comparison — and `coin_id()` is a SHA-256, so an attacker who
+    // dusts the wallet (which needs nobody's permission) chooses `n` in an O(n log n) hashing cost.
+    spendable.sort_by_cached_key(|coin| (coin.amount, coin.coin_id()));
 
     // `available` is the wallet's ENTIRE spendable balance, computed before any selection — it is
     // what the user would be told they hold, so it must not be an artefact of how far a selection
     // loop happened to get.
+    //
+    // CHECKED, not saturating: a total clamped to `u64::MAX` would sail through the shortfall test
+    // below and turn "this balance cannot be judged" into "proceed, and be refused later by
+    // arithmetic". The same discipline `SpendSummary::checked_native_total_mojos` applies.
     let available = spendable
         .iter()
-        .fold(0u64, |sum, coin| sum.saturating_add(coin.amount));
+        .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
+        .ok_or(TransferError::BalanceUnjudgeable)?;
     if available < required {
         return Err(TransferError::InsufficientFunds {
             required,
@@ -1498,6 +1549,66 @@ mod tests {
             .expect_err("a malformed address has no destination");
         assert!(
             matches!(error, TransferError::InvalidRecipient { .. }),
+            "{error}"
+        );
+    }
+
+    /// **A well-formed address with the WRONG prefix is refused, and that refusal is what stops the
+    /// funds being burned.**
+    ///
+    /// `Address::decode` checks bech32m and a 32-byte payload — never the human-readable part — so an
+    /// NFT launcher id, a DID, a CAT asset id and a testnet address all decode happily and yield a
+    /// puzzle hash. Paying one conserves value, signs, confirms, and reports `Confirmed` truthfully,
+    /// because a coin really does exist at a puzzle hash nobody can spend.
+    ///
+    /// The fixture is the SAME 32 bytes under each prefix, so the only difference between these cases
+    /// and the accepted one below is the prefix itself. `not-an-address` is deliberately not used
+    /// here: it fails bech32 PARSING, which proves the error is reachable for garbage and says
+    /// nothing about a well-formed wrong destination.
+    #[test]
+    fn a_well_formed_address_with_a_non_xch_prefix_is_refused_by_prefix() {
+        for prefix in ["nft", "txch", "did:chia", "cat", "totally-bogus"] {
+            let encoded = Address::new(RECIPIENT, prefix.to_string())
+                .encode()
+                .expect("a 32-byte payload encodes under any prefix");
+
+            // The control for the whole test: this string really does decode, so the refusal below is
+            // the prefix rule and not a parse failure.
+            assert_eq!(
+                Address::decode(&encoded).expect("it decodes").puzzle_hash,
+                RECIPIENT,
+                "{prefix} must be a decodable address, or this case proves nothing"
+            );
+
+            let error = TransferRequest::to_address(&encoded, 1_000)
+                .expect_err("paying the puzzle hash inside a non-payment address burns the funds");
+            match &error {
+                TransferError::InvalidRecipient { reason, .. } => assert!(
+                    reason.contains(prefix),
+                    "the refusal must name the prefix the user actually pasted: {reason}"
+                ),
+                other => panic!("{prefix}: {other}"),
+            }
+        }
+    }
+
+    /// A balance that cannot be summed is REFUSED rather than clamped. A saturating total pinned at
+    /// `u64::MAX` would pass the shortfall check and surface later as arithmetic, turning "this
+    /// cannot be judged" into "proceed and be refused".
+    #[test]
+    fn a_spendable_balance_that_overflows_u64_is_refused_rather_than_clamped() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[u64::MAX, u64::MAX]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect_err("a balance past u64 cannot be judged");
+        assert!(
+            matches!(error, TransferError::BalanceUnjudgeable),
             "{error}"
         );
     }

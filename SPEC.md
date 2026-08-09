@@ -726,6 +726,14 @@ also gated and signed would be a second route to a signature beside a gated one,
   `TransferError::VaultTransferUnsupported`, whose message states that funds move vault → hot wallet
   through the clawback window first. It MUST NOT be reported as a shortfall or a build failure — both
   would send the user looking for a problem that does not exist.
+- **`xch`-prefixed recipient addresses only.** `TransferRequest::to_address` MUST reject any address
+  whose human-readable part is not `xch`, naming the offending prefix. Bech32m decoding validates the
+  encoding and a 32-byte payload but NOT the prefix, so `nft1…`, `did:chia:…`, `cat1…` and `txch1…` all
+  decode and yield a puzzle hash. A payment built to one conserves value, signs, confirms and reports
+  `Confirmed` truthfully — while the coin sits at a puzzle hash with no preimage and the funds are
+  permanently burned. No later check can catch it: every downstream rule is about value conservation
+  and change ownership, and the confirm ceremony re-encodes the destination for display with a
+  hard-coded `xch` prefix, so the user is shown a plausible address that is not the one they supplied.
 - **No self-payment.** A recipient equal to the wallet's own puzzle hash MUST be refused
   (`TransferError::SelfPayment`). It moves no value while costing a fee, and §5.2's summary excludes
   outputs that provably return to a puzzle the spend already unlocks — so the confirmation ceremony
