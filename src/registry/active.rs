@@ -14,8 +14,13 @@ use crate::registry::entry::ProfileEntry;
 ///
 /// Because it borrows the registry immutably, [`set_active`](crate::registry::ProfileRegistry::set_active)
 /// — which needs `&mut` — cannot run while one is alive. **A stale active handle does not
-/// typecheck**, so there is no window in which a host holds an active profile that the registry has
-/// since moved away from.
+/// typecheck.**
+///
+/// The type stops a stale HANDLE, not a stale INDEX. [`ix`](Self::ix) and the `From` impl below
+/// hand out a `Copy` [`ProfileIx`] that outlives the borrow, and the index is what every
+/// key-derivation API actually consumes — so a host that keeps one across a
+/// [`set_active`](crate::registry::ProfileRegistry::set_active) can still derive at a profile the
+/// registry has moved away from. Re-read the active index rather than caching it.
 ///
 /// This replaces dig-app's `ACTIVE_PROFILES: &[ProfileIx]` plus its
 /// `const _: () = assert!(len() == 1)` tripwire (dig_ecosystem#2236). A slice can have a length

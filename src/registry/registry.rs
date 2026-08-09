@@ -260,6 +260,10 @@ impl ProfileRegistry {
     /// journalled fee is what a resumed phase B may spend, so it is bounded by the same ceiling the
     /// DID half already enforces; [`check`](Self::check) applies it again on load, so the bound
     /// cannot be side-stepped by editing the file.
+    ///
+    /// [`AccountError::RegistryInvariant`] if `stage` journals a DID that fails the rules
+    /// [`check_journalled_stage`](Self::check_journalled_stage) states. Nothing is written when it
+    /// does: a stage the registry would refuse to LOAD is refused before it can be SAVED.
     pub fn begin_mint(&mut self, ix: ProfileIx, stage: MintStage, store_fee: u64) -> Result<()> {
         if self.contains(ix) {
             return Err(AccountError::ProfileAlreadyRegistered(ix));
@@ -273,6 +277,7 @@ impl ProfileRegistry {
                 ceiling: MAX_MINT_FEE_MOJOS,
             });
         }
+        Self::check_journalled_stage(ix, &stage).map_err(AccountError::RegistryInvariant)?;
 
         let mint = ProfileMintInProgress::new(ix, stage, store_fee);
         let position = self.in_progress.partition_point(|m| m.ix() < ix);
@@ -287,11 +292,17 @@ impl ProfileRegistry {
     ///
     /// [`AccountError::ProfileNotFound`] if no mint is journalled at `ix`. A stage cannot be
     /// recorded for a mint that was never begun.
+    ///
+    /// [`AccountError::RegistryInvariant`] if `stage` journals a DID that fails the rules
+    /// [`check_journalled_stage`](Self::check_journalled_stage) states, leaving the journalled
+    /// stage as it was.
     pub fn advance_mint(&mut self, ix: ProfileIx, stage: MintStage) -> Result<()> {
         let Some(position) = self.mint_position(ix) else {
             return Err(AccountError::ProfileNotFound(ix));
         };
+        Self::check_journalled_stage(ix, &stage).map_err(AccountError::RegistryInvariant)?;
         self.in_progress[position].set_stage(stage);
+        self.expect_valid();
         Ok(())
     }
 
@@ -449,21 +460,52 @@ impl ProfileRegistry {
                     fee = mint.store_fee()
                 ));
             }
-            for did in mint.stage().minted_dids() {
-                let honest = dig_did::did_string_from_launcher_id(did.launcher_id);
-                if did.did != honest {
-                    return Err(format!(
-                        "the DID journalled at {ix} does not belong to its launcher id"
-                    ));
-                }
-                if did.confirmed_height == 0 {
-                    return Err(format!(
-                        "the DID journalled at {ix} claims to have confirmed at height 0"
-                    ));
-                }
-            }
+            Self::check_journalled_stage(ix, mint.stage())?;
         }
 
+        Ok(())
+    }
+
+    /// The rules every journalled [`MintStage`] must satisfy, wherever it enters the registry.
+    ///
+    /// A stage reaches the journal by two routes — deserialized from a file by
+    /// [`check`](Self::check), or handed to [`begin_mint`](Self::begin_mint) /
+    /// [`advance_mint`](Self::advance_mint) by a host — and both routes are untrusted:
+    /// [`MintStage`] is public and [`MintedDidRecord`](crate::registry::MintedDidRecord) has public
+    /// fields, so a host can hand-build one it never obtained from a live
+    /// [`MintedDid`](crate::mint::MintedDid). Sharing ONE helper is what stops a rule being added
+    /// to the load path and missed by the mutators, which is exactly how a registry came to accept
+    /// a record it would then refuse to load.
+    ///
+    /// This closes a correctness defect in a security control, not a live vulnerability: no
+    /// attacker-reachable path fed the mutators an invalid stage. A hostile FILE cannot, because
+    /// [`from_json`](Self::from_json) returns an error rather than panicking, and could already
+    /// deny the registry by other means; nothing in the crate calls `advance_mint` yet. What it
+    /// buys is that the registry can no longer write a file it will then refuse to load — a state
+    /// `SPEC.md` §7 leaves unrecoverable, because a host MUST NOT treat a `RegistryInvariant` load
+    /// failure as an empty registry, and an unloadable mint journal is what lets a paid-for DID be
+    /// minted twice.
+    ///
+    /// `coin_id` is deliberately unchecked: it is not derivable from the launcher id, so it cannot
+    /// be validated offline at all (dig_ecosystem#2425). The resume path re-verifies it against
+    /// chain instead.
+    fn check_journalled_stage(
+        ix: ProfileIx,
+        stage: &MintStage,
+    ) -> std::result::Result<(), String> {
+        for did in stage.minted_dids() {
+            let honest = dig_did::did_string_from_launcher_id(did.launcher_id);
+            if did.did != honest {
+                return Err(format!(
+                    "the DID journalled at {ix} does not belong to its launcher id"
+                ));
+            }
+            if did.confirmed_height == 0 {
+                return Err(format!(
+                    "the DID journalled at {ix} claims to have confirmed at height 0"
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -472,6 +514,7 @@ impl ProfileRegistry {
 mod tests {
     use super::*;
     use crate::mint::fixtures::{bound_mint, minted_did};
+    use crate::registry::MintedDidRecord;
 
     /// Record a profile at `ix`, panicking on the invariant errors this helper's callers never hit.
     fn record(registry: &mut ProfileRegistry, ix: u32) {
@@ -722,6 +765,105 @@ mod tests {
         registry
             .begin_mint(ProfileIx(0), a_stage(), MAX_MINT_FEE_MOJOS)
             .expect("exactly at the ceiling is allowed");
+    }
+
+    /// A stage whose journalled DID string does not belong to its launcher id.
+    fn a_spoofed_stage() -> MintStage {
+        let mut did: MintedDidRecord = (&minted_did(9)).into();
+        did.did = "did:chia:1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+            .to_string();
+        MintStage::DidConfirmedStoreNotLaunched { did }
+    }
+
+    /// A stage whose journalled DID claims a confirmation height no block can produce.
+    fn a_zero_height_stage() -> MintStage {
+        let mut did: MintedDidRecord = (&minted_did(9)).into();
+        did.confirmed_height = 0;
+        MintStage::DidConfirmedStoreNotLaunched { did }
+    }
+
+    /// **The mutators refuse exactly what the load path refuses, BEFORE writing anything.**
+    ///
+    /// `MintStage` is public and `MintedDidRecord`'s fields are public, so a host can hand-build a
+    /// record it never obtained from a live `MintedDid`. Both invalidities the load path knows are
+    /// exercised, because a helper that caught only the string spoof would pass a test that only
+    /// spoofed strings.
+    ///
+    /// The `in_progress` assertion is the load-bearing half: a check placed AFTER the insert would
+    /// return the same error and still leave the registry holding a record it cannot reload.
+    #[test]
+    fn begin_mint_refuses_a_stage_the_load_path_would_refuse_and_writes_nothing() {
+        for bad in [a_spoofed_stage(), a_zero_height_stage()] {
+            let mut registry = ProfileRegistry::empty();
+
+            let result = registry.begin_mint(ProfileIx(0), bad, 1_000);
+            assert!(
+                matches!(result, Err(AccountError::RegistryInvariant(_))),
+                "an invalid journalled DID must be refused: {result:?}"
+            );
+            assert!(
+                registry.in_progress().is_empty(),
+                "a refused mint reserves nothing"
+            );
+        }
+
+        ProfileRegistry::empty()
+            .begin_mint(ProfileIx(0), a_stage(), 1_000)
+            .expect("the control: a valid stage is still accepted");
+    }
+
+    /// The same rule on the other mutator, with a HONEST stage already journalled as the control.
+    ///
+    /// Asserting only the error would let a check that ran after `set_stage` pass; asserting the
+    /// journalled stage is still the one that was there distinguishes the two placements.
+    #[test]
+    fn advance_mint_refuses_a_stage_the_load_path_would_refuse_and_leaves_the_old_one() {
+        for bad in [a_spoofed_stage(), a_zero_height_stage()] {
+            let mut registry = ProfileRegistry::empty();
+            registry.begin_mint(ProfileIx(0), a_stage(), 1_000).unwrap();
+
+            let result = registry.advance_mint(ProfileIx(0), bad);
+            assert!(
+                matches!(result, Err(AccountError::RegistryInvariant(_))),
+                "an invalid journalled DID must be refused: {result:?}"
+            );
+            assert_eq!(
+                registry.in_progress()[0].stage(),
+                &a_stage(),
+                "a refused advance leaves the journalled stage exactly as it was"
+            );
+        }
+
+        let mut registry = ProfileRegistry::empty();
+        registry.begin_mint(ProfileIx(0), a_stage(), 1_000).unwrap();
+        registry
+            .advance_mint(
+                ProfileIx(0),
+                MintStage::DidConfirmedStoreNotLaunched {
+                    did: (&minted_did(3)).into(),
+                },
+            )
+            .expect("the control: a valid stage is still accepted");
+    }
+
+    /// **The crate never writes a file it will then refuse to load.**
+    ///
+    /// This is the consequence the mutator guards exist for, asserted end to end: whatever survives
+    /// the mutators serializes to something `from_json` accepts. Without the guards the sequence
+    /// below produced a registry whose own `from_json` returned `RegistryInvariant` — and
+    /// `SPEC.md` forbids the only fallback, so the mint journal would be permanently unloadable.
+    #[test]
+    fn whatever_the_mutators_accept_can_be_loaded_back() {
+        let mut registry = with_profiles(&[0]);
+        registry.begin_mint(ProfileIx(4), a_stage(), 1_000).unwrap();
+        let _ = registry.advance_mint(ProfileIx(4), a_spoofed_stage());
+        let _ = registry.begin_mint(ProfileIx(7), a_zero_height_stage(), 1_000);
+
+        let json = registry.to_json().expect("a mutated registry serializes");
+        assert_eq!(
+            ProfileRegistry::from_json(&json).expect("and loads back"),
+            registry
+        );
     }
 
     #[test]
