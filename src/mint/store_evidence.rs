@@ -60,7 +60,10 @@ impl PendingStoreLaunch {
     // build DOES construct these (via `mint::fixtures`), so an expectation would be fulfilled in the
     // lib build and unfulfilled in the lib-test build, and `--all-targets` compiles both. `expect`
     // fails the build here today — verified, not assumed.
-    #[allow(dead_code, reason = "constructed by the profile mint, which lands next")]
+    #[allow(
+        dead_code,
+        reason = "constructed by the profile mint, which lands next"
+    )]
     pub(crate) fn new(
         launcher_id: Bytes32,
         store_coin_id: Bytes32,
