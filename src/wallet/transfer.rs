@@ -57,10 +57,13 @@ pub const MAX_TRANSFER_INPUT_COINS: usize = 12;
 
 /// The only human-readable prefix a transfer will pay: Chia mainnet's.
 ///
-/// The same literal [`WalletKey::address`](crate::WalletKey::address) encodes with and the confirm
-/// ceremony's `destination_line` re-encodes for display, so a recipient bearing any other prefix is a
-/// destination this crate would DISPLAY as an `xch` address while paying something else entirely.
-pub const MAINNET_ADDRESS_PREFIX: &str = "xch";
+/// Re-exported rather than defined here. The same value is what
+/// [`WalletKey::address`](crate::WalletKey::address) encodes with and what the confirm ceremony
+/// re-encodes for display, so a recipient bearing any other prefix is a destination this crate would
+/// DISPLAY as an `xch` address while paying something else entirely — see
+/// [`crate::constants::MAINNET_ADDRESS_PREFIX`] for why that agreement is structural and not a
+/// convention.
+pub use crate::constants::MAINNET_ADDRESS_PREFIX;
 
 /// The message the lead coin announces and every secondary input asserts.
 ///
@@ -947,10 +950,18 @@ mod tests {
     /// Records are supplied whole rather than as bare coins because half of these tests are ABOUT the
     /// difference between a confirmed coin, an unconfirmed one and a spent one — a double that could
     /// only express "a coin exists" could not exhibit the property under test.
+    ///
+    /// [`answers_with`](Self::answers_with) exists for the same reason one level up. Looking a record
+    /// up BY the requested id makes it structurally impossible for this double to answer about a
+    /// different coin — so a source that returns a real, well-formed record for the WRONG coin, which
+    /// is the whole threat `ConfirmedTransfer::from_confirmed`'s id check exists to stop, could not be
+    /// expressed at all and the check could not be falsified by any test.
     struct FixedChain {
         records: Vec<CoinRecord>,
         peak: Option<u32>,
         offline: bool,
+        /// When set, EVERY `coin_record` query is answered with this record, whatever was asked for.
+        answers_with: Option<CoinRecord>,
     }
 
     impl FixedChain {
@@ -970,6 +981,7 @@ mod tests {
                     .collect(),
                 peak: Some(PEAK),
                 offline: false,
+                answers_with: None,
             }
         }
 
@@ -978,6 +990,7 @@ mod tests {
                 records,
                 peak: Some(PEAK),
                 offline: false,
+                answers_with: None,
             }
         }
 
@@ -991,7 +1004,14 @@ mod tests {
                 records: Vec::new(),
                 peak: Some(PEAK),
                 offline: true,
+                answers_with: None,
             }
+        }
+
+        /// Answer every `coin_record` query with `record`, regardless of the id asked for.
+        fn answering_every_query_with(mut self, record: CoinRecord) -> Self {
+            self.answers_with = Some(record);
+            self
         }
 
         fn without_peak(mut self) -> Self {
@@ -1032,6 +1052,9 @@ mod tests {
         fn coin_record(&self, coin_id: Bytes32) -> std::result::Result<Option<CoinRecord>, String> {
             if self.offline {
                 return self.unavailable();
+            }
+            if let Some(answer) = &self.answers_with {
+                return Ok(Some(answer.clone()));
             }
             Ok(self
                 .records
@@ -1641,6 +1664,38 @@ mod tests {
         assert_eq!(request.fee_mojos(), 0);
     }
 
+    /// **The address this crate DISPLAYS is an address this crate will PAY.**
+    ///
+    /// The display path ([`WalletKey::address`]) and the payment path
+    /// ([`TransferRequest::to_address`]) are written in different modules and were, until they were
+    /// converged on [`MAINNET_ADDRESS_PREFIX`], two independent `"xch"` literals. A divergence
+    /// between them is SILENT — nothing fails, the wallet simply hands out a receive address the
+    /// builder refuses, or worse renders a destination under a prefix it did not pay.
+    ///
+    /// This test cannot be satisfied by either module alone: it takes a string produced by the
+    /// display path and requires the payment path to accept it AND to recover the very puzzle hash it
+    /// was encoded from. Re-inline a different literal at either site and it fails.
+    #[test]
+    fn the_wallets_displayed_address_is_one_the_transfer_builder_will_pay() {
+        let ops = ops();
+        let displayed = ops
+            .wallet_key()
+            .address()
+            .expect("the wallet renders its own receive address");
+
+        let request = TransferRequest::to_address(&displayed, 42)
+            .expect("an address this crate displays must be one it will pay");
+        assert_eq!(
+            request.recipient(),
+            ops.puzzle_hash(),
+            "the payment path must recover the puzzle hash the display path encoded"
+        );
+        assert!(
+            displayed.starts_with(MAINNET_ADDRESS_PREFIX),
+            "the displayed address must bear the one prefix: {displayed}"
+        );
+    }
+
     // ------------------------------------------------------------------- the input binding
 
     /// Every secondary input asserts the announcement the LEAD makes, so a secondary — which creates
@@ -1846,6 +1901,76 @@ mod tests {
         assert_eq!(settled.amount_mojos(), 600);
         assert_eq!(settled.confirmed_height(), PEAK + 1);
         assert_eq!(settled.payment_coin_id(), payment.coin_id());
+    }
+
+    /// **A record for a DIFFERENT coin is not evidence, however impeccable it otherwise looks.**
+    ///
+    /// The id check is the ENTIRE argument that a confirmation is about the right recipient and the
+    /// right amount: a coin id commits to `(parent, puzzle_hash, amount)`, so a matching id is the
+    /// proof and nothing separate is compared. `ConfirmedTransfer` also recommends an AGGREGATING
+    /// chain source, i.e. several nodes stitched together — a deployment where a mis-addressed or
+    /// mis-attributed record is a realistic answer rather than a hypothetical one.
+    ///
+    /// The fixture differs from a genuine confirmation in the id and in NOTHING ELSE: the same
+    /// recipient, the same amount, a post-push height, and a burial well past
+    /// [`MIN_CONFIRMATION_DEPTH`]. Only the parent differs, which is what makes the id differ. Every
+    /// other condition `from_confirmed` tests is satisfied, so the id check is the only thing that
+    /// can refuse it.
+    ///
+    /// The assertion is `Awaiting` SPECIFICALLY, not `confirmed().is_none()`. A source that answered
+    /// nothing at all would satisfy the weaker form equally, and that is a different property — it
+    /// would leave the guard exactly as unfalsifiable as before.
+    #[test]
+    fn a_confirmed_record_for_a_different_coin_is_not_this_transfers_evidence() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let impostor = Coin::new(
+            Bytes32::new([0xAB; 32]),
+            payment.puzzle_hash,
+            payment.amount,
+        );
+        assert_ne!(
+            impostor.coin_id(),
+            pending.payment_coin_id(),
+            "the impostor must be a different coin, or this test proves nothing"
+        );
+
+        let chain = FixedChain::with_records(Vec::new())
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH)
+            .answering_every_query_with(record(impostor, Some(PEAK + 1), None));
+
+        assert_eq!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Awaiting {
+                blocks_since_push: MIN_CONFIRMATION_DEPTH
+            },
+            "a record about some other coin says nothing about this payment"
+        );
+    }
+
+    /// The truthful control for the impostor test: the SAME double, the SAME heights and the SAME
+    /// peak, answering with the CORRECT coin, reaches `Confirmed`. Without it the refusal above would
+    /// be equally satisfied by a fixture that can never confirm anything.
+    #[test]
+    fn the_same_double_answering_with_the_correct_coin_is_confirmed() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(Vec::new())
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH)
+            .answering_every_query_with(record(payment, Some(PEAK + 1), None));
+
+        let settled = transfer_status(&pending, &chain)
+            .expect("readable")
+            .confirmed()
+            .cloned()
+            .expect("the correct coin, buried, IS the payment");
+        assert_eq!(settled.payment_coin_id(), pending.payment_coin_id());
+        assert_eq!(settled.recipient(), RECIPIENT);
+        assert_eq!(settled.amount_mojos(), 600);
     }
 
     /// The same payment coin confirmed only ONE block deep is NOT settled: a shallow confirmation is
