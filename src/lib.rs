@@ -59,8 +59,9 @@ pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;
 pub use keys::wallet_key::WalletKey;
 pub use mint::{
-    ChainUnavailable, MintError, MintNetwork, MintOptions, MintResult, MintStatus, MintedDid,
-    PendingMint, PushOutcome, SpendPublisher, MAX_MINT_FEE_MOJOS, MIN_CONFIRMATION_DEPTH,
+    ChainUnavailable, ConfirmedStore, MintError, MintNetwork, MintOptions, MintResult, MintStatus,
+    MintedDid, PendingMint, PendingStoreLaunch, PushOutcome, SpendPublisher, MAX_MINT_FEE_MOJOS,
+    MIN_CONFIRMATION_DEPTH,
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;

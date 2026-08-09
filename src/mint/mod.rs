@@ -17,9 +17,22 @@ pub mod did;
 pub mod error;
 pub mod evidence;
 pub mod status;
+pub mod store_evidence;
+
+/// Real evidence values for tests in OTHER modules of this crate.
+///
+/// The evidence constructors are deliberately unreachable outside [`mint`](self), which is what
+/// stops a registry (or anything else) inventing a DID. Tests elsewhere still need genuine
+/// evidence, so this module builds it the ONLY legal way — through `from_confirmed`, over a real
+/// confirmed [`CoinRecord`](dig_chainsource_interface::CoinRecord). It is `cfg(test)`, so it widens
+/// nothing for a consumer, and it fabricates nothing: change a rule and these helpers stop
+/// producing values.
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 pub use chain::{ChainUnavailable, PushOutcome, SpendPublisher};
 pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use status::MintStatus;
+pub use store_evidence::{ConfirmedStore, PendingStoreLaunch};
