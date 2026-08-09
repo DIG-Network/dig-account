@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -74,6 +74,11 @@ serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
 chia-sdk-test = "0.30"
+# Test-only: the consensus ErrorCode enum, so the orphaned-secondary test can pin its refusal to
+# AssertCoinAnnouncementFailed specifically. A bare is_err() there would be satisfied by a signature
+# failure and would leave the input binding untested. Pinned to the version chia-sdk-test 0.30
+# resolves to; a divergence makes the two ErrorCode types differ and fails LOUDLY at compile time.
+chia-consensus = "0.26"
 # Test-only: a DERIVED k1 keypair for the secp-refusal fixture (the gate must refuse a signature
 # requirement a DID mint never produces). Pinned to the version chia-wallet-sdk 0.30 resolves to.
 chia-secp = "0.26"

@@ -74,10 +74,17 @@ impl WalletKey {
     }
 
     /// The wallet's canonical XCH receive address (`xch1…` bech32m of the puzzle hash).
+    ///
+    /// Encoded under [`MAINNET_ADDRESS_PREFIX`](crate::constants::MAINNET_ADDRESS_PREFIX), which is
+    /// also the only prefix the transfer builder will pay to — so an address this wallet displays is
+    /// always one the ecosystem can send to.
     pub fn address(&self) -> Result<String> {
-        Address::new(self.puzzle_hash(), "xch".to_string())
-            .encode()
-            .map_err(|e| AccountError::Keystore(format!("address encode: {e}")))
+        Address::new(
+            self.puzzle_hash(),
+            crate::constants::MAINNET_ADDRESS_PREFIX.to_string(),
+        )
+        .encode()
+        .map_err(|e| AccountError::Keystore(format!("address encode: {e}")))
     }
 }
 

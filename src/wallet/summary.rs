@@ -290,17 +290,25 @@ pub(crate) fn p2_destinations(coin_spends: &[CoinSpend]) -> BTreeSet<Bytes32> {
 /// One line of the summary, for a created coin that leaves.
 ///
 /// The address is encoded from the puzzle hash `analyze` decoded, so it names exactly the destination
-/// the condition creates. `xch` is the mainnet human-readable part; the vault destination rule decodes
-/// it straight back to a puzzle hash, so the string is a display form and never the thing compared.
+/// the condition creates. The vault destination rule decodes it straight back to a puzzle hash, so the
+/// string is a display form and never the thing compared.
+///
+/// It is encoded under [`MAINNET_ADDRESS_PREFIX`](crate::constants::MAINNET_ADDRESS_PREFIX), the same
+/// value the transfer builder requires of a recipient address. Rendering a destination under a prefix
+/// the builder would not pay is how a user comes to approve a plausible address that is not the one
+/// they supplied.
 fn destination_line(output: &DecodedOutput) -> SpendRecipient {
     SpendRecipient {
-        address: Address::new(output.puzzle_hash, "xch".to_string())
-            .encode()
-            // An `Address` built from a 32-byte puzzle hash and a valid HRP always encodes; a
-            // bech32m failure here would be a defect in the encoder rather than a property of the
-            // spend, and a summary line must exist for every output either way. The raw hash is the
-            // honest fallback: unusable as an address, and impossible to mistake for one.
-            .unwrap_or_else(|_| hex::encode(output.puzzle_hash)),
+        address: Address::new(
+            output.puzzle_hash,
+            crate::constants::MAINNET_ADDRESS_PREFIX.to_string(),
+        )
+        .encode()
+        // An `Address` built from a 32-byte puzzle hash and a valid HRP always encodes; a
+        // bech32m failure here would be a defect in the encoder rather than a property of the
+        // spend, and a summary line must exist for every output either way. The raw hash is the
+        // honest fallback: unusable as an address, and impossible to mistake for one.
+        .unwrap_or_else(|_| hex::encode(output.puzzle_hash)),
         amount_mojos: output.amount,
         asset_id: output.asset_id.map(hex::encode),
     }
@@ -435,6 +443,34 @@ impl DerivedSpend {
 mod tests {
     use super::*;
     use crate::wallet::policy::{HotWallet, Vault};
+
+    /// **The address the confirm ceremony SHOWS is an address the transfer builder will PAY.**
+    ///
+    /// These two are written in different modules and were, until they were converged on
+    /// [`MAINNET_ADDRESS_PREFIX`](crate::constants::MAINNET_ADDRESS_PREFIX), independent `"xch"`
+    /// literals. A divergence is SILENT: the ceremony renders a plausible mainnet address that is not
+    /// the destination the user supplied, differing only in a prefix they have no reason to inspect.
+    ///
+    /// The assertion is deliberately cross-path — the rendered string is handed to the PAYMENT path's
+    /// prefix rule, and must both be accepted and decode back to the very puzzle hash the output
+    /// creates. Neither module can satisfy this alone.
+    #[test]
+    fn a_rendered_destination_is_an_address_the_transfer_builder_will_pay() {
+        let puzzle_hash = Bytes32::new([0x5C; 32]);
+        let line = destination_line(&DecodedOutput {
+            puzzle_hash,
+            amount: 600,
+            asset_id: None,
+        });
+
+        let request = crate::TransferRequest::to_address(&line.address, 600)
+            .expect("a destination the ceremony displays must be one the builder will pay");
+        assert_eq!(
+            request.recipient(),
+            puzzle_hash,
+            "the displayed address must decode back to the puzzle hash the output creates"
+        );
+    }
 
     #[test]
     fn classify_maps_vault_to_the_vault_tier() {

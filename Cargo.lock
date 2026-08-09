@@ -1264,12 +1264,13 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dig-account"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "bip39",
  "chia-bls 0.26.0",
+ "chia-consensus 0.26.0",
  "chia-protocol 0.26.0",
  "chia-puzzle-types 0.26.0",
  "chia-sdk-test",

@@ -44,6 +44,7 @@
 #![allow(clippy::todo)]
 
 pub mod auth;
+pub mod constants;
 pub mod error;
 pub mod id;
 pub mod keys;
@@ -62,6 +63,7 @@ pub use auth::factors::AuthFactors;
 pub use auth::policy::{AllOf, AuthPolicy, PasswordOnlyPolicy, UnlockError, UnlockGate};
 pub use auth::provider::{AuthProvider, SpendConfirmRequest, SpendDecision, UnlockRequest};
 pub use auth::second_factor::SecondFactor;
+pub use constants::MAINNET_ADDRESS_PREFIX;
 pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;
@@ -91,4 +93,8 @@ pub use wallet::enforcer::PolicyAuthorizer;
 pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};
 pub use wallet::policy::{CustodyPolicy, HotWallet, Vault};
 pub use wallet::summary::{SpendRecipient, SpendSummary, SpendTier};
+pub use wallet::transfer::{
+    transfer_status, ConfirmedTransfer, PayableDestination, PendingTransfer, TransferError,
+    TransferPlan, TransferRequest, TransferResult, TransferStatus, MAX_TRANSFER_INPUT_COINS,
+};
 pub use wallet::vault_move::VaultMove;
