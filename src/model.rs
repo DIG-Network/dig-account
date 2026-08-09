@@ -153,7 +153,7 @@ pub struct AccountRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::fixtures::{confirmed_store, minted_did};
+    use crate::mint::fixtures::bound_mint;
     use chia_wallet_sdk::utils::Address;
     use dig_social_profile::{
         Bytes32, Coin, Did, IdentityProfile, IdentitySingleton, Profile as Metadata,
@@ -191,9 +191,8 @@ mod tests {
     /// Register a confirmed profile at `ix` so a resolved view may be attached there.
     fn registry_with(ix: ProfileIx) -> ProfileRegistry {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .record_minted(ix, &minted_did(1), &confirmed_store(1), None)
-            .unwrap();
+        let (did, store) = bound_mint(1);
+        registry.record_minted(ix, &did, &store, None).unwrap();
         registry
     }
 
@@ -245,8 +244,9 @@ mod tests {
     #[allow(deprecated)]
     fn the_deprecated_default_profile_api_delegates_to_the_registry() {
         let mut registry = registry_with(ProfileIx::ROOT);
+        let (did, store) = bound_mint(3);
         registry
-            .record_minted(ProfileIx(1), &minted_did(3), &confirmed_store(3), None)
+            .record_minted(ProfileIx(1), &did, &store, None)
             .unwrap();
         let mut account = Account::new(AccountId::new("a"), registry);
         account.attach_resolved(profile_at(ProfileIx(1))).unwrap();

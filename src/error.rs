@@ -45,6 +45,37 @@ pub enum AccountError {
     #[error("a profile mint is already in progress at index {0}")]
     MintAlreadyInProgress(ProfileIx),
 
+    /// The two halves of a mint do not belong to each other: the store was launched from some
+    /// other DID's coin.
+    ///
+    /// Each evidence proves only that its OWN coin confirmed, so pairing them is where the
+    /// relationship is checked. Recording this pair would assert a profile that does not exist.
+    /// Both ids are public coin ids.
+    #[error(
+        "the store was launched from DID coin {store_launched_from}, not from this DID's coin {did_coin_id}"
+    )]
+    MismatchedMintHalves {
+        /// The coin of the DID being recorded.
+        did_coin_id: chia_protocol::Bytes32,
+        /// The DID coin the store's launch actually spent.
+        store_launched_from: chia_protocol::Bytes32,
+    },
+
+    /// A disclosed mint fee is above the mint's hard ceiling
+    /// ([`MAX_MINT_FEE_MOJOS`](crate::mint::MAX_MINT_FEE_MOJOS)).
+    ///
+    /// The journalled store fee is the amount a resumed phase B is allowed to spend, so an
+    /// unbounded one turns a restart into a route for handing a wallet coin to a farmer — exactly
+    /// what the DID half's ceiling already refuses. Same ceiling, deliberately: a different limit
+    /// for the second bundle would be a design decision, not a bound.
+    #[error("mint fee of {fee} mojos is above the {ceiling} mojo ceiling")]
+    MintFeeAboveCeiling {
+        /// The fee that was disclosed.
+        fee: u64,
+        /// The largest fee a mint may pay.
+        ceiling: u64,
+    },
+
     /// A profile registry violated one of its four invariants — usually an edited or corrupt file.
     ///
     /// Fail-closed: the registry is not partially loaded, so a host never acts on a half-valid

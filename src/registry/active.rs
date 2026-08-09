@@ -72,14 +72,15 @@ pub struct ActiveSwitch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::fixtures::{confirmed_store, minted_did};
+    use crate::mint::fixtures::bound_mint;
     use crate::registry::anchor::ProfileAnchor;
 
     #[test]
     fn an_active_profile_reports_the_entrys_index() {
+        let (did, store) = bound_mint(1);
         let entry = ProfileEntry::new(
             ProfileIx(5),
-            ProfileAnchor::from_confirmed(&minted_did(1), &confirmed_store(2)),
+            ProfileAnchor::from_confirmed(&did, &store).unwrap(),
             None,
         );
         let active = ActiveProfile::new(&entry);

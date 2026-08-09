@@ -85,12 +85,13 @@ impl ProfileEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::fixtures::{confirmed_store, minted_did};
+    use crate::mint::fixtures::bound_mint;
 
     fn entry(label: Option<&str>) -> ProfileEntry {
+        let (did, store) = bound_mint(1);
         ProfileEntry::new(
             ProfileIx(3),
-            ProfileAnchor::from_confirmed(&minted_did(1), &confirmed_store(2)),
+            ProfileAnchor::from_confirmed(&did, &store).unwrap(),
             label.map(str::to_string),
         )
     }

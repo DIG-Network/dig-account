@@ -60,16 +60,38 @@ pub(crate) fn minted_did(seed: u8) -> MintedDid {
         .expect("the fixture record satisfies every evidence rule")
 }
 
-/// A [`ConfirmedStore`] proven from a real confirmed record, distinct per `seed`.
-pub(crate) fn confirmed_store(seed: u8) -> ConfirmedStore {
+/// A [`ConfirmedStore`] proven from a real confirmed record, distinct per `seed`, launched from
+/// `did_coin_id`.
+///
+/// Every field keeps its own byte pattern, so a constructor that transposed two of them is visible
+/// at any call site that asserts field-by-field.
+fn store_launched_from(seed: u8, did_coin_id: Bytes32) -> ConfirmedStore {
     let coin = coin(seed.wrapping_add(0x11));
     let pending = PendingStoreLaunch::new(
         Bytes32::new([seed.wrapping_add(0x50); 32]),
         coin.coin_id(),
-        Bytes32::new([seed.wrapping_add(0x90); 32]),
+        did_coin_id,
         [seed; 32],
         PUSHED_AT,
     );
     ConfirmedStore::from_confirmed(&pending, &confirmed_record(coin), PEAK)
         .expect("the fixture record satisfies every evidence rule")
+}
+
+/// A [`ConfirmedStore`] launched from a DID coin belonging to NO fixture DID.
+///
+/// Deliberately unrelated: it is what a caller reaches for to prove that pairing mismatched halves
+/// is refused, and pairing it with any [`minted_did`] MUST fail.
+pub(crate) fn confirmed_store(seed: u8) -> ConfirmedStore {
+    store_launched_from(seed, Bytes32::new([seed.wrapping_add(0x90); 32]))
+}
+
+/// The two halves of ONE mint: a [`MintedDid`] and the store genuinely launched from its coin.
+///
+/// Both go through the real constructors — nothing here is fabricated; the store's evidence simply
+/// names the DID coin it spent, exactly as a real launch would.
+pub(crate) fn bound_mint(seed: u8) -> (MintedDid, ConfirmedStore) {
+    let did = minted_did(seed);
+    let store = store_launched_from(seed.wrapping_add(1), did.coin_id());
+    (did, store)
 }

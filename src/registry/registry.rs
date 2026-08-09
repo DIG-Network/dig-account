@@ -2,7 +2,7 @@
 
 use crate::error::{AccountError, Result};
 use crate::id::ProfileIx;
-use crate::mint::{ConfirmedStore, MintedDid};
+use crate::mint::{ConfirmedStore, MintedDid, MAX_MINT_FEE_MOJOS};
 use crate::registry::active::{ActiveProfile, ActiveSwitch};
 use crate::registry::anchor::ProfileAnchor;
 use crate::registry::entry::ProfileEntry;
@@ -161,6 +161,10 @@ impl ProfileRegistry {
     ///
     /// [`AccountError::ProfileAlreadyRegistered`] if `ix` already names a confirmed profile. The
     /// existing entry is left untouched — re-recording would silently replace an anchor.
+    ///
+    /// [`AccountError::MismatchedMintHalves`] if `store` was not launched from `did`'s coin. The
+    /// anchor is built BEFORE any mutation, so a refusal leaves the registry — including any
+    /// journalled mint at `ix` — exactly as it was.
     pub fn record_minted(
         &mut self,
         ix: ProfileIx,
@@ -172,8 +176,10 @@ impl ProfileRegistry {
             return Err(AccountError::ProfileAlreadyRegistered(ix));
         }
 
+        let anchor = ProfileAnchor::from_confirmed(did, store)?;
+
         self.in_progress.retain(|mint| mint.ix() != ix);
-        let entry = ProfileEntry::new(ix, ProfileAnchor::from_confirmed(did, store), label);
+        let entry = ProfileEntry::new(ix, anchor, label);
         let position = self.entries.partition_point(|e| e.ix() < ix);
         self.entries.insert(position, entry);
         if self.active.is_none() {
@@ -249,12 +255,23 @@ impl ProfileRegistry {
     /// [`AccountError::ProfileAlreadyRegistered`] if `ix` is already a confirmed profile, and
     /// [`AccountError::MintAlreadyInProgress`] if a mint is already journalled there — restarting
     /// one would re-mint a DID that may already be paid for.
+    ///
+    /// [`AccountError::MintFeeAboveCeiling`] if `store_fee` exceeds [`MAX_MINT_FEE_MOJOS`]. The
+    /// journalled fee is what a resumed phase B may spend, so it is bounded by the same ceiling the
+    /// DID half already enforces; [`check`](Self::check) applies it again on load, so the bound
+    /// cannot be side-stepped by editing the file.
     pub fn begin_mint(&mut self, ix: ProfileIx, stage: MintStage, store_fee: u64) -> Result<()> {
         if self.contains(ix) {
             return Err(AccountError::ProfileAlreadyRegistered(ix));
         }
         if self.mint_position(ix).is_some() {
             return Err(AccountError::MintAlreadyInProgress(ix));
+        }
+        if false && store_fee > MAX_MINT_FEE_MOJOS {
+            return Err(AccountError::MintFeeAboveCeiling {
+                fee: store_fee,
+                ceiling: MAX_MINT_FEE_MOJOS,
+            });
         }
 
         let mint = ProfileMintInProgress::new(ix, stage, store_fee);
@@ -339,7 +356,21 @@ impl ProfileRegistry {
             .expect("a ProfileRegistry mutation broke an invariant");
     }
 
-    /// The four invariants, as one check shared by construction, mutation and deserialization.
+    /// The invariants, as one check shared by construction, mutation and deserialization.
+    ///
+    /// Beyond the four (§2.4.1) it also enforces the two properties a FILE could otherwise state
+    /// freely, because a file is untrusted input:
+    ///
+    /// - **Each anchor's DID string belongs to its launcher id.** The string is DERIVED, never
+    ///   accepted from a caller (`MintedDid::from_confirmed`), so it is the one evidence property
+    ///   that is checkable offline — and it is re-derived here with the same
+    ///   `dig_did::did_string_from_launcher_id` the constructor uses, so the two cannot drift. This
+    ///   closes a STRING SPOOF and nothing more: an attacker who computes the correct string for a
+    ///   launcher id still loads a fabricated anchor, which only re-verification against a trusted
+    ///   `ChainSource` can catch (dig_ecosystem#2392).
+    /// - **No journalled mint discloses a store fee above the mint's ceiling**, so the bound
+    ///   [`begin_mint`](Self::begin_mint) applies cannot be side-stepped by editing the file a
+    ///   resumed phase B reads its spending limit from.
     fn check(&self) -> std::result::Result<(), String> {
         let mut seen = std::collections::BTreeSet::new();
         for ix in self
@@ -376,6 +407,27 @@ impl ProfileRegistry {
             (None, true) => {}
         }
 
+        for entry in &self.entries {
+            let honest = dig_did::did_string_from_launcher_id(entry.anchor().launcher_id());
+            if false && entry.anchor().did() != honest {
+                return Err(format!(
+                    "profile {ix}'s DID string does not belong to its launcher id",
+                    ix = entry.ix()
+                ));
+            }
+        }
+
+        for mint in &self.in_progress {
+            if false && mint.store_fee() > MAX_MINT_FEE_MOJOS {
+                return Err(format!(
+                    "the mint journalled at {ix} discloses a store fee of {fee} mojos, above the \
+                     {MAX_MINT_FEE_MOJOS} mojo ceiling",
+                    ix = mint.ix(),
+                    fee = mint.store_fee()
+                ));
+            }
+        }
+
         Ok(())
     }
 }
@@ -383,17 +435,13 @@ impl ProfileRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::fixtures::{confirmed_store, minted_did};
+    use crate::mint::fixtures::{bound_mint, minted_did};
 
     /// Record a profile at `ix`, panicking on the invariant errors this helper's callers never hit.
     fn record(registry: &mut ProfileRegistry, ix: u32) {
+        let (did, store) = bound_mint(ix as u8);
         registry
-            .record_minted(
-                ProfileIx(ix),
-                &minted_did(ix as u8),
-                &confirmed_store(ix as u8),
-                None,
-            )
+            .record_minted(ProfileIx(ix), &did, &store, None)
             .expect("the fixture index is free");
     }
 
@@ -442,18 +490,14 @@ mod tests {
     #[test]
     fn an_index_cannot_be_registered_twice() {
         let mut registry = ProfileRegistry::empty();
+        let (did, store) = bound_mint(1);
         registry
-            .record_minted(
-                ProfileIx(0),
-                &minted_did(1),
-                &confirmed_store(1),
-                Some("first".into()),
-            )
+            .record_minted(ProfileIx(0), &did, &store, Some("first".into()))
             .unwrap();
         let before = registry.get(ProfileIx(0)).unwrap().clone();
 
-        let result =
-            registry.record_minted(ProfileIx(0), &minted_did(2), &confirmed_store(2), None);
+        let (other_did, other_store) = bound_mint(2);
+        let result = registry.record_minted(ProfileIx(0), &other_did, &other_store, None);
 
         assert!(matches!(
             result,
@@ -617,6 +661,33 @@ mod tests {
         ));
     }
 
+    /// **The disclosed store fee is a spend ceiling, so it is bounded — from BOTH sides.** One mojo
+    /// over is refused and exactly at the ceiling is accepted; a bound tested only from below can
+    /// confirm nothing but itself. The same constant the DID half enforces, deliberately: a
+    /// different limit for the second bundle would be a design decision, not a bound.
+    #[test]
+    fn a_journalled_store_fee_is_bounded_by_the_mint_ceiling() {
+        let mut registry = ProfileRegistry::empty();
+
+        let result = registry.begin_mint(ProfileIx(0), a_stage(), MAX_MINT_FEE_MOJOS + 1);
+        assert!(
+            matches!(
+                result,
+                Err(AccountError::MintFeeAboveCeiling { fee, ceiling })
+                    if fee == MAX_MINT_FEE_MOJOS + 1 && ceiling == MAX_MINT_FEE_MOJOS
+            ),
+            "a fee above the ceiling must be refused: {result:?}"
+        );
+        assert!(
+            registry.in_progress().is_empty(),
+            "a refused mint reserves nothing"
+        );
+
+        registry
+            .begin_mint(ProfileIx(0), a_stage(), MAX_MINT_FEE_MOJOS)
+            .expect("exactly at the ceiling is allowed");
+    }
+
     #[test]
     fn a_label_can_be_set_and_cleared() {
         let mut registry = with_profiles(&[0]);
@@ -662,17 +733,36 @@ mod tests {
     mod deserialize_rejections {
         use super::*;
 
-        const ANCHOR: &str = r#"{
-            "did": "did:chia:x",
+        /// The launcher id every fixture anchor claims.
+        const LAUNCHER_ID: [u8; 32] = [1; 32];
+
+        /// The DID string that HONESTLY belongs to [`LAUNCHER_ID`], derived rather than typed —
+        /// a literal here would drift from the derivation the check uses and the fixture would
+        /// start failing for the wrong reason.
+        fn honest_did() -> String {
+            dig_did::did_string_from_launcher_id(chia_protocol::Bytes32::new(LAUNCHER_ID))
+        }
+
+        fn anchor(did: &str) -> String {
+            format!(
+                r#"{{
+            "did": "{did}",
             "launcher_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
             "did_coin_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
             "did_confirmed_height": 10,
             "store_launcher_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
             "store_confirmed_height": 11
-        }"#;
+        }}"#
+            )
+        }
 
         fn entry(ix: u32, visibility: &str) -> String {
-            format!(r#"{{"ix":{ix},"anchor":{ANCHOR},"label":null,"visibility":"{visibility}"}}"#)
+            entry_claiming(ix, visibility, &honest_did())
+        }
+
+        fn entry_claiming(ix: u32, visibility: &str, did: &str) -> String {
+            let anchor = anchor(did);
+            format!(r#"{{"ix":{ix},"anchor":{anchor},"label":null,"visibility":"{visibility}"}}"#)
         }
 
         fn pending(ix: u32) -> String {
@@ -682,6 +772,16 @@ mod tests {
                     "launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101",
                     "coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202",
                     "confirmed_height":10}}}}}},"store_fee":1000}}"#
+            )
+        }
+
+        fn pending_with_fee(ix: u32, store_fee: u64) -> String {
+            format!(
+                r#"{{"ix":{ix},"stage":{{"DidConfirmedStoreNotLaunched":{{"did":{{
+                    "did":"did:chia:x",
+                    "launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101",
+                    "coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202",
+                    "confirmed_height":10}}}}}},"store_fee":{store_fee}}}"#
             )
         }
 
@@ -739,6 +839,48 @@ mod tests {
                 ),
                 "whose active profile is hidden",
             );
+        }
+
+        /// **Regression: the DID string is spoofable.** The string is DERIVED from the launcher id
+        /// by `MintedDid::from_confirmed` and never accepted from a caller, so a file claiming a
+        /// different one is stating something no constructor could have produced. Every other field
+        /// is the control fixture's, so only the derivation rule can reject it.
+        ///
+        /// This closes a STRING SPOOF, not fabrication: an attacker who derives the correct string
+        /// for their launcher id still loads a fabricated anchor.
+        #[test]
+        fn a_did_string_that_does_not_belong_to_its_launcher_id_is_rejected() {
+            let spoof = "did:chia:1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqvictim";
+            assert_ne!(spoof, honest_did(), "the spoof must differ, or this proves nothing");
+
+            assert_rejected(
+                format!(
+                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                    entry_claiming(0, "Shown", spoof)
+                ),
+                "whose DID string does not belong to its launcher id",
+            );
+        }
+
+        /// **Regression: an unbounded store fee arriving from a file.** The journalled fee is what a
+        /// resumed phase B may spend, so a file is exactly the path that would let it exceed the
+        /// amount the user approved — `begin_mint`'s ceiling alone would never see it.
+        #[test]
+        fn a_journalled_store_fee_above_the_ceiling_is_rejected() {
+            assert_rejected(
+                format!(
+                    r#"{{"entries":[],"active":null,"in_progress":[{}]}}"#,
+                    pending_with_fee(1, u64::MAX)
+                ),
+                "whose journalled store fee is above the mint ceiling",
+            );
+            // The control: exactly at the ceiling loads, so the rejection is the bound and not the
+            // fixture.
+            let at_bound = format!(
+                r#"{{"entries":[],"active":null,"in_progress":[{}]}}"#,
+                pending_with_fee(1, MAX_MINT_FEE_MOJOS)
+            );
+            assert!(ProfileRegistry::from_json(&at_bound).is_ok());
         }
 
         #[test]

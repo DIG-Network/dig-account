@@ -122,6 +122,13 @@ pub struct ConfirmedStore {
     /// The block height at which that coin was confirmed. Not optional: an unconfirmed launch
     /// cannot be represented by this type.
     confirmed_height: u32,
+    /// The DID coin this store was launched FROM, carried through from the launch this evidence
+    /// proves.
+    ///
+    /// This is what makes the store attributable: a confirmed store coin on its own says a store
+    /// exists somewhere, and only this field says WHOSE. [`ProfileAnchor`](crate::ProfileAnchor)
+    /// pairs the two halves of a mint by comparing it against the DID's own coin id.
+    did_coin_id: Bytes32,
     /// The root the launch spend committed to.
     committed_root: [u8; 32],
 }
@@ -174,6 +181,7 @@ impl ConfirmedStore {
             launcher_id: pending.launcher_id(),
             coin_id: pending.store_coin_id(),
             confirmed_height,
+            did_coin_id: pending.did_coin_id(),
             committed_root: pending.committed_root(),
         })
     }
@@ -191,6 +199,12 @@ impl ConfirmedStore {
     /// The block height at which the store coin was confirmed.
     pub fn confirmed_height(&self) -> u32 {
         self.confirmed_height
+    }
+
+    /// The DID coin this store was launched from — the only thing that ties the store to an
+    /// identity.
+    pub fn did_coin_id(&self) -> Bytes32 {
+        self.did_coin_id
     }
 
     /// The root the launch spend committed to.
@@ -251,6 +265,16 @@ mod tests {
         assert_eq!(store.confirmed_height(), PUSHED_AT);
         assert_eq!(store.launcher_id(), pending.launcher_id());
         assert_eq!(store.coin_id(), pending.store_coin_id());
+        assert_eq!(
+            store.did_coin_id(),
+            pending.did_coin_id(),
+            "the DID coin the launch spent is carried through, or the store loses its owner"
+        );
+        assert_ne!(
+            store.did_coin_id(),
+            store.coin_id(),
+            "the fixture must distinguish the two coins, or a transposed field would pass"
+        );
         assert_eq!(
             store.committed_root(),
             ROOT,

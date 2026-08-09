@@ -65,11 +65,26 @@ impl ProfileMinter {
         Ok(self.seed.master_seed())
     }
 
-    /// Mint a new profile at HD index `ix`: launch its DID + dig-store and bind them into an
-    /// [`IdentityProfile`], signed with the profile's derived identity key.
+    /// **NOT YET IMPLEMENTED — calling this panics.** See `# Panics`.
     ///
-    /// **Broadcasting the resulting spends on mainnet spends real DIG/XCH.**
+    /// When it exists it will mint a whole profile at HD index `ix`: launch its DID + dig-store and
+    /// bind them into an [`IdentityProfile`], signed with the profile's derived identity key. The
+    /// current signature is not the final one — a profile mint is a two-phase on-chain ceremony, so
+    /// it needs a `ChainSource`, a `SpendPublisher` and a `MintNetwork` this signature does not
+    /// take. That shape lands with phase B (dig_ecosystem#2342).
+    ///
+    /// The DID half IS real today: [`crate::mint`] builds, signs and pushes a `did:chia:` mint and
+    /// turns its confirmation into [`MintedDid`](crate::mint::MintedDid) evidence.
+    ///
+    /// **Once the body exists, broadcasting the resulting spends on mainnet spends real DIG/XCH.**
+    ///
+    /// # Panics
+    ///
+    /// Unconditionally, on every call, with a `todo!()`. There is no argument that makes it
+    /// succeed, and nothing is derived, signed or pushed before it panics.
     pub fn mint(&self, ix: ProfileIx) -> Result<IdentityProfile> {
+        // Both parameters are unread only because the body does not exist yet; discarding them
+        // keeps the signature — which is part of this cut's public shape — warning-free.
         let _ = (&self.seed, ix);
         todo!("Phase 2: DID launch + dig-store create + SMT seed via IdentityProfile::mint_from_did, signed with the profile's derived key")
     }

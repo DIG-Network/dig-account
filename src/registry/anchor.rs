@@ -2,6 +2,7 @@
 
 use chia_protocol::Bytes32;
 
+use crate::error::{AccountError, Result};
 use crate::mint::{ConfirmedStore, MintedDid};
 
 /// The PERSISTED public record of a profile that exists on chain: both halves of the mint, and the
@@ -45,19 +46,34 @@ pub struct ProfileAnchor {
 }
 
 impl ProfileAnchor {
-    /// The only way to build an anchor: from BOTH evidences.
+    /// The only way to build an anchor: from BOTH evidences, and only when they are the two halves
+    /// of the SAME mint.
     ///
-    /// Total rather than fallible, because there is nothing left to check — every field is copied
-    /// out of a value whose own constructor already refused anything unproven.
-    pub fn from_confirmed(did: &MintedDid, store: &ConfirmedStore) -> Self {
-        Self {
+    /// Each evidence proves that its own coin confirmed, and neither proves anything about the
+    /// other. A profile is not "a DID and a store" — it is a DID and the store launched FROM that
+    /// DID's coin, so the one thing left to check is exactly the thing neither constructor could
+    /// check alone: that `store.did_coin_id()` is `did.coin_id()`. Without it any two unrelated
+    /// confirmations would compose into an anchor asserting a profile that does not exist.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::MismatchedMintHalves`] when the store was launched from some other DID coin.
+    /// Fail-closed: no anchor is produced, not a plausible one.
+    pub fn from_confirmed(did: &MintedDid, store: &ConfirmedStore) -> Result<Self> {
+        if store.did_coin_id() != did.coin_id() {
+            return Err(AccountError::MismatchedMintHalves {
+                did_coin_id: did.coin_id(),
+                store_launched_from: store.did_coin_id(),
+            });
+        }
+        Ok(Self {
             did: did.did().to_string(),
             launcher_id: did.launcher_id(),
             did_coin_id: did.coin_id(),
             did_confirmed_height: did.confirmed_height(),
             store_launcher_id: store.launcher_id(),
             store_confirmed_height: store.confirmed_height(),
-        }
+        })
     }
 
     /// The canonical `did:chia:…` string.
@@ -94,7 +110,7 @@ impl ProfileAnchor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mint::fixtures::{confirmed_store, minted_did};
+    use crate::mint::fixtures::{bound_mint, confirmed_store, minted_did};
 
     /// Every field of BOTH evidences reaches the anchor. A mutant that dropped
     /// `store_confirmed_height` — or that quietly copied the DID's launcher id into the store's
@@ -102,15 +118,15 @@ mod tests {
     /// the anchor merely being non-empty.
     #[test]
     fn an_anchor_carries_every_field_of_both_evidences() {
-        let did = minted_did(1);
-        let store = confirmed_store(2);
+        let (did, store) = bound_mint(1);
         assert_ne!(
             did.launcher_id(),
             store.launcher_id(),
             "the fixture must distinguish the two halves, or a swapped field would pass"
         );
 
-        let anchor = ProfileAnchor::from_confirmed(&did, &store);
+        let anchor = ProfileAnchor::from_confirmed(&did, &store)
+            .expect("halves of the same mint compose into an anchor");
 
         assert_eq!(anchor.did(), did.did());
         assert_eq!(anchor.launcher_id(), did.launcher_id());
@@ -120,9 +136,41 @@ mod tests {
         assert_eq!(anchor.store_confirmed_height(), store.confirmed_height());
     }
 
+    /// **The regression test.** Two evidences, each individually proven, that are NOT halves of one
+    /// mint: the store names a DID coin no fixture DID owns. Every field is present and every
+    /// constructor was satisfied, and the pair is still a lie — so the refusal can only come from
+    /// the pairing check itself.
+    ///
+    /// The control above (built from `bound_mint`) is what stops this passing because the fixture
+    /// is broken rather than because the rule fired.
+    #[test]
+    fn an_anchor_refuses_two_halves_of_different_mints() {
+        let did = minted_did(1);
+        let store = confirmed_store(2);
+        assert_ne!(
+            store.did_coin_id(),
+            did.coin_id(),
+            "the fixture must be genuinely unrelated, or this proves nothing"
+        );
+
+        let result = ProfileAnchor::from_confirmed(&did, &store);
+
+        assert!(
+            matches!(
+                result,
+                Err(AccountError::MismatchedMintHalves {
+                    did_coin_id,
+                    store_launched_from,
+                }) if did_coin_id == did.coin_id() && store_launched_from == store.did_coin_id()
+            ),
+            "an unrelated pair must be refused, and the error must name both coins: {result:?}"
+        );
+    }
+
     #[test]
     fn an_anchor_round_trips_through_json() {
-        let anchor = ProfileAnchor::from_confirmed(&minted_did(1), &confirmed_store(2));
+        let (did, store) = bound_mint(1);
+        let anchor = ProfileAnchor::from_confirmed(&did, &store).unwrap();
         let json = serde_json::to_string(&anchor).unwrap();
         assert_eq!(
             serde_json::from_str::<ProfileAnchor>(&json).unwrap(),
