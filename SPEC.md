@@ -817,6 +817,12 @@ A push is not a payment. `TransferPlan::pushed_at(pre_push_peak)` yields a `Pend
 expose no success-flavoured accessor, and `transfer_status(pending, chain)` is the only route to a
 `ConfirmedTransfer`.
 
+`pre_push_peak` is compared with STRICTLY-LESS-THAN, never `<=`. `ChainSource::peak_height` reports the
+height the NEXT block will take rather than the last one that exists, so the first block able to contain
+the bundle carries exactly the height read before the push; an implementation that refused that height
+as "a block that already existed" would reject every first-block confirmation and report a settled
+payment as permanently unconfirmed.
+
 `pre_push_peak` MUST be read BEFORE the bundle is pushed. A transfer cannot be included in a block that
 already existed when it was broadcast, so this height is the only thing that later makes a back-dated
 confirmation contradict something the chain itself said earlier; read afterwards, the number a
@@ -824,10 +830,8 @@ fabricating source would have to contradict is one it also supplied.
 
 `transfer_status` returns exactly one of:
 
-- `Confirmed(ConfirmedTransfer)` — the payment coin exists at a height that is non-zero, STRICTLY
-  GREATER than the pre-push peak, and buried under `MIN_CONFIRMATION_DEPTH` blocks. The pre-push peak
-  names a block that already existed when the bundle was broadcast, so a confirmation at exactly that
-  height is as impossible as one below it and MUST be refused. A coin id commits to
+- `Confirmed(ConfirmedTransfer)` — the payment coin exists at a height that is non-zero, not before the
+  push, and buried under `MIN_CONFIRMATION_DEPTH` blocks. A coin id commits to
   `(parent, puzzle_hash, amount)`, so a matching id is itself the proof that the recipient and amount are
   the ones that were built. A record WITHOUT a confirmed height is a mempool observation and MUST NOT be
   treated as evidence, however deep the chain has since advanced.
@@ -904,9 +908,8 @@ module. That constructor MUST reject a coin record unless ALL of the following h
 2. it carries a confirmed height (a mempool observation — a real record of the right coin, from a
    reachable node, with no confirmed height — is NOT evidence);
 3. that height is not `0` (no coin is created in genesis);
-4. that height is STRICTLY GREATER than the chain peak observed immediately before the push. The
-   pre-push peak names a block that already existed when the bundle was broadcast, so a confirmation AT
-   that height is as impossible as one below it, and both MUST be refused; and
+4. that height is not below the chain peak observed immediately BEFORE the push (a mint cannot appear in
+   a block that already existed when it was broadcast); and
 5. the coin is buried under at least `MIN_CONFIRMATION_DEPTH` blocks, so a shallow reorg cannot undo a
    DID already recorded as permanent. This also rejects a height beyond the source's own peak, whose
    depth is 1; `MIN_CONFIRMATION_DEPTH` MUST therefore exceed 1.

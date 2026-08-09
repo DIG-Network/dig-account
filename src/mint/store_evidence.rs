@@ -165,7 +165,7 @@ impl ConfirmedStore {
             return None;
         }
         let confirmed_height = record.confirmed_height?;
-        if confirmed_height == 0 || confirmed_height <= pending.pushed_at_height() {
+        if confirmed_height == 0 || confirmed_height < pending.pushed_at_height() {
             return None;
         }
         // `peak - confirmed` is the number of blocks built ON TOP; the confirming block itself is
@@ -274,12 +274,7 @@ mod tests {
     /// The height the launch was pushed at, and a peak far enough beyond it that an honest
     /// confirmation at `PUSHED_AT` is buried past [`MIN_CONFIRMATION_DEPTH`].
     const PUSHED_AT: u32 = 4_200_000;
-    /// The earliest height that CAN contain the bundle: `PUSHED_AT` is the peak read BEFORE the push,
-    /// so a block at that very height already existed and cannot hold it.
-    const CONFIRMED_AT: u32 = PUSHED_AT + 1;
-    /// Exactly `MIN_CONFIRMATION_DEPTH` blocks of burial for a confirmation at `CONFIRMED_AT`, since
-    /// the confirming block is itself the first of the depth.
-    const PEAK: u32 = CONFIRMED_AT + MIN_CONFIRMATION_DEPTH - 1;
+    const PEAK: u32 = PUSHED_AT + MIN_CONFIRMATION_DEPTH;
 
     fn coin() -> Coin {
         Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1)
@@ -305,36 +300,6 @@ mod tests {
         }
     }
 
-    /// **A confirmation at EXACTLY the pre-push peak is not evidence.** `pushed_at_height` is the
-    /// peak read BEFORE the bundle was broadcast, so a block at that very height already existed and
-    /// cannot contain it; only a STRICTLY greater height can.
-    ///
-    /// The `predates the push` test cannot reach this case — it uses a height BELOW the push, which a
-    /// `<` comparison rejects exactly as a `<=` one does. Only the equal case tells the two apart.
-    #[test]
-    fn a_store_confirmation_at_exactly_the_pre_push_peak_is_not_evidence() {
-        let coin = coin();
-        let pending = pending_for(&coin);
-        assert!(
-            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(PUSHED_AT)), PEAK)
-                .is_none(),
-            "a block that already existed at push time cannot contain this bundle"
-        );
-    }
-
-    /// The other side of the boundary: ONE block later IS accepted, so the rule above is an
-    /// off-by-one boundary and not a guard that rejects everything.
-    #[test]
-    fn a_store_confirmation_one_block_after_the_pre_push_peak_is_evidence() {
-        let coin = coin();
-        let pending = pending_for(&coin);
-        assert!(
-            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(CONFIRMED_AT)), PEAK)
-                .is_some(),
-            "the first block that could contain the bundle is evidence"
-        );
-    }
-
     /// The CONTROL. Without it every rejection below could pass because the fixture is broken rather
     /// than because the rule fired.
     #[test]
@@ -342,11 +307,10 @@ mod tests {
         let coin = coin();
         let pending = pending_for(&coin);
 
-        let store =
-            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(CONFIRMED_AT)), PEAK)
-                .expect("a buried confirmation of the expected coin is evidence");
+        let store = ConfirmedStore::from_confirmed(&pending, &record(coin, Some(PUSHED_AT)), PEAK)
+            .expect("a buried confirmation of the expected coin is evidence");
 
-        assert_eq!(store.confirmed_height(), CONFIRMED_AT);
+        assert_eq!(store.confirmed_height(), PUSHED_AT);
         assert_eq!(store.launcher_id(), pending.launcher_id());
         assert_eq!(store.coin_id(), pending.store_coin_id());
         assert_eq!(
@@ -385,7 +349,7 @@ mod tests {
         assert_ne!(other.coin_id(), pending.store_coin_id());
 
         assert!(
-            ConfirmedStore::from_confirmed(&pending, &record(other, Some(CONFIRMED_AT)), PEAK)
+            ConfirmedStore::from_confirmed(&pending, &record(other, Some(PUSHED_AT)), PEAK)
                 .is_none()
         );
     }
@@ -455,16 +419,16 @@ mod tests {
 
         // The confirming block counts as the first of the depth, so a peak of
         // `h + MIN_CONFIRMATION_DEPTH - 1` is exactly at the bound.
-        let at_bound = CONFIRMED_AT + MIN_CONFIRMATION_DEPTH - 1;
+        let at_bound = PUSHED_AT + MIN_CONFIRMATION_DEPTH - 1;
         let one_short = at_bound - 1;
 
         assert!(
-            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(CONFIRMED_AT)), one_short)
+            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(PUSHED_AT)), one_short)
                 .is_none(),
             "one block short of {MIN_CONFIRMATION_DEPTH} deep is still reversible"
         );
         assert!(
-            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(CONFIRMED_AT)), at_bound)
+            ConfirmedStore::from_confirmed(&pending, &record(coin, Some(PUSHED_AT)), at_bound)
                 .is_some(),
             "exactly {MIN_CONFIRMATION_DEPTH} deep is evidence"
         );

@@ -462,7 +462,12 @@ impl ConfirmedTransfer {
     ///    the amount are the ones that were built — there is nothing separate left to compare.
     /// 2. **It carries a confirmed height.** An unconfirmed record is a mempool observation.
     /// 3. **That height is not genesis**, since no coin is created in block 0.
-    /// 4. **It does not predate the push** (see [`TransferPlan::pushed_at`]).
+    /// 4. **It does not predate the push** (see [`TransferPlan::pushed_at`]). The comparison is
+    ///    STRICTLY LESS THAN, and that is deliberate: `ChainSource::peak_height` reports the height
+    ///    the NEXT block will take, not the last one that exists, so the first block able to contain
+    ///    the bundle carries exactly the height read before the push. Tightening this to `<=` reads
+    ///    like closing an off-by-one and instead rejects every first-block confirmation, turning a
+    ///    settled payment into one that never confirms.
     /// 5. **It is buried under [`MIN_CONFIRMATION_DEPTH`] blocks**, so a shallow reorg cannot undo a
     ///    payment already reported as settled. This also rejects a height beyond the source's own
     ///    peak, whose computed depth is 1.
@@ -475,7 +480,7 @@ impl ConfirmedTransfer {
             return None;
         }
         let confirmed_height = record.confirmed_height?;
-        if confirmed_height == 0 || confirmed_height <= pending.pushed_at_height {
+        if confirmed_height == 0 || confirmed_height < pending.pushed_at_height {
             return None;
         }
         // `peak - confirmed` counts the blocks built ON TOP; the confirming block is the first of the
@@ -2183,60 +2188,9 @@ mod tests {
         );
     }
 
-    /// **A confirmation at EXACTLY the pre-push peak is not evidence.** `pushed_at_height` is the
-    /// peak read BEFORE the bundle was broadcast, so a block at that very height already existed when
-    /// the transfer was pushed and cannot contain it. Only a STRICTLY greater height can.
-    ///
-    /// This is the boundary case the `predating the push` test cannot reach: it uses `PEAK - 1`, which
-    /// a `<` comparison rejects just as a `<=` one does. Only the equal case tells them apart, and
-    /// getting it wrong accepts a confirmation the chain itself says is impossible — the exact class
-    /// `pushed_at`'s pre-push read exists to make contradictable.
-    #[test]
-    fn a_confirmation_at_exactly_the_pre_push_peak_is_not_evidence() {
-        let ops = ops();
-        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
-        let (pending, payment) = pending_and_payment(&ops, &source);
-        assert_eq!(
-            pending.pushed_at_height(),
-            PEAK,
-            "the fixture pins the boundary"
-        );
-
-        let chain = FixedChain::with_records(vec![record(payment, Some(PEAK), None)])
-            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
-
-        assert!(
-            matches!(
-                transfer_status(&pending, &chain).expect("readable"),
-                TransferStatus::Awaiting { .. }
-            ),
-            "a block that already existed at push time cannot contain this transfer"
-        );
-    }
-
-    /// The other side of that boundary: ONE block later IS acceptable. A bound tested only from below
-    /// can only confirm itself, and a guard tightened to reject everything would satisfy the test
-    /// above while breaking every real confirmation.
-    #[test]
-    fn a_confirmation_one_block_after_the_pre_push_peak_is_evidence() {
-        let ops = ops();
-        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
-        let (pending, payment) = pending_and_payment(&ops, &source);
-
-        let chain = FixedChain::with_records(vec![record(payment, Some(PEAK + 1), None)])
-            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
-
-        let settled = transfer_status(&pending, &chain)
-            .expect("readable")
-            .confirmed()
-            .cloned()
-            .expect("the first block that could contain the transfer is evidence");
-        assert_eq!(settled.confirmed_height(), PEAK + 1);
-    }
-
     /// **The burial bound, pinned from BOTH sides.** `MIN_CONFIRMATION_DEPTH` blocks of burial is
-    /// enough and one fewer is not, so the constant's value is what the test measures rather than
-    /// whichever side happens to be checked.
+    /// enough and one fewer is not, so what the test measures is the constant's value rather than
+    /// whichever side happens to be checked. A bound tested from one side can only confirm itself.
     #[test]
     fn the_confirmation_depth_bound_holds_from_both_sides() {
         let ops = ops();
@@ -2265,6 +2219,39 @@ mod tests {
                 TransferStatus::Awaiting { .. }
             ),
             "one block short of the bound must not be treated as settled"
+        );
+    }
+
+    /// **A confirmation at EXACTLY the pre-push peak is legitimate, and this pins that it is
+    /// accepted.** It reads like an impossibility — a block that already existed cannot contain a
+    /// bundle pushed afterwards — and that reading is wrong here, which is why it is written down.
+    ///
+    /// `ChainSource::peak_height` reports the height the NEXT block will take, not the height of the
+    /// last one that exists: the simulator this crate tests against stamps a new coin with
+    /// `created_height = height()` and only then increments. So the first block that can contain a
+    /// bundle carries exactly the height read before the push, and tightening the comparison to `<=`
+    /// would reject every genuinely first-block confirmation — turning a settled payment into one
+    /// that never confirms, and inviting a caller to send it twice.
+    #[test]
+    fn a_confirmation_at_exactly_the_pre_push_peak_is_accepted() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+        assert_eq!(
+            pending.pushed_at_height(),
+            PEAK,
+            "the fixture pins the boundary"
+        );
+
+        let chain = FixedChain::with_records(vec![record(payment, Some(PEAK), None)])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
+
+        assert!(
+            transfer_status(&pending, &chain)
+                .expect("readable")
+                .confirmed()
+                .is_some(),
+            "the first block that can contain the bundle carries the pre-push peak's own height"
         );
     }
 

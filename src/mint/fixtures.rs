@@ -8,11 +8,8 @@ use super::store_evidence::{ConfirmedStore, PendingStoreLaunch};
 
 /// A push height comfortably past genesis, so a fixture never leans on the genesis rule by accident.
 const PUSHED_AT: u32 = 4_200_000;
-/// The earliest height that CAN contain the bundle: `PUSHED_AT` is the peak read BEFORE the push, so
-/// a block at that height already existed and cannot hold it.
-const CONFIRMED_AT: u32 = PUSHED_AT + 1;
-/// A peak that buries `CONFIRMED_AT` exactly at [`MIN_CONFIRMATION_DEPTH`].
-const PEAK: u32 = CONFIRMED_AT + MIN_CONFIRMATION_DEPTH - 1;
+/// A peak that buries `PUSHED_AT` exactly at [`MIN_CONFIRMATION_DEPTH`].
+const PEAK: u32 = PUSHED_AT + MIN_CONFIRMATION_DEPTH - 1;
 
 /// A distinct coin per `seed`, so two fixtures never collide.
 fn coin(seed: u8) -> Coin {
@@ -22,7 +19,7 @@ fn coin(seed: u8) -> Coin {
 fn confirmed_record(coin: Coin) -> CoinRecord {
     CoinRecord {
         coin,
-        confirmed_height: Some(CONFIRMED_AT),
+        confirmed_height: Some(PUSHED_AT),
         spent_height: None,
         timestamp: None,
         coinbase: false,
