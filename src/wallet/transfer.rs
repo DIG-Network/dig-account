@@ -182,6 +182,24 @@ pub struct TransferRequest {
 
 impl TransferRequest {
     /// Pay `amount_mojos` to the standard puzzle hash `recipient`, with no fee.
+    ///
+    /// # This constructor is the way PAST the prefix rule, so it must not take user input
+    ///
+    /// A `Bytes32` carries no evidence of where it came from. [`to_address`](Self::to_address)
+    /// refuses anything but an [`xch`](MAINNET_ADDRESS_PREFIX) address precisely because an
+    /// `nft1…`/`did:chia:…`/`cat1…`/`txch1…` string decodes cleanly into a puzzle hash nobody holds a
+    /// preimage for — and paying one burns the funds permanently, while still confirming and
+    /// reporting [`TransferStatus::Confirmed`]. Once that string has been reduced to a puzzle hash
+    /// the evidence is gone, and this constructor cannot tell a burn address from a payable one.
+    ///
+    /// So `Address::decode(user_input)?.puzzle_hash` handed to this function reconstructs the whole
+    /// burn in the CALLER, with the prefix check bypassed rather than failed. Anything that
+    /// originated as a string a human typed, pasted, scanned, or received MUST go through
+    /// [`to_address`](Self::to_address).
+    ///
+    /// Use this one only for a puzzle hash the code itself derived and already knows to be payable —
+    /// a standard puzzle hash computed from a public key, an address this wallet generated, or a
+    /// destination a lower layer has already validated.
     pub fn to_puzzle_hash(recipient: Bytes32, amount_mojos: u64) -> Self {
         Self {
             recipient,
