@@ -1338,6 +1338,59 @@ mod tests {
         assert_eq!(plan.change_mojos(), change.amount);
     }
 
+    /// **The payment coin carries the recipient as a hint.** The hint is how the recipient's wallet
+    /// discovers the payment by hinted scan. A payment that confirms and conserves value but hints to
+    /// a different puzzle hash (e.g. the sender's own) may never surface in the recipient's wallet.
+    ///
+    /// This test asserts EQUALITY with the recipient — not merely that a memo is present — so it goes
+    /// red if the hint names any other puzzle hash.
+    #[test]
+    fn the_payment_coin_is_hinted_to_the_recipient() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+            )
+            .expect("builds");
+
+        // Re-run the puzzles with a shared allocator so the NodePtrs in the memos are still
+        // readable when we decode them.
+        let mut allocator = Allocator::new();
+        let mut payment_hint: Option<Bytes32> = None;
+        'outer: for spend in plan.coin_spends() {
+            let puzzle =
+                node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("valid puzzle");
+            let solution =
+                node_from_bytes(&mut allocator, &spend.solution).expect("valid solution");
+            let output = run_puzzle(&mut allocator, puzzle, solution).expect("runs");
+            for condition in
+                Vec::<Condition>::from_clvm(&allocator, output).expect("valid conditions")
+            {
+                if let Condition::CreateCoin(create) = condition {
+                    if create.puzzle_hash == RECIPIENT {
+                        let Memos::Some(ptr) = create.memos else {
+                            panic!("the payment coin must carry a hint memo");
+                        };
+                        let hints: Vec<Bytes32> =
+                            Vec::from_clvm(&allocator, ptr).expect("hint is a list of Bytes32");
+                        assert_eq!(hints.len(), 1, "exactly one hint expected");
+                        payment_hint = Some(hints[0]);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            payment_hint.expect("a CREATE_COIN for RECIPIENT must exist"),
+            RECIPIENT,
+            "the hint must name the recipient, not the sender or any other puzzle hash"
+        );
+    }
+
     /// Inputs consumed to the mojo create NO change coin.
     #[test]
     fn an_exactly_covering_selection_creates_no_change_coin() {
@@ -1356,6 +1409,39 @@ mod tests {
         let created = created_coins(plan.coin_spends());
         assert_eq!(created.len(), 1, "only the payment coin: {created:?}");
         assert_eq!(created[0].puzzle_hash, RECIPIENT);
+    }
+
+    /// **A 1-mojo remainder is emitted as a change coin, not silently donated to the farmer.**
+    ///
+    /// This pins the `change > 0` boundary at its tightest value. The wallet holds exactly
+    /// `amount + fee + 1` mojos, so the change is 1 — the smallest non-zero value. A condition
+    /// `change > 1` would pass `plan.change_mojos() == 1` but omit the coin, making the plan
+    /// describe an output the bundle does not contain; the second assertion catches that.
+    #[test]
+    fn a_one_mojo_remainder_is_emitted_as_a_change_coin() {
+        let ops = ops();
+        // amount=600_000, fee=1_000, input=601_001 → change=1
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[601_001]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+            )
+            .expect("builds");
+
+        assert_eq!(plan.change_mojos(), 1, "plan must report a 1-mojo change");
+
+        let created = created_coins(plan.coin_spends());
+        let change_coin = created
+            .iter()
+            .find(|coin| coin.puzzle_hash == ops.puzzle_hash())
+            .expect("a change coin of 1 mojo must be created");
+        assert_eq!(
+            change_coin.amount, 1,
+            "the change coin must carry the 1-mojo remainder, not lose it as fee"
+        );
     }
 
     /// **The duplicate-coin-id class, closed at its root.** Two created coins sharing
@@ -2032,6 +2118,61 @@ mod tests {
             transfer_status(&pending, &chain).expect("readable"),
             TransferStatus::Awaiting { .. }
         ));
+    }
+
+    /// **A payment coin confirmed at height 0 (genesis) is not evidence, even for a transfer pushed
+    /// at height 0.** No real coin is created in the genesis block, so `confirmed_height: Some(0)` is
+    /// the chain reporting a height that cannot be genuine — it must not be accepted as confirmation.
+    ///
+    /// This test makes the `confirmed_height == 0` guard in `from_confirmed` falsifiable. The
+    /// positive control uses the SAME `pushed_at_height: 0` pending transfer and the SAME fixture
+    /// chain, but reports the coin at height 1, which IS accepted once the chain is sufficiently
+    /// deep. Without it the refusal above would be equally satisfied by a fixture that can never
+    /// confirm anything.
+    #[test]
+    fn a_payment_coin_confirmed_at_genesis_height_is_not_evidence() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+
+        // Build a real plan and derive the payment coin from what the bundle actually creates,
+        // then construct a PendingTransfer that was pushed at height 0.
+        let plan = ops
+            .build_transfer(
+                &source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+            )
+            .expect("builds");
+        let payment = created_coins(plan.coin_spends())
+            .into_iter()
+            .find(|coin| coin.puzzle_hash == RECIPIENT)
+            .expect("recipient is paid");
+        let pending = plan.pushed_at(0);
+
+        // The chain reports the payment coin at confirmed_height == 0: genesis.
+        // This must be refused regardless of burial depth.
+        let chain = FixedChain::with_records(vec![record(payment, Some(0), None)])
+            .at_peak(MIN_CONFIRMATION_DEPTH);
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Awaiting { .. }
+            ),
+            "a genesis-height confirmation must not be accepted"
+        );
+
+        // Positive control: same pending transfer (pushed_at 0), same fixture, same burial depth —
+        // but the coin is now at height 1.  This reaches `Confirmed` and proves the fixture is
+        // otherwise capable of confirming; the refusal above is entirely about the zero height.
+        let chain_at_one = FixedChain::with_records(vec![record(payment, Some(1), None)])
+            .at_peak(MIN_CONFIRMATION_DEPTH);
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain_at_one).expect("readable"),
+                TransferStatus::Confirmed(_)
+            ),
+            "the same fixture at height 1 must confirm"
+        );
     }
 
     /// A source coin spent with NO payment coin means a different spend consumed it, so this bundle
