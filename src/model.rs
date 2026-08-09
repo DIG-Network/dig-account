@@ -228,7 +228,9 @@ mod tests {
     fn a_resolved_profile_at_a_confirmed_index_is_attached() {
         let mut account = Account::new(AccountId::new("a"), registry_with(ProfileIx::ROOT));
 
-        account.attach_resolved(profile_at(ProfileIx::ROOT)).unwrap();
+        account
+            .attach_resolved(profile_at(ProfileIx::ROOT))
+            .unwrap();
 
         assert_eq!(
             account.resolved(ProfileIx::ROOT).map(Profile::ix),
@@ -252,7 +254,10 @@ mod tests {
         account.set_default_profile(ProfileIx(1)).unwrap();
 
         assert_eq!(account.registry().active().unwrap().ix(), ProfileIx(1));
-        assert_eq!(account.default_profile().map(Profile::ix), Some(ProfileIx(1)));
+        assert_eq!(
+            account.default_profile().map(Profile::ix),
+            Some(ProfileIx(1))
+        );
     }
 
     /// Fail-closed, unchanged from the pre-0.7.0 contract: an absent target index is refused and

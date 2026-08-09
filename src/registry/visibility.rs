@@ -13,9 +13,7 @@
 /// The variant is named [`HiddenFromLists`](Self::HiddenFromLists) rather than `Hidden` precisely so
 /// a later reader cannot mistake it for deletion. **A minted profile is permanent — a DID singleton
 /// and a dig-store exist on chain, paid for. There is no delete, and this enum must never grow one.**
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ProfileVisibility {
     /// Offered in the host's profile lists. The default for every recorded profile.
     #[default]

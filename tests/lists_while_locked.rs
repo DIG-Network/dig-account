@@ -79,7 +79,9 @@ fn a_locked_host_can_list_filter_and_read_the_active_profile() {
         Some(ProfileVisibility::HiddenFromLists)
     );
 
-    let active = registry.active().expect("the fixture has an active profile");
+    let active = registry
+        .active()
+        .expect("the fixture has an active profile");
     assert_eq!(ActiveProfile::ix(active), ProfileIx(0));
     assert_eq!(active.entry().label(), Some("personal"));
     assert_eq!(active.entry().anchor().did(), "did:chia:zero");

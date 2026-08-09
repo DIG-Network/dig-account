@@ -356,9 +356,7 @@ impl ProfileRegistry {
         }
 
         match (self.active, self.entries.is_empty()) {
-            (None, false) => {
-                return Err("entries are present but no profile is active".to_string())
-            }
+            (None, false) => return Err("entries are present but no profile is active".to_string()),
             (Some(ix), true) => {
                 return Err(format!(
                     "profile {ix} is active but the registry has no confirmed profile"
@@ -538,9 +536,7 @@ mod tests {
     #[test]
     fn next_free_ix_counts_in_progress_mints() {
         let mut registry = with_profiles(&[0]);
-        registry
-            .begin_mint(ProfileIx(1), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(1), a_stage(), 1_000).unwrap();
 
         assert_eq!(registry.next_free_ix(), ProfileIx(2));
     }
@@ -552,9 +548,7 @@ mod tests {
     #[test]
     fn an_amnesiac_restart_does_not_re_mint_at_the_same_index() {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .begin_mint(ProfileIx(1), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(1), a_stage(), 1_000).unwrap();
 
         assert_eq!(registry.next_free_ix(), ProfileIx(2));
     }
@@ -563,9 +557,7 @@ mod tests {
     #[test]
     fn a_did_confirmed_mint_is_not_a_profile() {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .begin_mint(ProfileIx(0), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(0), a_stage(), 1_000).unwrap();
 
         assert!(registry.is_empty());
         assert_eq!(registry.entries(), &[]);
@@ -580,9 +572,7 @@ mod tests {
     #[test]
     fn completing_a_mint_moves_the_index_out_of_in_progress() {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .begin_mint(ProfileIx(2), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(2), a_stage(), 1_000).unwrap();
 
         record(&mut registry, 2);
 
@@ -593,9 +583,7 @@ mod tests {
     #[test]
     fn a_mint_cannot_be_begun_twice_at_one_index() {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .begin_mint(ProfileIx(0), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(0), a_stage(), 1_000).unwrap();
 
         let result = registry.begin_mint(ProfileIx(0), a_stage(), 1_000);
 
@@ -608,9 +596,7 @@ mod tests {
     #[test]
     fn a_mint_advances_and_can_be_abandoned() {
         let mut registry = ProfileRegistry::empty();
-        registry
-            .begin_mint(ProfileIx(0), a_stage(), 1_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(0), a_stage(), 1_000).unwrap();
 
         let later = MintStage::DidPushed {
             pending: crate::registry::journal::PendingMintRecord {
@@ -659,9 +645,7 @@ mod tests {
         registry
             .set_visibility(ProfileIx(3), ProfileVisibility::HiddenFromLists)
             .unwrap();
-        registry
-            .begin_mint(ProfileIx(5), a_stage(), 7_000)
-            .unwrap();
+        registry.begin_mint(ProfileIx(5), a_stage(), 7_000).unwrap();
 
         let json = registry.to_json().unwrap();
         assert_eq!(ProfileRegistry::from_json(&json).unwrap(), registry);
