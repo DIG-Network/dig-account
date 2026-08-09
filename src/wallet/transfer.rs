@@ -592,14 +592,28 @@ where
         })
 }
 
-/// Picks the wallet coins to spend: smallest first, until they cover `required`.
-///
-/// Ascending accumulation consolidates dust as a side effect of paying, which is the behaviour that
-/// keeps a wallet spendable over time — the alternative, taking the largest coin first, shatters big
-/// coins into change and grows the very coin count the cap bounds.
+/// Picks the wallet coins to spend, using as FEW inputs as will cover `required`.
 ///
 /// A coin that is unconfirmed or already spent is not spendable, so it is neither selected NOR
 /// counted toward `available`: reporting it would tell the user they hold money they cannot move.
+///
+/// # Fewest inputs, not smallest inputs
+///
+/// The tempting rule is to spend the smallest coins first, so that paying quietly consolidates dust.
+/// It is a trap, because the input cap turns it into a denial of service that a STRANGER can trigger:
+/// anyone may send dust to an address, so a wallet holding two hundred 1-mojo coins plus one large
+/// one would sweep the dust, never reach the amount, and refuse a send it could have made from the
+/// large coin alone. The user would be told their transfer needs too many coins while a single coin
+/// sat there covering it — the same lie about their money the cap exists to prevent, in different
+/// words.
+///
+/// So selection minimises the input COUNT instead:
+///
+/// 1. the smallest SINGLE coin that covers the whole amount, when one exists — which also keeps the
+///    wallet's larger coins intact and the change small (the same rule
+///    [`mint`](crate::mint) uses to pick its funding coin); otherwise
+/// 2. largest-first accumulation, so the fewest possible coins are consumed before the cap is
+///    consulted.
 fn select_input_coins<C>(
     chain: &C,
     puzzle_hash: Bytes32,
@@ -621,23 +635,31 @@ where
     // whatever order the chain source happened to answer in.
     spendable.sort_by_key(|coin| (coin.amount, coin.coin_id()));
 
+    // `available` is the wallet's ENTIRE spendable balance, computed before any selection — it is
+    // what the user would be told they hold, so it must not be an artefact of how far a selection
+    // loop happened to get.
+    let available = spendable
+        .iter()
+        .fold(0u64, |sum, coin| sum.saturating_add(coin.amount));
+    if available < required {
+        return Err(TransferError::InsufficientFunds {
+            required,
+            available,
+        });
+    }
+
+    if let Some(single) = spendable.iter().find(|coin| coin.amount >= required) {
+        return Ok(vec![*single]);
+    }
+
     let mut selected = Vec::new();
     let mut total: u64 = 0;
-    for coin in spendable {
+    for coin in spendable.iter().rev() {
         total = total.saturating_add(coin.amount);
-        selected.push(coin);
+        selected.push(*coin);
         if total >= required {
             break;
         }
-    }
-
-    if total < required {
-        // `total` here is every spendable coin the wallet holds, which is exactly what "available"
-        // must mean.
-        return Err(TransferError::InsufficientFunds {
-            required,
-            available: total,
-        });
     }
     if selected.len() > MAX_TRANSFER_INPUT_COINS {
         return Err(TransferError::TooManyInputCoins {
@@ -735,4 +757,914 @@ fn build_transfer_spends(
         fee_mojos: request.fee_mojos,
         change_mojos: change,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::ProfileIx;
+    use crate::session_residency::Residency;
+    use crate::wallet::policy::{HotWallet, Vault};
+    use chia_wallet_sdk::prelude::FromClvm;
+    use chia_wallet_sdk::types::{run_puzzle, Condition};
+    use clvmr::serde::node_from_bytes;
+    use clvmr::Allocator;
+    use dig_keystore::{BackendKey, MemoryBackend};
+    use dig_session::{Password, Session, UnlockedMasterSeed, ENTROPY_LEN};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    const ENTROPY: [u8; ENTROPY_LEN] = [0x37; ENTROPY_LEN];
+    const RECIPIENT: Bytes32 = Bytes32::new([7u8; 32]);
+    /// A peak far above genesis, so no fixture height is ever accidentally `0`.
+    const PEAK: u32 = 4_200_000;
+
+    fn seed() -> Arc<UnlockedMasterSeed> {
+        Arc::new(
+            Session::enroll_master_seed(
+                Arc::new(MemoryBackend::new()),
+                BackendKey::new("transfer-tests".to_string()),
+                Password::new("pw"),
+                &ENTROPY,
+            )
+            .expect("the fixture seed must enrol"),
+        )
+    }
+
+    fn ops() -> WalletOps {
+        WalletOps::new(seed(), ProfileIx::ROOT, Arc::new(Residency::new()))
+    }
+
+    fn hot() -> CustodyPolicy {
+        CustodyPolicy::Hot(HotWallet {
+            auto_send_limit: u64::MAX,
+        })
+    }
+
+    /// A chain source over a fixed set of records, with a controllable peak.
+    ///
+    /// Records are supplied whole rather than as bare coins because half of these tests are ABOUT the
+    /// difference between a confirmed coin, an unconfirmed one and a spent one — a double that could
+    /// only express "a coin exists" could not exhibit the property under test.
+    struct FixedChain {
+        records: Vec<CoinRecord>,
+        peak: Option<u32>,
+        offline: bool,
+    }
+
+    impl FixedChain {
+        /// Confirmed, unspent coins of the given amounts, all at `puzzle_hash`.
+        fn holding(puzzle_hash: Bytes32, amounts: &[u64]) -> Self {
+            Self {
+                records: amounts
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, amount)| {
+                        confirmed(Coin::new(
+                            Bytes32::new([ix as u8 + 1; 32]),
+                            puzzle_hash,
+                            *amount,
+                        ))
+                    })
+                    .collect(),
+                peak: Some(PEAK),
+                offline: false,
+            }
+        }
+
+        fn with_records(records: Vec<CoinRecord>) -> Self {
+            Self {
+                records,
+                peak: Some(PEAK),
+                offline: false,
+            }
+        }
+
+        fn at_peak(mut self, peak: u32) -> Self {
+            self.peak = Some(peak);
+            self
+        }
+
+        fn offline() -> Self {
+            Self {
+                records: Vec::new(),
+                peak: Some(PEAK),
+                offline: true,
+            }
+        }
+
+        fn without_peak(mut self) -> Self {
+            self.peak = None;
+            self
+        }
+
+        fn unavailable<T>(&self) -> std::result::Result<T, String> {
+            Err("simulated: no node answered".to_string())
+        }
+    }
+
+    fn record(coin: Coin, confirmed_height: Option<u32>, spent_height: Option<u32>) -> CoinRecord {
+        CoinRecord {
+            coin,
+            confirmed_height,
+            spent_height,
+            timestamp: None,
+            coinbase: false,
+        }
+    }
+
+    fn confirmed(coin: Coin) -> CoinRecord {
+        record(coin, Some(PEAK - 100), None)
+    }
+
+    fn unconfirmed(coin: Coin) -> CoinRecord {
+        record(coin, None, None)
+    }
+
+    fn spent(coin: Coin) -> CoinRecord {
+        record(coin, Some(PEAK - 100), Some(PEAK - 50))
+    }
+
+    impl ChainSource for FixedChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> std::result::Result<Option<CoinRecord>, String> {
+            if self.offline {
+                return self.unavailable();
+            }
+            Ok(self
+                .records
+                .iter()
+                .find(|record| record.coin.coin_id() == coin_id)
+                .cloned())
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            if self.offline {
+                return self.unavailable();
+            }
+            Ok(self
+                .records
+                .iter()
+                .filter(|record| record.coin.puzzle_hash == puzzle_hash)
+                .cloned()
+                .collect())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent: Bytes32,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(&self, _coin_id: Bytes32) -> std::result::Result<Option<CoinSpend>, String> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> std::result::Result<Option<dig_chainsource_interface::SingletonLineage>, String>
+        {
+            Err("not supported by this test double".to_string())
+        }
+
+        fn peak_height(&self) -> std::result::Result<Option<u32>, String> {
+            if self.offline {
+                return self.unavailable();
+            }
+            Ok(self.peak)
+        }
+
+        fn block_timestamp(&self, _height: u32) -> std::result::Result<Option<u64>, String> {
+            Ok(None)
+        }
+    }
+
+    /// Every coin the spends CREATE, re-derived by running the puzzles — never read off the plan's
+    /// own description of itself.
+    ///
+    /// This is what makes the change and amount assertions load-bearing: a builder that reported the
+    /// right numbers in its fields while emitting different `CREATE_COIN` conditions would satisfy an
+    /// assertion on `change_mojos()` and fail here.
+    fn created_coins(coin_spends: &[CoinSpend]) -> Vec<Coin> {
+        conditions_of(coin_spends)
+            .into_iter()
+            .filter_map(|(spender, condition)| match condition {
+                Condition::CreateCoin(create) => {
+                    Some(Coin::new(spender, create.puzzle_hash, create.amount))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every condition the spends emit, paired with the id of the coin that emitted it.
+    fn conditions_of(coin_spends: &[CoinSpend]) -> Vec<(Bytes32, Condition)> {
+        let mut allocator = Allocator::new();
+        let mut out = Vec::new();
+        for spend in coin_spends {
+            let puzzle = node_from_bytes(&mut allocator, &spend.puzzle_reveal).expect("puzzle");
+            let solution = node_from_bytes(&mut allocator, &spend.solution).expect("solution");
+            let output = run_puzzle(&mut allocator, puzzle, solution).expect("runs");
+            for condition in Vec::<Condition>::from_clvm(&allocator, output).expect("conditions") {
+                out.push((spend.coin.coin_id(), condition));
+            }
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------- coin selection
+
+    /// The amounts of the coins a plan actually spends, sorted, for asserting on selection.
+    fn inputs_of(plan: &TransferPlan) -> Vec<u64> {
+        let mut amounts: Vec<u64> = plan
+            .coin_spends()
+            .iter()
+            .map(|spend| spend.coin.amount)
+            .collect();
+        amounts.sort_unstable();
+        amounts
+    }
+
+    /// One coin that covers the whole amount is preferred, and it is the SMALLEST such coin — the
+    /// wallet's larger coins stay intact and the change stays small.
+    ///
+    /// The amounts distinguish this from three other rules: `5_000` comes FIRST in source order (so a
+    /// first-fit takes it), it is the LARGEST (so a largest-first takes it), and `20 + 50 + 900` would
+    /// be a smallest-first sweep.
+    #[test]
+    fn selection_prefers_the_smallest_single_coin_that_covers_the_transfer() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[5_000, 900, 50, 20]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 900),
+            )
+            .expect("the 900 coin covers it exactly");
+
+        assert_eq!(inputs_of(&plan), vec![900]);
+        assert_eq!(plan.change_mojos(), 0);
+    }
+
+    /// **A stranger must not be able to make a wallet unspendable by dusting it.** Anyone can send
+    /// dust to any address, so a selection that swept the smallest coins first would consume the
+    /// whole cap on 1-mojo coins and refuse a transfer the wallet plainly affords.
+    ///
+    /// The fixture is exactly that attack: many more dust coins than the cap, plus one coin that
+    /// covers the amount on its own. The right answer uses ONE input.
+    #[test]
+    fn a_wallet_dusted_beyond_the_cap_can_still_spend_its_large_coin() {
+        let ops = ops();
+        let mut amounts = vec![1u64; MAX_TRANSFER_INPUT_COINS * 10];
+        amounts.push(1_000_000);
+        let chain = FixedChain::holding(ops.puzzle_hash(), &amounts);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+            )
+            .expect("one coin covers this transfer, however much dust surrounds it");
+        assert_eq!(inputs_of(&plan), vec![1_000_000]);
+    }
+
+    /// When NO single coin covers the amount, selection takes the FEWEST coins that do — largest
+    /// first. Here 600 + 500 reaches 1_000 in two inputs, where a smallest-first accumulation would
+    /// have needed all four.
+    #[test]
+    fn a_transfer_no_single_coin_covers_uses_the_fewest_inputs() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[600, 500, 400, 300]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect("1_800 mojos cover 1_000");
+
+        assert_eq!(inputs_of(&plan), vec![500, 600]);
+        assert_eq!(plan.change_mojos(), 100);
+    }
+
+    /// `available` is the wallet's WHOLE spendable balance, not however far a selection loop got
+    /// before giving up. A wallet holding several coins that together fall short must be told the
+    /// true total, or it will look emptier than it is.
+    #[test]
+    fn insufficient_funds_reports_the_whole_spendable_balance() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[100, 200, 300, 400]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 5_000),
+            )
+            .expect_err("1_000 mojos cannot cover 5_000");
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds {
+                    required: 5_000,
+                    available: 1_000
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// An unconfirmed or already-spent coin cannot fund a spend, so it is neither selected NOR
+    /// counted toward `available`. Reporting it would tell the user they hold money they cannot move.
+    ///
+    /// The fixture holds 30_005 mojos in total and only 5 of them spendable, so an implementation
+    /// that filtered selection but not the reported balance fails on the number.
+    #[test]
+    fn unconfirmed_and_spent_coins_are_neither_selected_nor_counted_as_available() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let chain = FixedChain::with_records(vec![
+            unconfirmed(Coin::new(Bytes32::new([1; 32]), ph, 10_000)),
+            spent(Coin::new(Bytes32::new([2; 32]), ph, 20_000)),
+            confirmed(Coin::new(Bytes32::new([3; 32]), ph, 5)),
+        ]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect_err("only 5 mojos are actually spendable");
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds {
+                    required: 1_000,
+                    available: 5
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// The truthful control: the SAME amounts, all confirmed and unspent, DO fund the transfer.
+    /// Without it the refusal above could be passing because the builder refuses everything.
+    #[test]
+    fn the_same_coins_confirmed_and_unspent_do_fund_the_transfer() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[10_000, 20_000, 5]);
+        assert!(ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+            )
+            .is_ok());
+    }
+
+    // ------------------------------------------------------------------- change + outputs
+
+    /// The recipient is paid EXACTLY, the change is EXACTLY the remainder, and the change returns to
+    /// this wallet. Asserted over the coins the puzzles actually create, so a mis-computed change
+    /// cannot hide behind a correct-looking field.
+    #[test]
+    fn the_recipient_is_paid_exactly_and_the_change_is_exact_and_wallet_owned() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+            )
+            .expect("builds");
+
+        let created = created_coins(plan.coin_spends());
+        assert_eq!(created.len(), 2, "a payment and a change coin: {created:?}");
+
+        let payment = created
+            .iter()
+            .find(|coin| coin.puzzle_hash == RECIPIENT)
+            .expect("the recipient is paid");
+        assert_eq!(payment.amount, 600_000);
+        assert_eq!(payment.coin_id(), plan.payment_coin_id());
+
+        let change = created
+            .iter()
+            .find(|coin| coin.puzzle_hash == ops.puzzle_hash())
+            .expect("the change returns to THIS wallet");
+        assert_eq!(
+            change.amount,
+            1_000_000 - 600_000 - 1_000,
+            "unspent input value silently becomes fee, so an inexact change donates the difference"
+        );
+        assert_eq!(plan.change_mojos(), change.amount);
+    }
+
+    /// Inputs consumed to the mojo create NO change coin.
+    #[test]
+    fn an_exactly_covering_selection_creates_no_change_coin() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[601_000]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+            )
+            .expect("builds");
+
+        assert_eq!(plan.change_mojos(), 0);
+        let created = created_coins(plan.coin_spends());
+        assert_eq!(created.len(), 1, "only the payment coin: {created:?}");
+        assert_eq!(created[0].puzzle_hash, RECIPIENT);
+    }
+
+    /// **The duplicate-coin-id class, closed at its root.** Two created coins sharing
+    /// `(parent, puzzle_hash, amount)` are one coin id twice, which consensus rejects
+    /// deterministically — and since re-selection picks the same coins every time, the wallet would
+    /// wedge on that amount forever.
+    ///
+    /// The lead's two outputs can only collide when the payment goes to this wallet's OWN puzzle hash
+    /// with an amount equal to the change, so the fixture asks for exactly that: half a coin, paid to
+    /// itself. It is refused by name before any spend is built.
+    #[test]
+    fn a_payment_to_this_wallets_own_address_is_refused_by_name() {
+        let ops = ops();
+        let own = ops.puzzle_hash();
+        let chain = FixedChain::holding(own, &[1_000]);
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::to_puzzle_hash(own, 500))
+            .expect_err("a self-payment moves nothing and would duplicate a coin id");
+        assert!(matches!(error, TransferError::SelfPayment), "{error}");
+    }
+
+    /// The structural consequence: across a sweep of amounts — including the one that would collide
+    /// if the recipient were this wallet — no bundle this builder emits creates two coins with the
+    /// same id.
+    #[test]
+    fn no_bundle_ever_creates_two_coins_with_the_same_id() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+
+        for amount in [1u64, 2, 499, 500, 501, 999] {
+            let plan = ops
+                .build_transfer(
+                    &chain,
+                    &hot(),
+                    &TransferRequest::to_puzzle_hash(RECIPIENT, amount),
+                )
+                .expect("builds");
+            let created = created_coins(plan.coin_spends());
+            let ids: HashSet<Bytes32> = created.iter().map(Coin::coin_id).collect();
+            assert_eq!(
+                ids.len(),
+                created.len(),
+                "amount {amount} produced a duplicate coin id"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------- the input cap
+
+    /// A wallet whose value is spread over more coins than the cap gets its OWN error, naming the
+    /// cap — never "insufficient funds", which would be false about a wallet that holds the money.
+    #[test]
+    fn needing_more_coins_than_the_cap_is_its_own_error() {
+        let ops = ops();
+        let coins = vec![100u64; MAX_TRANSFER_INPUT_COINS + 1];
+        let chain = FixedChain::holding(ops.puzzle_hash(), &coins);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 100 * coins.len() as u64),
+            )
+            .expect_err("one coin over the cap");
+        assert!(
+            matches!(
+                error,
+                TransferError::TooManyInputCoins { needed, cap }
+                    if needed == MAX_TRANSFER_INPUT_COINS + 1 && cap == MAX_TRANSFER_INPUT_COINS
+            ),
+            "{error}"
+        );
+    }
+
+    /// The bound from the other side: a transfer needing EXACTLY the cap's worth of coins is built. A
+    /// bound tested only from above can only confirm itself.
+    #[test]
+    fn a_transfer_needing_exactly_the_cap_is_still_built() {
+        let ops = ops();
+        let coins = vec![100u64; MAX_TRANSFER_INPUT_COINS];
+        let chain = FixedChain::holding(ops.puzzle_hash(), &coins);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 100 * coins.len() as u64),
+            )
+            .expect("exactly the cap is allowed");
+        assert_eq!(plan.coin_spends().len(), MAX_TRANSFER_INPUT_COINS);
+    }
+
+    // ------------------------------------------------------------------- refusals
+
+    /// A vault-tier profile cannot send, and says so in its own words — never as a shortfall or a
+    /// build failure, which would send the user looking for a problem that does not exist.
+    #[test]
+    fn a_vault_profile_is_refused_with_its_own_error() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &CustodyPolicy::Vault(Vault::default()),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+            )
+            .expect_err("a vault outflow may only pay this profile's own hot wallet");
+        assert!(
+            matches!(error, TransferError::VaultTransferUnsupported),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("vault"),
+            "the sentence must name the tier: {error}"
+        );
+    }
+
+    /// The control: the SAME wallet, SAME coins, SAME request under the HOT tier is built. So the
+    /// refusal above is about the tier and not about the fixture.
+    #[test]
+    fn the_same_request_under_the_hot_tier_is_built() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+        assert!(ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000)
+            )
+            .is_ok());
+    }
+
+    /// A fee the inputs cannot cover is a shortfall of `amount + fee`, not of `amount`. The fixture
+    /// covers the amount EXACTLY, so an implementation that forgot to count the fee would build a
+    /// bundle paying the farmer out of the recipient's money.
+    #[test]
+    fn a_fee_the_inputs_cannot_cover_is_refused() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(1),
+            )
+            .expect_err("1_000 mojos cannot pay 1_000 plus a fee");
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds {
+                    required: 1_001,
+                    available: 1_000
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// The control: the same amount with NO fee is built, so the refusal above is about the fee.
+    #[test]
+    fn the_same_amount_with_no_fee_is_built() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        assert!(ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_zero_amount_transfer_is_refused() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 0),
+            )
+            .expect_err("a transfer moves a positive amount");
+        assert!(matches!(error, TransferError::ZeroAmount), "{error}");
+    }
+
+    /// An amount plus fee that overflows `u64` is named as such rather than wrapping into a small
+    /// number a wallet could accidentally cover.
+    #[test]
+    fn an_amount_plus_fee_that_overflows_is_refused() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, u64::MAX).with_fee(1),
+            )
+            .expect_err("u64::MAX + 1 is not a spendable total");
+        assert!(
+            matches!(error, TransferError::AmountOverflow { .. }),
+            "{error}"
+        );
+    }
+
+    /// An unreachable chain is UNKNOWN, not a shortfall: a builder that said "insufficient funds"
+    /// when it simply could not read the wallet would tell the user something false about their
+    /// balance.
+    #[test]
+    fn an_unreachable_chain_is_not_reported_as_a_shortfall() {
+        let ops = ops();
+        let error = ops
+            .build_transfer(
+                &FixedChain::offline(),
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect_err("an unanswerable chain is not an empty wallet");
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "{error}"
+        );
+    }
+
+    /// An undecodable recipient address is refused before any chain read.
+    #[test]
+    fn an_undecodable_recipient_address_is_refused() {
+        let error = TransferRequest::to_address("not-an-address", 1_000)
+            .expect_err("a malformed address has no destination");
+        assert!(
+            matches!(error, TransferError::InvalidRecipient { .. }),
+            "{error}"
+        );
+    }
+
+    /// A well-formed address decodes to the puzzle hash it names, so the two constructors agree.
+    #[test]
+    fn a_valid_address_decodes_to_its_puzzle_hash() {
+        let address = Address::new(RECIPIENT, "xch".to_string()).encode().unwrap();
+        let request = TransferRequest::to_address(&address, 42).expect("a valid address");
+        assert_eq!(request.recipient(), RECIPIENT);
+        assert_eq!(request.amount_mojos(), 42);
+        assert_eq!(request.fee_mojos(), 0);
+    }
+
+    // ------------------------------------------------------------------- the input binding
+
+    /// Every secondary input asserts the announcement the LEAD makes, so a secondary — which creates
+    /// nothing — cannot be included without it. Unbound, a node could take the secondaries alone and
+    /// burn the user's coins into fees. (The simulator suite proves consensus actually refuses the
+    /// orphaned half; this pins the shape.)
+    #[test]
+    fn every_secondary_input_is_bound_to_the_lead() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[100, 200, 300]);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 550),
+            )
+            .expect("builds");
+
+        let conditions = conditions_of(plan.coin_spends());
+        let lead_id = conditions
+            .iter()
+            .find_map(|(coin_id, condition)| {
+                matches!(condition, Condition::CreateCoinAnnouncement(_)).then_some(*coin_id)
+            })
+            .expect("the lead announces");
+        let expected = chia_wallet_sdk::types::announcement_id(lead_id, INPUT_BINDING_MESSAGE);
+
+        let asserting: Vec<Bytes32> = conditions
+            .iter()
+            .filter_map(|(coin_id, condition)| match condition {
+                Condition::AssertCoinAnnouncement(assertion) => {
+                    assert_eq!(assertion.announcement_id, expected);
+                    Some(*coin_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            asserting.len(),
+            2,
+            "both secondary inputs must be bound to the lead"
+        );
+        assert!(!asserting.contains(&lead_id));
+    }
+
+    /// A single-input transfer carries no binding at all: there is no secondary to orphan, and an
+    /// unnecessary announcement is block space the user pays for.
+    #[test]
+    fn a_single_input_transfer_carries_no_binding() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 500),
+            )
+            .expect("builds");
+
+        assert!(conditions_of(plan.coin_spends())
+            .iter()
+            .all(|(_, condition)| !matches!(condition, Condition::CreateCoinAnnouncement(_))));
+    }
+
+    // ------------------------------------------------------------------- status
+
+    /// A pending transfer plus the payment coin the chain would show once it is included.
+    fn pending_and_payment(ops: &WalletOps, source: &FixedChain) -> (PendingTransfer, Coin) {
+        let plan = ops
+            .build_transfer(
+                source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+            )
+            .expect("builds");
+        // Derived from the coins the puzzles CREATE rather than from an assumed spend ordering, so
+        // the fixture cannot drift away from the bundle it is meant to describe.
+        let payment = created_coins(plan.coin_spends())
+            .into_iter()
+            .find(|coin| coin.puzzle_hash == RECIPIENT)
+            .expect("the recipient is paid");
+        assert_eq!(payment.coin_id(), plan.payment_coin_id());
+        (plan.pushed_at(PEAK), payment)
+    }
+
+    /// A payment coin buried past [`MIN_CONFIRMATION_DEPTH`] is settled, and the evidence names the
+    /// recipient and the exact amount.
+    #[test]
+    fn a_buried_payment_coin_is_confirmed_evidence() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(vec![record(payment, Some(PEAK + 1), None)])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
+
+        let settled = transfer_status(&pending, &chain)
+            .expect("readable")
+            .confirmed()
+            .cloned()
+            .expect("a buried payment is settled");
+        assert_eq!(settled.recipient(), RECIPIENT);
+        assert_eq!(settled.amount_mojos(), 600);
+        assert_eq!(settled.confirmed_height(), PEAK + 1);
+        assert_eq!(settled.payment_coin_id(), payment.coin_id());
+    }
+
+    /// The same payment coin confirmed only ONE block deep is NOT settled: a shallow confirmation is
+    /// reversible, and reporting it would let a reorg silently unmake a payment the user was told
+    /// about.
+    #[test]
+    fn a_shallow_confirmation_is_not_yet_settled() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain =
+            FixedChain::with_records(vec![record(payment, Some(PEAK + 1), None)]).at_peak(PEAK + 1);
+
+        assert!(matches!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Awaiting { .. }
+        ));
+    }
+
+    /// A confirmation BACK-DATED to before the push is not evidence: a transfer cannot appear in a
+    /// block that already existed when it was broadcast.
+    #[test]
+    fn a_confirmation_predating_the_push_is_not_evidence() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(vec![record(payment, Some(PEAK - 1), None)])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH);
+
+        assert!(matches!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Awaiting { .. }
+        ));
+    }
+
+    /// A source coin spent with NO payment coin means a different spend consumed it, so this bundle
+    /// can never be included. That is a proof of death, not an eternal wait.
+    #[test]
+    fn a_source_coin_spent_elsewhere_is_a_failure_not_a_wait() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(vec![spent(source.records[0].coin)]);
+
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Failed { .. }
+            ),
+            "a consumed input can never confirm"
+        );
+    }
+
+    /// The control that stops the test above from being satisfied by a status that calls everything
+    /// dead: the SAME spent input, WITH the payment coin present, is this very bundle succeeding.
+    #[test]
+    fn a_spent_input_with_the_payment_coin_present_is_not_a_failure() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(vec![
+            spent(source.records[0].coin),
+            record(payment, Some(PEAK + 1), None),
+        ]);
+
+        assert!(matches!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Awaiting { .. }
+        ));
+    }
+
+    /// An unreachable chain fails CLOSED: the status is unknown, never "not confirmed".
+    #[test]
+    fn an_unreachable_chain_makes_the_status_unknown() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+
+        let error = transfer_status(&pending, &FixedChain::offline())
+            .expect_err("an unanswerable chain yields no status");
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "{error}"
+        );
+    }
+
+    /// A source that answers reads but exposes no PEAK also fails closed: without a peak, a claimed
+    /// confirmation height cannot be bounded at all.
+    #[test]
+    fn a_source_without_a_peak_fails_closed() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+
+        let error = transfer_status(&pending, &source.without_peak())
+            .expect_err("no peak, no bound");
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "{error}"
+        );
+    }
+
+    /// Blocks-since-push is a real elapsed measure a caller can time out on, not a spinner.
+    #[test]
+    fn awaiting_reports_the_blocks_elapsed_since_the_push() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(Vec::new()).at_peak(PEAK + 9);
+        assert_eq!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Awaiting {
+                blocks_since_push: 9
+            }
+        );
+    }
 }
