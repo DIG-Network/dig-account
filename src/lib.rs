@@ -94,7 +94,7 @@ pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};
 pub use wallet::policy::{CustodyPolicy, HotWallet, Vault};
 pub use wallet::summary::{SpendRecipient, SpendSummary, SpendTier};
 pub use wallet::transfer::{
-    transfer_status, ConfirmedTransfer, PendingTransfer, TransferError, TransferPlan,
-    TransferRequest, TransferResult, TransferStatus, MAX_TRANSFER_INPUT_COINS,
+    transfer_status, ConfirmedTransfer, PayableDestination, PendingTransfer, TransferError,
+    TransferPlan, TransferRequest, TransferResult, TransferStatus, MAX_TRANSFER_INPUT_COINS,
 };
 pub use wallet::vault_move::VaultMove;

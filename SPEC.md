@@ -726,8 +726,12 @@ also gated and signed would be a second route to a signature beside a gated one,
   `TransferError::VaultTransferUnsupported`, whose message states that funds move vault → hot wallet
   through the clawback window first. It MUST NOT be reported as a shortfall or a build failure — both
   would send the user looking for a problem that does not exist.
-- **`xch`-prefixed recipient addresses only.** `TransferRequest::to_address` MUST reject any address
-  whose human-readable part is not `xch`, naming the offending prefix. Bech32m decoding validates the
+- **`xch`-prefixed recipient addresses only, enforced by the TYPE.** `TransferRequest` MUST take a
+  `PayableDestination`, which has exactly two constructors: `from_address`, which decodes a string
+  and rejects any human-readable part that is not `xch`, naming the offending prefix; and
+  `from_derived`, whose caller is ASSERTING that the code produced this puzzle hash and knows it
+  payable. A public constructor taking a bare `Bytes32` recipient is FORBIDDEN — the safe path must be
+  the default one, and a rule stated only in documentation is skipped by whoever does not read it. Bech32m decoding validates the
   encoding and a 32-byte payload but NOT the prefix, so `nft1…`, `did:chia:…`, `cat1…` and `txch1…` all
   decode and yield a puzzle hash. A payment built to one conserves value, signs, confirms and reports
   `Confirmed` truthfully — while the coin sits at a puzzle hash with no preimage and the funds are

@@ -21,9 +21,9 @@ use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
 use chia_wallet_sdk::types::Conditions;
 use dig_account::{
     transfer_status, AutoSendPolicy, CustodyPolicy, FixedClock, HotWallet, MoneySigner,
-    OpClassLimits, PolicyAuthorizer, ProfileIx, SpendOpClass, SpendPublisher, SpendRuling,
-    TransferError, TransferPlan, TransferRequest, TransferStatus, UnlockedAccount, WalletOps,
-    MIN_CONFIRMATION_DEPTH,
+    OpClassLimits, PayableDestination, PolicyAuthorizer, ProfileIx, SpendOpClass, SpendPublisher,
+    SpendRuling, TransferError, TransferPlan, TransferRequest, TransferStatus, UnlockedAccount,
+    WalletOps, MIN_CONFIRMATION_DEPTH,
 };
 use dig_chainsource_interface::ChainSource;
 use dig_wallet_backend::types::Network;
@@ -126,7 +126,7 @@ fn a_transfer_is_accepted_by_consensus_and_pays_the_recipient_exactly() -> anyho
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
 
     chain.farm()?;
@@ -175,7 +175,7 @@ fn a_multi_coin_transfer_is_accepted_by_consensus() -> anyhow::Result<()> {
     let plan = ops.build_transfer(
         &chain,
         &hot(),
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 700_000).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 700_000).with_fee(FEE),
     )?;
     assert!(
         plan.coin_spends().len() > 1,
@@ -202,7 +202,7 @@ fn a_pushed_but_unfarmed_transfer_is_not_yet_a_payment() -> anyhow::Result<()> {
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
 
     assert!(
@@ -230,7 +230,7 @@ fn a_transfer_included_but_not_buried_is_still_awaiting() -> anyhow::Result<()> 
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
 
     chain.include_in_a_block()?;
@@ -259,7 +259,7 @@ fn a_source_coin_spent_elsewhere_reports_failed() -> anyhow::Result<()> {
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
     // Drop the bundle on the floor and have the node report the input as consumed by something else.
     chain.mempool.borrow_mut().clear();
@@ -300,7 +300,7 @@ fn an_offline_chain_fails_closed_rather_than_answering() -> anyhow::Result<()> {
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
 
     let offline = SimulatorChain::offline();
@@ -308,7 +308,7 @@ fn an_offline_chain_fails_closed_rather_than_answering() -> anyhow::Result<()> {
         account.wallet_ops().build_transfer(
             &offline,
             &hot(),
-            &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT)
+            &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
         ),
         Err(TransferError::ChainUnreachable(_))
     ));
@@ -331,7 +331,7 @@ fn the_gates_summary_names_the_recipient_and_the_exact_amount() -> anyhow::Resul
     let plan = ops.build_transfer(
         &chain,
         &hot(),
-        &TransferRequest::to_puzzle_hash(RECIPIENT, AMOUNT).with_fee(FEE),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
     )?;
 
     let summary = ops.summarize(plan.coin_spends(), &hot())?;
@@ -492,7 +492,7 @@ fn a_fee_bumped_replacement_conflicts_and_pays_the_recipient_once() -> anyhow::R
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000).with_fee(1_000),
     )?;
 
     let replacement = ops.build_transfer_replacing(&chain, &hot(), &pending, 5_000)?;
@@ -560,12 +560,12 @@ fn a_naive_fee_bumped_rebuild_pays_the_recipient_twice() -> anyhow::Result<()> {
     let first = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
     )?;
     let second = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000).with_fee(1_000),
     )?;
 
     assert_ne!(
@@ -607,7 +607,7 @@ fn a_replacement_refuses_rather_than_reaching_for_another_coin() -> anyhow::Resu
     let pending = send(
         &account,
         &chain,
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+        &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
     )?;
 
     let refused = ops

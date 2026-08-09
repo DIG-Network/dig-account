@@ -239,64 +239,43 @@ pub enum TransferError {
     Build(String),
 }
 
-/// What the caller wants moved, and to whom.
+/// A destination this crate is willing to PAY: a puzzle hash plus the evidence it is payable.
+///
+/// # Why a newtype rather than a `Bytes32` and a documented rule
+///
+/// A `Bytes32` carries no evidence of where it came from, and the two ways of obtaining one are not
+/// equally safe. `Address::decode` validates that a string is bech32m with a 32-byte payload — it does
+/// NOT validate the human-readable part, and hands it back for the caller to judge. So `nft1…`,
+/// `did:chia:…`, `cat1…`, `txch1…` and outright invented prefixes all decode successfully and yield a
+/// puzzle hash nobody holds a preimage for.
+///
+/// Paying one is not caught by anything downstream. It conserves value, returns honest change, signs,
+/// confirms, and reports [`TransferStatus::Confirmed`] truthfully, because a coin really does exist at
+/// that puzzle hash. The funds are permanently burned, and the confirmation ceremony re-encodes the
+/// destination under [`MAINNET_ADDRESS_PREFIX`] for display — so the user is shown a plausible mainnet
+/// address that is NOT the string they supplied, differing only in a prefix they have no reason to
+/// inspect.
+///
+/// The check therefore has to happen where the STRING is, and the type makes that the only route: a
+/// destination reaches [`TransferRequest`] having been either decoded here
+/// ([`from_address`](Self::from_address)) or explicitly vouched for by the caller
+/// ([`from_derived`](Self::from_derived)). A rule in a doc comment can be skipped by someone who never
+/// reads it; a constructor cannot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransferRequest {
-    recipient: Bytes32,
-    amount_mojos: u64,
-    fee_mojos: u64,
-}
+pub struct PayableDestination(Bytes32);
 
-impl TransferRequest {
-    /// Pay `amount_mojos` to the standard puzzle hash `recipient`, with no fee.
+impl PayableDestination {
+    /// Decode a bech32m address, refusing any prefix but [`MAINNET_ADDRESS_PREFIX`].
     ///
-    /// # This constructor is the way PAST the prefix rule, so it must not take user input
+    /// This is the constructor for anything that originated as a string a human typed, pasted,
+    /// scanned, or received. The error names the offending prefix, so the user learns what they
+    /// actually supplied rather than being told the address is merely "invalid".
     ///
-    /// A `Bytes32` carries no evidence of where it came from. [`to_address`](Self::to_address)
-    /// refuses anything but an [`xch`](MAINNET_ADDRESS_PREFIX) address precisely because an
-    /// `nft1…`/`did:chia:…`/`cat1…`/`txch1…` string decodes cleanly into a puzzle hash nobody holds a
-    /// preimage for — and paying one burns the funds permanently, while still confirming and
-    /// reporting [`TransferStatus::Confirmed`]. Once that string has been reduced to a puzzle hash
-    /// the evidence is gone, and this constructor cannot tell a burn address from a payable one.
+    /// # Errors
     ///
-    /// So `Address::decode(user_input)?.puzzle_hash` handed to this function reconstructs the whole
-    /// burn in the CALLER, with the prefix check bypassed rather than failed. Anything that
-    /// originated as a string a human typed, pasted, scanned, or received MUST go through
-    /// [`to_address`](Self::to_address).
-    ///
-    /// Use this one only for a puzzle hash the code itself derived and already knows to be payable —
-    /// a standard puzzle hash computed from a public key, an address this wallet generated, or a
-    /// destination a lower layer has already validated.
-    pub fn to_puzzle_hash(recipient: Bytes32, amount_mojos: u64) -> Self {
-        Self {
-            recipient,
-            amount_mojos,
-            fee_mojos: 0,
-        }
-    }
-
-    /// Pay `amount_mojos` to a bech32m `xch1…` address, with no fee.
-    ///
-    /// The address is decoded HERE so an unusable one is a named error before any chain read, rather
-    /// than a comparison that silently never matches later.
-    ///
-    /// # The PREFIX is checked, and that check is what stops funds being burned
-    ///
-    /// `Address::decode` validates two things — that the string is bech32m, and that its payload is
-    /// 32 bytes. It does NOT validate the human-readable part; it hands it back and leaves the
-    /// decision to the caller. So `nft1…`, `did:chia:…`, `cat1…`, `txch1…` and outright invented
-    /// prefixes all decode successfully and yield a puzzle hash.
-    ///
-    /// Nothing downstream would catch it. A payment to an NFT launcher id or a DID conserves value,
-    /// returns honest change, signs, confirms, and reports [`TransferStatus::Confirmed`] — truthfully,
-    /// because the coin really does exist at a puzzle hash nobody holds a preimage for. The funds are
-    /// permanently burned. Worse, the confirmation ceremony re-encodes the destination for display
-    /// with a hard-coded `xch` prefix, so the user is shown a plausible mainnet address that is NOT
-    /// the string they pasted, differing only in a prefix they have no reason to inspect.
-    ///
-    /// Refusing anything but [`MAINNET_ADDRESS_PREFIX`] is therefore the only place this class can be
-    /// stopped, and the error names the offending prefix so the user learns what they actually pasted.
-    pub fn to_address(address: &str, amount_mojos: u64) -> TransferResult<Self> {
+    /// [`TransferError::InvalidRecipient`] if the string is not decodable bech32m with a 32-byte
+    /// payload, or if its prefix is not `xch`.
+    pub fn from_address(address: &str) -> TransferResult<Self> {
         let decoded = Address::decode(address).map_err(|e| TransferError::InvalidRecipient {
             address: address.to_string(),
             reason: e.to_string(),
@@ -311,7 +290,69 @@ impl TransferRequest {
                 ),
             });
         }
-        Ok(Self::to_puzzle_hash(decoded.puzzle_hash, amount_mojos))
+        Ok(Self(decoded.puzzle_hash))
+    }
+
+    /// Vouch for a puzzle hash the CODE derived and already knows to be payable.
+    ///
+    /// # Calling this is an ASSERTION, and it is the way past the prefix rule
+    ///
+    /// [`from_address`](Self::from_address) refuses a non-`xch` address precisely because the puzzle
+    /// hash inside one is unspendable and paying it burns the funds. Once a string has been reduced to
+    /// a `Bytes32` that evidence is gone, so `Address::decode(user_input)?.puzzle_hash` handed to this
+    /// function reconstructs the entire burn in the CALLER, with the prefix check bypassed rather than
+    /// failed.
+    ///
+    /// Use it only for a puzzle hash the code itself produced and can vouch for: one computed from a
+    /// public key, an address this wallet generated, or a destination a lower layer has already
+    /// validated. Anything that began life as a string a human supplied MUST go through
+    /// [`from_address`](Self::from_address).
+    pub fn from_derived(puzzle_hash: Bytes32) -> Self {
+        Self(puzzle_hash)
+    }
+
+    /// The destination puzzle hash.
+    pub fn puzzle_hash(&self) -> Bytes32 {
+        self.0
+    }
+}
+
+/// What the caller wants moved, and to whom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferRequest {
+    recipient: PayableDestination,
+    amount_mojos: u64,
+    fee_mojos: u64,
+}
+
+impl TransferRequest {
+    /// Pay `amount_mojos` to `recipient`, with no fee.
+    ///
+    /// The destination has already been judged payable by whichever [`PayableDestination`]
+    /// constructor produced it; this function has nothing left to validate about it.
+    pub fn new(recipient: PayableDestination, amount_mojos: u64) -> Self {
+        Self {
+            recipient,
+            amount_mojos,
+            fee_mojos: 0,
+        }
+    }
+
+    /// Pay `amount_mojos` to a bech32m `xch1…` address, with no fee.
+    ///
+    /// A convenience for the common case, equivalent to
+    /// [`PayableDestination::from_address`] followed by [`new`](Self::new). The address is decoded
+    /// HERE so an unusable one is a named error before any chain read, rather than a comparison that
+    /// silently never matches later.
+    ///
+    /// # Errors
+    ///
+    /// See [`PayableDestination::from_address`].
+    pub fn to_address(address: &str, amount_mojos: u64) -> TransferResult<Self> {
+        Ok(Self::new(
+            PayableDestination::from_address(address)?,
+            amount_mojos,
+        ))
     }
 
     /// The same request, paying `fee_mojos` to a farmer.
@@ -332,6 +373,11 @@ impl TransferRequest {
 
     /// The destination puzzle hash.
     pub fn recipient(&self) -> Bytes32 {
+        self.recipient.puzzle_hash()
+    }
+
+    /// The destination, with the evidence that it is payable.
+    pub fn destination(&self) -> PayableDestination {
         self.recipient
     }
 
@@ -704,7 +750,7 @@ impl WalletOps {
         }
 
         let wallet = self.wallet_key();
-        if request.recipient == wallet.puzzle_hash() {
+        if request.recipient() == wallet.puzzle_hash() {
             return Err(TransferError::SelfPayment);
         }
 
@@ -762,8 +808,10 @@ impl WalletOps {
         }
 
         let wallet = self.wallet_key();
+        // `from_derived` is correct here and is not a bypass: this puzzle hash was judged payable
+        // when the ORIGINAL request was built, and has been carried through the plan unchanged.
         let request = TransferRequest {
-            recipient: pending.recipient,
+            recipient: PayableDestination::from_derived(pending.recipient),
             amount_mojos: pending.amount_mojos,
             fee_mojos: new_fee_mojos,
         };
@@ -1148,11 +1196,11 @@ fn build_transfer_spends(
 
     let mut ctx = SpendContext::new();
     let hint = ctx
-        .hint(request.recipient)
+        .hint(request.recipient())
         .map_err(|e| TransferError::Build(format!("recipient hint: {e}")))?;
 
     let mut lead_conditions =
-        Conditions::new().create_coin(request.recipient, request.amount_mojos, hint);
+        Conditions::new().create_coin(request.recipient(), request.amount_mojos, hint);
     if change > 0 {
         lead_conditions = lead_conditions.create_coin(wallet.puzzle_hash(), change, Memos::None);
     }
@@ -1182,10 +1230,10 @@ fn build_transfer_spends(
 
     Ok(TransferPlan {
         coin_spends: ctx.take(),
-        payment_coin_id: Coin::new(lead.coin_id(), request.recipient, request.amount_mojos)
+        payment_coin_id: Coin::new(lead.coin_id(), request.recipient(), request.amount_mojos)
             .coin_id(),
         source_coin_ids: selected.iter().map(Coin::coin_id).collect(),
-        recipient: request.recipient,
+        recipient: request.recipient(),
         amount_mojos: request.amount_mojos,
         fee_mojos: request.fee_mojos,
         change_mojos: change,
@@ -1480,7 +1528,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 900),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900),
             )
             .expect("the 900 coin covers it exactly");
 
@@ -1505,7 +1553,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
             )
             .expect("one coin covers this transfer, however much dust surrounds it");
         assert_eq!(inputs_of(&plan), vec![1_000_000]);
@@ -1523,7 +1571,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect("1_800 mojos cover 1_000");
 
@@ -1543,7 +1591,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 5_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 5_000),
             )
             .expect_err("1_000 mojos cannot cover 5_000");
         assert!(
@@ -1576,7 +1624,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect_err("only 5 mojos are actually spendable");
         assert!(
@@ -1613,7 +1661,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect_err("a source that cannot report a height cannot judge the balance");
         assert!(
@@ -1641,7 +1689,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
             )
             .is_ok());
     }
@@ -1671,7 +1719,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect_err("a coin this wallet's puzzle cannot unlock is not spendable value");
         assert!(
@@ -1698,7 +1746,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
             )
             .is_ok());
     }
@@ -1713,7 +1761,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
             )
             .is_ok());
     }
@@ -1732,7 +1780,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
+                    .with_fee(1_000),
             )
             .expect("builds");
 
@@ -1773,7 +1822,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
+                    .with_fee(1_000),
             )
             .expect("builds");
 
@@ -1821,7 +1871,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
+                    .with_fee(1_000),
             )
             .expect("builds");
 
@@ -1847,7 +1898,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
+                    .with_fee(1_000),
             )
             .expect("builds");
 
@@ -1879,7 +1931,11 @@ mod tests {
         let chain = FixedChain::holding(own, &[1_000]);
 
         let error = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::to_puzzle_hash(own, 500))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(own), 500),
+            )
             .expect_err("a self-payment moves nothing and would duplicate a coin id");
         assert!(matches!(error, TransferError::SelfPayment), "{error}");
     }
@@ -1897,7 +1953,7 @@ mod tests {
                 .build_transfer(
                     &chain,
                     &hot(),
-                    &TransferRequest::to_puzzle_hash(RECIPIENT, amount),
+                    &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), amount),
                 )
                 .expect("builds");
             let created = created_coins(plan.coin_spends());
@@ -1924,7 +1980,10 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 100 * coins.len() as u64),
+                &TransferRequest::new(
+                    PayableDestination::from_derived(RECIPIENT),
+                    100 * coins.len() as u64,
+                ),
             )
             .expect_err("one coin over the cap");
         assert!(
@@ -1949,7 +2008,10 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 100 * coins.len() as u64),
+                &TransferRequest::new(
+                    PayableDestination::from_derived(RECIPIENT),
+                    100 * coins.len() as u64,
+                ),
             )
             .expect("exactly the cap is allowed");
         assert_eq!(plan.coin_spends().len(), MAX_TRANSFER_INPUT_COINS);
@@ -1968,7 +2030,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &CustodyPolicy::Vault(Vault::default()),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
             )
             .expect_err("a vault outflow may only pay this profile's own hot wallet");
         assert!(
@@ -1991,7 +2053,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
             )
             .is_ok());
     }
@@ -2008,7 +2070,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(1),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(1),
             )
             .expect_err("1_000 mojos cannot pay 1_000 plus a fee");
         assert!(
@@ -2032,7 +2095,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
             )
             .is_ok());
     }
@@ -2045,7 +2108,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 0),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 0),
             )
             .expect_err("a transfer moves a positive amount");
         assert!(matches!(error, TransferError::ZeroAmount), "{error}");
@@ -2061,7 +2124,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, u64::MAX).with_fee(1),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), u64::MAX)
+                    .with_fee(1),
             )
             .expect_err("u64::MAX + 1 is not a spendable total");
         assert!(
@@ -2080,7 +2144,7 @@ mod tests {
             .build_transfer(
                 &FixedChain::offline(),
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect_err("an unanswerable chain is not an empty wallet");
         assert!(
@@ -2151,13 +2215,73 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect_err("a balance past u64 cannot be judged");
         assert!(
             matches!(error, TransferError::BalanceUnjudgeable),
             "{error}"
         );
+    }
+
+    /// **The unsafe destination is no longer expressible from a raw `Bytes32` by accident.**
+    ///
+    /// `TransferRequest::new` takes a [`PayableDestination`], so every destination has passed through
+    /// one of exactly two constructors: one that CHECKS a string, and one whose name says the caller
+    /// is vouching for a hash the code derived. The old `to_puzzle_hash(Bytes32, u64)` allowed a
+    /// decoded `nft1…` payload straight in with nothing said about it, and it was as prominent in the
+    /// public API as the safe path.
+    ///
+    /// This test pins the SHAPE rather than a behaviour: the two routes must agree on the puzzle hash
+    /// when the address really is an `xch` one, which is what makes `from_derived` a genuine
+    /// alternative rather than a different meaning.
+    #[test]
+    fn the_checked_and_vouched_destinations_agree_on_a_real_xch_address() {
+        let address = Address::new(RECIPIENT, MAINNET_ADDRESS_PREFIX.to_string())
+            .encode()
+            .expect("encodes");
+
+        let checked = PayableDestination::from_address(&address).expect("an xch address");
+        let vouched = PayableDestination::from_derived(RECIPIENT);
+
+        assert_eq!(checked, vouched);
+        assert_eq!(checked.puzzle_hash(), RECIPIENT);
+    }
+
+    /// The prefix rule lives in [`PayableDestination::from_address`] now, so it is enforced for every
+    /// caller of every constructor that takes a string — including `TransferRequest::to_address`,
+    /// which delegates to it.
+    ///
+    /// The fixture is the SAME 32 bytes under each prefix, so the only difference between these cases
+    /// and an accepted one is the prefix itself.
+    #[test]
+    fn a_payable_destination_refuses_every_non_xch_prefix() {
+        for prefix in ["nft", "txch", "did:chia", "cat", "totally-bogus"] {
+            let encoded = Address::new(RECIPIENT, prefix.to_string())
+                .encode()
+                .expect("a 32-byte payload encodes under any prefix");
+
+            // The control for the whole test: this string really does decode, so the refusal below
+            // is the prefix rule and not a parse failure.
+            assert_eq!(
+                Address::decode(&encoded).expect("it decodes").puzzle_hash,
+                RECIPIENT,
+                "{prefix} must be a decodable address, or this case proves nothing"
+            );
+
+            let error = PayableDestination::from_address(&encoded)
+                .expect_err("paying the puzzle hash inside a non-payment address burns the funds");
+            match &error {
+                TransferError::InvalidRecipient { reason, .. } => assert!(
+                    reason.contains(prefix),
+                    "the refusal must name the prefix the user actually pasted: {reason}"
+                ),
+                other => panic!("{prefix}: {other}"),
+            }
+
+            // And the same refusal reaches the request constructor that delegates to it.
+            assert!(TransferRequest::to_address(&encoded, 1_000).is_err());
+        }
     }
 
     /// A well-formed address decodes to the puzzle hash it names, so the two constructors agree.
@@ -2212,7 +2336,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
             )
             .expect("builds");
 
@@ -2231,7 +2355,7 @@ mod tests {
             .build_transfer(
                 &source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
             )
             .expect("builds");
 
@@ -2266,14 +2390,15 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect("builds");
         let naive_retry = ops
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(100),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(100),
             )
             .expect("builds");
 
@@ -2314,7 +2439,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect("builds");
         let pending = original.pushed_at(PEAK);
@@ -2362,7 +2487,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2392,7 +2517,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2421,7 +2547,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2446,7 +2573,8 @@ mod tests {
             .build_transfer(
                 &source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds");
         let pending = original.pushed_at(PEAK);
@@ -2488,7 +2616,8 @@ mod tests {
             .build_transfer(
                 &source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2510,7 +2639,8 @@ mod tests {
             .build_transfer(
                 &source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2541,7 +2671,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                    .with_fee(50),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -2575,7 +2706,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 550),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 550),
             )
             .expect("builds");
 
@@ -2667,7 +2798,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 700_000).with_fee(1_000),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 700_000)
+                    .with_fee(1_000),
             )
             .expect("builds");
         assert!(
@@ -2729,7 +2861,7 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 500),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 500),
             )
             .expect("builds");
 
@@ -2746,7 +2878,7 @@ mod tests {
             .build_transfer(
                 source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
             )
             .expect("builds");
         // Derived from the coins the puzzles CREATE rather than from an assumed spend ordering, so
@@ -2932,7 +3064,7 @@ mod tests {
             .build_transfer(
                 &source,
                 &hot(),
-                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
             )
             .expect("builds");
         let payment = created_coins(plan.coin_spends())
