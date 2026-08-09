@@ -371,6 +371,16 @@ impl ProfileRegistry {
     /// - **No journalled mint discloses a store fee above the mint's ceiling**, so the bound
     ///   [`begin_mint`](Self::begin_mint) applies cannot be side-stepped by editing the file a
     ///   resumed phase B reads its spending limit from.
+    /// - **The same DID binding holds for every DID the JOURNAL carries**, on every
+    ///   [`MintStage`](crate::registry::MintStage) that carries one. A journalled DID is not inert
+    ///   bookkeeping: `DidConfirmedStoreNotLaunched` tells the resume path to launch the store from
+    ///   THAT record's DID coin, so a file that could redirect it would redirect a spend. Bounding
+    ///   the fee beside an unchecked identity would be an asymmetry, not a scope boundary.
+    /// - **No confirmation height is 0**, for anchors and journalled DIDs alike. No coin is created
+    ///   in the genesis block, so a `0` is fabricated — the same reasoning
+    ///   [`MintedDid::from_confirmed`](crate::mint::MintedDid::from_confirmed) applies to live
+    ///   evidence, applied to the file that outlives it. Unlike fabrication in general this one IS
+    ///   checkable offline, so there is no reason to wait for chain re-verification.
     fn check(&self) -> std::result::Result<(), String> {
         let mut seen = std::collections::BTreeSet::new();
         for ix in self
@@ -408,23 +418,47 @@ impl ProfileRegistry {
         }
 
         for entry in &self.entries {
-            let honest = dig_did::did_string_from_launcher_id(entry.anchor().launcher_id());
-            if entry.anchor().did() != honest {
+            let anchor = entry.anchor();
+            let ix = entry.ix();
+            let honest = dig_did::did_string_from_launcher_id(anchor.launcher_id());
+            if anchor.did() != honest {
                 return Err(format!(
-                    "profile {ix}'s DID string does not belong to its launcher id",
-                    ix = entry.ix()
+                    "profile {ix}'s DID string does not belong to its launcher id"
+                ));
+            }
+            if anchor.did_confirmed_height() == 0 {
+                return Err(format!(
+                    "profile {ix}'s DID claims to have confirmed at height 0"
+                ));
+            }
+            if anchor.store_confirmed_height() == 0 {
+                return Err(format!(
+                    "profile {ix}'s store claims to have confirmed at height 0"
                 ));
             }
         }
 
         for mint in &self.in_progress {
+            let ix = mint.ix();
             if mint.store_fee() > MAX_MINT_FEE_MOJOS {
                 return Err(format!(
                     "the mint journalled at {ix} discloses a store fee of {fee} mojos, above the \
                      {MAX_MINT_FEE_MOJOS} mojo ceiling",
-                    ix = mint.ix(),
                     fee = mint.store_fee()
                 ));
+            }
+            for did in mint.stage().minted_dids() {
+                let honest = dig_did::did_string_from_launcher_id(did.launcher_id);
+                if did.did != honest {
+                    return Err(format!(
+                        "the DID journalled at {ix} does not belong to its launcher id"
+                    ));
+                }
+                if did.confirmed_height == 0 {
+                    return Err(format!(
+                        "the DID journalled at {ix} claims to have confirmed at height 0"
+                    ));
+                }
             }
         }
 
@@ -743,15 +777,24 @@ mod tests {
             dig_did::did_string_from_launcher_id(chia_protocol::Bytes32::new(LAUNCHER_ID))
         }
 
+        /// [`LAUNCHER_ID`] as the hex string serde emits for a `Bytes32`.
+        const LAUNCHER_HEX: &str =
+            "0x0101010101010101010101010101010101010101010101010101010101010101";
+        const COIN_HEX: &str = "0x0202020202020202020202020202020202020202020202020202020202020202";
+
         fn anchor(did: &str) -> String {
+            anchor_confirmed_at(did, 10, 11)
+        }
+
+        fn anchor_confirmed_at(did: &str, did_height: u32, store_height: u32) -> String {
             format!(
                 r#"{{
             "did": "{did}",
-            "launcher_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
-            "did_coin_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
-            "did_confirmed_height": 10,
+            "launcher_id": "{LAUNCHER_HEX}",
+            "did_coin_id": "{COIN_HEX}",
+            "did_confirmed_height": {did_height},
             "store_launcher_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
-            "store_confirmed_height": 11
+            "store_confirmed_height": {store_height}
         }}"#
             )
         }
@@ -761,27 +804,75 @@ mod tests {
         }
 
         fn entry_claiming(ix: u32, visibility: &str, did: &str) -> String {
-            let anchor = anchor(did);
-            format!(r#"{{"ix":{ix},"anchor":{anchor},"label":null,"visibility":"{visibility}"}}"#)
+            wrap_entry(ix, visibility, anchor(did))
         }
 
-        fn pending(ix: u32) -> String {
-            format!(
-                r#"{{"ix":{ix},"stage":{{"DidConfirmedStoreNotLaunched":{{"did":{{
-                    "did":"did:chia:x",
-                    "launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101",
-                    "coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202",
-                    "confirmed_height":10}}}}}},"store_fee":1000}}"#
+        fn entry_confirmed_at(ix: u32, did_height: u32, store_height: u32) -> String {
+            wrap_entry(
+                ix,
+                "Shown",
+                anchor_confirmed_at(&honest_did(), did_height, store_height),
             )
         }
 
-        fn pending_with_fee(ix: u32, store_fee: u64) -> String {
+        fn wrap_entry(ix: u32, visibility: &str, anchor: String) -> String {
+            format!(r#"{{"ix":{ix},"anchor":{anchor},"label":null,"visibility":"{visibility}"}}"#)
+        }
+
+        /// A journalled `MintedDidRecord` claiming `did` and `confirmed_height`, against the same
+        /// launcher id [`honest_did`] derives from — so a rejection can only be the field varied.
+        fn did_record(did: &str, confirmed_height: u32) -> String {
             format!(
-                r#"{{"ix":{ix},"stage":{{"DidConfirmedStoreNotLaunched":{{"did":{{
-                    "did":"did:chia:x",
-                    "launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101",
-                    "coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202",
-                    "confirmed_height":10}}}}}},"store_fee":{store_fee}}}"#
+                r#"{{"did":"{did}","launcher_id":"{LAUNCHER_HEX}","coin_id":"{COIN_HEX}",
+                    "confirmed_height":{confirmed_height}}}"#
+            )
+        }
+
+        /// The stage that carries NO DID record, as a truthful control: it must keep loading, or a
+        /// journal check that simply refused everything would look like a working rule.
+        fn did_pushed_stage() -> String {
+            format!(
+                r#"{{"DidPushed":{{"pending":{{"launcher_id":"{LAUNCHER_HEX}",
+                    "did_coin_id":"{COIN_HEX}","source_coin_id":"{COIN_HEX}",
+                    "pushed_at_height":100}}}}}}"#
+            )
+        }
+
+        fn did_confirmed_stage(did: &str, confirmed_height: u32) -> String {
+            format!(
+                r#"{{"DidConfirmedStoreNotLaunched":{{"did":{}}}}}"#,
+                did_record(did, confirmed_height)
+            )
+        }
+
+        fn store_pushed_stage(did: &str, confirmed_height: u32) -> String {
+            let root = format!("{:?}", [7u8; 32]);
+            format!(
+                r#"{{"StorePushed":{{"did":{did_record},"pending_store":{{
+                    "launcher_id":"{LAUNCHER_HEX}","store_coin_id":"{COIN_HEX}",
+                    "did_coin_id":"{COIN_HEX}","committed_root":{root},
+                    "pushed_at_height":100}}}}}}"#,
+                did_record = did_record(did, confirmed_height)
+            )
+        }
+
+        fn journalled(ix: u32, stage: String, store_fee: u64) -> String {
+            format!(r#"{{"ix":{ix},"stage":{stage},"store_fee":{store_fee}}}"#)
+        }
+
+        fn pending(ix: u32) -> String {
+            pending_with_fee(ix, 1_000)
+        }
+
+        fn pending_with_fee(ix: u32, store_fee: u64) -> String {
+            journalled(ix, did_confirmed_stage(&honest_did(), 10), store_fee)
+        }
+
+        /// A registry carrying exactly one journalled mint at the stage given.
+        fn registry_with_stage(stage: String) -> String {
+            format!(
+                r#"{{"entries":[],"active":null,"in_progress":[{}]}}"#,
+                journalled(1, stage, 1_000)
             )
         }
 
@@ -896,6 +987,89 @@ mod tests {
                     pending(0)
                 ),
                 "with one index both confirmed and pending",
+            );
+        }
+
+        /// **Regression: the journalled DID is spoofable too, at every stage that carries one.**
+        /// `DidConfirmedStoreNotLaunched` instructs the resume path to launch the store from THAT
+        /// record's DID coin, so a file that redirects it redirects a spend. Asserted once per
+        /// record-carrying variant, because a rule applied to one of them would leave the other
+        /// wide open and a single-variant test would never say so.
+        #[test]
+        fn a_journalled_did_that_does_not_belong_to_its_launcher_id_is_rejected() {
+            let spoof = "did:chia:1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqvictim";
+            assert_ne!(
+                spoof,
+                honest_did(),
+                "the spoof must differ, or this proves nothing"
+            );
+
+            assert_rejected(
+                registry_with_stage(did_confirmed_stage(spoof, 10)),
+                "whose DidConfirmedStoreNotLaunched DID does not belong to its launcher id",
+            );
+            assert_rejected(
+                registry_with_stage(store_pushed_stage(spoof, 10)),
+                "whose StorePushed DID does not belong to its launcher id",
+            );
+        }
+
+        /// The stage-shaped control for the test above: each variant loads when its DID is honest,
+        /// and `DidPushed` — which carries no DID at all — keeps loading. Without this a journal
+        /// check that rejected every stage would read as three working rules.
+        #[test]
+        fn every_stage_loads_when_its_did_is_honest() {
+            for stage in [
+                did_pushed_stage(),
+                did_confirmed_stage(&honest_did(), 10),
+                store_pushed_stage(&honest_did(), 10),
+            ] {
+                ProfileRegistry::from_json(&registry_with_stage(stage.clone()))
+                    .unwrap_or_else(|e| panic!("the honest stage {stage} must load: {e:?}"));
+            }
+        }
+
+        /// **Regression: a fabricated genesis height on the journal.** No coin is created in block
+        /// 0, so a `0` is a value no confirmation could have produced — the rule
+        /// `MintedDid::from_confirmed` applies to live evidence, applied to the file.
+        #[test]
+        fn a_journalled_did_confirmed_at_height_zero_is_rejected() {
+            assert_rejected(
+                registry_with_stage(did_confirmed_stage(&honest_did(), 0)),
+                "whose journalled DID confirmed at the genesis height",
+            );
+            assert_rejected(
+                registry_with_stage(store_pushed_stage(&honest_did(), 0)),
+                "whose StorePushed DID confirmed at the genesis height",
+            );
+        }
+
+        /// The same fabricated height, on an anchor. Height 1 is the lowest honest value and must
+        /// still load, so the rejection is the `0` and not an over-eager lower bound.
+        #[test]
+        fn an_anchor_confirmed_at_height_zero_is_rejected() {
+            assert_rejected(
+                format!(
+                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                    entry_confirmed_at(0, 0, 11)
+                ),
+                "whose DID confirmed at the genesis height",
+            );
+            assert_rejected(
+                format!(
+                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                    entry_confirmed_at(0, 10, 0)
+                ),
+                "whose store confirmed at the genesis height",
+            );
+
+            let at_bound = format!(
+                r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                entry_confirmed_at(0, 1, 1)
+            );
+            assert!(
+                ProfileRegistry::from_json(&at_bound).is_ok(),
+                "the first block after genesis is an honest height"
             );
         }
 

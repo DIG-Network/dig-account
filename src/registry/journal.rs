@@ -185,6 +185,20 @@ impl MintStage {
             Self::StorePushed { .. } => "finishing setup",
         }
     }
+
+    /// Every [`MintedDidRecord`] this stage carries, so a validator can reach all of them without
+    /// knowing the variants.
+    ///
+    /// The match is deliberately exhaustive and wildcard-free: a new variant carrying a record must
+    /// fail to compile here rather than slip past the registry's checks, which is exactly how a rule
+    /// that covered two of three variants stayed invisible before.
+    pub(crate) fn minted_dids(&self) -> Vec<&MintedDidRecord> {
+        match self {
+            Self::DidPushed { .. } => Vec::new(),
+            Self::DidConfirmedStoreNotLaunched { did } => vec![did],
+            Self::StorePushed { did, .. } => vec![did],
+        }
+    }
 }
 
 /// A profile mint that has STARTED and is not finished — the resumable, honestly-named state.
