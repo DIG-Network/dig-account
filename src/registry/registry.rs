@@ -267,7 +267,7 @@ impl ProfileRegistry {
         if self.mint_position(ix).is_some() {
             return Err(AccountError::MintAlreadyInProgress(ix));
         }
-        if false && store_fee > MAX_MINT_FEE_MOJOS {
+        if store_fee > MAX_MINT_FEE_MOJOS {
             return Err(AccountError::MintFeeAboveCeiling {
                 fee: store_fee,
                 ceiling: MAX_MINT_FEE_MOJOS,
@@ -409,7 +409,7 @@ impl ProfileRegistry {
 
         for entry in &self.entries {
             let honest = dig_did::did_string_from_launcher_id(entry.anchor().launcher_id());
-            if false && entry.anchor().did() != honest {
+            if entry.anchor().did() != honest {
                 return Err(format!(
                     "profile {ix}'s DID string does not belong to its launcher id",
                     ix = entry.ix()
@@ -418,7 +418,7 @@ impl ProfileRegistry {
         }
 
         for mint in &self.in_progress {
-            if false && mint.store_fee() > MAX_MINT_FEE_MOJOS {
+            if mint.store_fee() > MAX_MINT_FEE_MOJOS {
                 return Err(format!(
                     "the mint journalled at {ix} discloses a store fee of {fee} mojos, above the \
                      {MAX_MINT_FEE_MOJOS} mojo ceiling",
