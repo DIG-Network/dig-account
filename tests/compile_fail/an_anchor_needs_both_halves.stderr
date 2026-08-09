@@ -1,0 +1,42 @@
+error: cannot construct `ProfileAnchor` with struct literal syntax due to private fields
+  --> tests/compile_fail/an_anchor_needs_both_halves.rs:11:20
+   |
+11 |     let _literal = ProfileAnchor {
+   |                    ^^^^^^^^^^^^^
+12 |         did: "did:chia:x".to_string(),
+   |         ----------------------------- private field
+   |
+   = note: ...and other private fields `launcher_id`, `did_coin_id`, `did_confirmed_height`, `store_launcher_id` and `store_confirmed_height` that were not provided
+help: you might have meant to use the `from_confirmed` associated function
+   |
+11 -     let _literal = ProfileAnchor {
+12 -         did: "did:chia:x".to_string(),
+13 -     };
+11 +     let _literal = ProfileAnchor::from_confirmed(_, _);
+   |
+
+warning: unreachable statement
+  --> tests/compile_fail/an_anchor_needs_both_halves.rs:17:5
+   |
+16 |     let did: MintedDid = unimplemented!();
+   |                          ---------------- any code following this expression is unreachable
+17 |     let _partial = ProfileAnchor::from_confirmed(&did);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+  --> tests/compile_fail/an_anchor_needs_both_halves.rs:17:20
+   |
+17 |     let _partial = ProfileAnchor::from_confirmed(&did);
+   |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^------ argument #2 of type `&ConfirmedStore` is missing
+   |
+note: associated function defined here
+  --> src/registry/anchor.rs
+   |
+   |     pub fn from_confirmed(did: &MintedDid, store: &ConfirmedStore) -> Self {
+   |            ^^^^^^^^^^^^^^
+help: provide the argument
+   |
+17 |     let _partial = ProfileAnchor::from_confirmed(&did, /* &ConfirmedStore */);
+   |                                                      +++++++++++++++++++++++

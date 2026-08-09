@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `registry` as mutable because it is also borrowed as immutable
+  --> tests/compile_fail/a_stale_active_handle.rs:13:5
+   |
+12 |     let active = registry.active().expect("fixture");
+   |                  -------- immutable borrow occurs here
+13 |     registry.set_active(ProfileIx(1)).expect("fixture");
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+14 |     let _stale = active.ix();
+   |                  ------ immutable borrow later used here
