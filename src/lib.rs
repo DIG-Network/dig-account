@@ -24,14 +24,20 @@
 //!
 //! ## Phase 1 status
 //!
-//! This is the PUBLIC TYPE SURFACE cut: the object model, keystore (`store`), unlock policy
-//! (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` — the canonical
-//! `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner) over
-//! `dig-wallet-backend`'s `LocalSigner`, with the structured [`SpendSummary`](wallet::summary::SpendSummary))
-//! carry real, tested implementations, as does the **on-chain DID mint** ([`mint`] — build, sign,
-//! push, and prove a `did:chia:` against real chain evidence). The full-profile mint
-//! ([`ProfileMinter::mint`]) still exposes its FINAL public signature with a `todo!()` body, awaiting
-//! the dig-store half.
+//! This is the PUBLIC TYPE SURFACE cut: the object model, the **profile registry** ([`registry`] —
+//! which profiles exist, which is active, which mints are half-finished), keystore (`store`),
+//! unlock policy (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` —
+//! the canonical `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner)
+//! over `dig-wallet-backend`'s `LocalSigner`, with the structured
+//! [`SpendSummary`](wallet::summary::SpendSummary)) carry real, tested implementations, as does the
+//! **on-chain DID mint** ([`mint`] — build, sign, push, and prove a `did:chia:` against real chain
+//! evidence).
+//!
+//! [`ProfileMinter::mint`] still has a `todo!()` body, and its CURRENT signature is **not** the
+//! final one: a full-profile mint is a two-phase on-chain ceremony — the DID singleton must confirm
+//! before the store launch parented from its coin can even be built — so it needs a `ChainSource`,
+//! a `SpendPublisher` and a `MintNetwork` that the present signature does not take. Its final shape
+//! lands with dig_ecosystem#2342.
 
 // Phase 1 stubs: several modules expose final signatures with `todo!()`/`unimplemented!()` bodies.
 #![allow(clippy::todo)]

@@ -40,23 +40,33 @@ contract, the versioned at-rest envelope, and the fail-closed legacy rule live i
 
 ### 2.1 Account (master seed + profiles; exactly-one-default invariant)
 
-An `Account` is one `AccountId` + one-or-more `Profile`s + a `default_profile_ix`. Construction
-(`Account::new`) MUST reject an empty profile set (`DefaultProfileInvariant`) and a
-`default_profile_ix` that names no present profile (`ProfileNotFound`). `set_default_profile` MUST leave
-the previous default unchanged if the target index is absent (fail-closed). `default_profile()`
-therefore always returns a present profile.
+An `Account` is one `AccountId` + one `ProfileRegistry` (§2.4, the OFFLINE half: which profiles exist,
+which is active) + zero-or-more resolved `Profile`s (§2.2, the ONLINE half). `Account::new` is TOTAL and
+MUST NOT reject any registry: an account with no confirmed profile is the state every account starts in,
+and MUST be representable.
+
+`attach_resolved` MUST refuse an index the registry does not confirm (`ProfileNotFound`), so the resolved
+views can never claim a profile the registry does not have.
 
 `AccountId` is an app-local, opaque, stable handle (a UUID is recommended). It MUST NOT be a DID and
 MUST NOT be derived from key material, so relabelling an account never disturbs its custody root.
 
-`AccountRecord` is the serializable persistence shape (`id`, `profile_indexes`, `default_profile_ix`);
-the live `Profile` state is rehydrated from chain / dig-store on load. It MUST NOT carry any secret.
+`AccountRecord` is the serializable persistence shape (`id`, `profiles: ProfileRegistry`); the live
+`Profile` state is rehydrated from chain / dig-store on load. It MUST NOT carry any secret.
+
+`default_profile()` / `set_default_profile()` are DEPRECATED delegates to `registry().active()` /
+`registry_mut().set_active()`. `default_profile()` returns an `Option`, because an account may have no
+active profile.
 
 ### 2.2 Profile (DID + dig-store + SMT; wraps dig-social-profile IdentityProfile)
 
 A `Profile` is a `dig_social_profile::IdentityProfile` (DID singleton + dig-store + profile-info SMT)
 tagged with the `ProfileIx` its identity + wallet keys derive at. The model is pure state — no seed, no
 crypto — so it is trivially testable and serialization-friendly.
+
+A `Profile` is the ONLINE, chain-resolved view. It MUST NOT be the authority on whether a profile
+exists — that is the registry's job (§2.4) — and it is attached opportunistically, once a chain source
+is available. A host MUST be able to list and switch profiles with no `Profile` resolved at all.
 
 ### 2.3 AccountStore / multi-account registry
 
@@ -74,6 +84,66 @@ derives NO keys itself.
   (§4.1), which return an `UnlockedAccount`.
 - `list` enumerates enrolled accounts sorted; `delete` is irreversible and MUST report `NotFound` for an
   absent account.
+
+### 2.4 ProfileRegistry (the offline profile record)
+
+The `ProfileRegistry` is the authoritative offline record of an account's profiles: confirmed entries,
+the active slot, and the journal of half-finished mints. It holds PUBLIC IDENTIFIERS ONLY — an HD index,
+a `did:chia:` string, coin ids, heights, a local label, a local list visibility. No method MAY take an
+`UnlockedAccount`, an `UnlockedMasterSeed`, a `Residency` or a `ChainSource`, and every read MUST be
+available while the account is LOCKED.
+
+**A profile the chain has not confirmed is not a profile.** A `ProfileEntry` MUST be constructible only
+from a `ProfileAnchor`, and a `ProfileAnchor` only from BOTH halves of a confirmed mint — a `MintedDid`
+(§6A) and a `ConfirmedStore`, each of which requires an on-chain confirmation buried at least
+`MIN_CONFIRMATION_DEPTH` blocks. No path MAY record a profile from a key, or from a push being accepted.
+
+Deserializing an anchor is a CACHE OF A VERDICT, not a verdict: it asserts only that this host recorded
+live evidence earlier and wrote it down. Re-verification against a trusted `ChainSource` is deferred to
+profile discovery.
+
+#### 2.4.1 The four invariants (normative)
+
+Enforced on construction, on EVERY mutation, and on DESERIALIZE. A registry violating any of them MUST
+NOT load: `from_json` returns `RegistryInvariant` and yields no registry at all, never a partial one.
+
+1. **Indices are UNIQUE across `entries` and `in_progress`.** An index is confirmed or in progress,
+   never both, and never twice.
+2. **`active` is `Some(ix)` IFF `entries` is non-empty**, and that `ix` MUST name a present entry. An
+   account with no confirmed profile has NO active slot; fabricating one would record a profile the
+   chain has not confirmed.
+3. **The active entry MUST be `Shown`.** A hidden active profile is a trap: nothing is listed while the
+   wallet keeps deriving and receiving at that index. `set_visibility` MUST refuse to hide the active
+   profile (`ActiveProfileCannotBeHidden`, leaving it unchanged); `set_active` MUST un-hide its target.
+4. **Indices are SPARSE.** Gaps are legal, and nothing MAY derive an index from `entries.len()`.
+   `next_free_ix()` MUST return one past the highest index known — confirmed OR in progress — and MUST
+   NOT reuse a gap: an index that looks free locally may already hold an undiscovered profile, and an
+   in-progress index names a DID that is already paid for.
+
+#### 2.4.2 Visibility
+
+`ProfileVisibility` is a LOCAL VIEW PREFERENCE with no on-chain effect. Hiding a profile MUST NOT stop
+any key deriving at that index, and coins at that address stay spendable. A minted profile is permanent:
+there is no delete, and the enum MUST NOT grow one.
+
+#### 2.4.3 The mint journal
+
+A profile mint is TWO bundles — the DID singleton, then a dig-store launched from its coin — with a
+real, minutes-wide window between them in which the DID is already paid for. That window MUST be
+journalled as a `ProfileMintInProgress`, which is NOT a profile and MUST NOT be presentable as one.
+
+- `MintStage` names what has been PROVEN: `DidPushed` (nothing), `DidConfirmedStoreNotLaunched` (the
+  dangerous state — money spent, an identity exists, no profile), `StorePushed`.
+- A journalled stage MUST carry only public identifiers, heights and fees. It MUST NOT carry a
+  `puzzle_reveal`, a `solution`, a lineage proof, a `DidInfo` or a serialized `Did`: the resume path
+  re-derives the spendable DID from chain by walking its lineage from the launcher id.
+- The journal's `*Record` types are serde MIRRORS of the evidence types, converting ONE WAY only. A
+  record is NOT evidence, and there MUST NOT be a conversion back into `MintedDid` or `ConfirmedStore`.
+- `store_fee` records the fee disclosed to the user for the store-launch bundle, so a phase-B resume
+  after a restart cannot spend more than the amount the user was shown.
+- A resume from `DidConfirmedStoreNotLaunched` MUST launch the store from the existing DID coin, and
+  MUST NOT re-mint the DID.
+- A `progress_label()` MUST NOT assert that a profile exists.
 
 ## 3. Key derivation (byte-contracts — additive, back-compatible forever)
 
@@ -786,6 +856,17 @@ because the next such decision will be measured against it:
   other Chia wallet, which is strictly worse.
 
 Any FURTHER change to a stored-secret derivation requires a migration path, not a re-pin.
+
+**The 0.7.0 break, and why it needs no migration.** 0.7.0 changes `AccountRecord`'s serde shape
+(`profile_indexes` + `default_profile_ix` become one `profiles: ProfileRegistry`) and makes
+`Account::new` total. No derivation, no sealed format and no golden vector is touched, so §3's frozen
+byte-contracts are unaffected.
+
+It needs no migration because there is nothing to migrate — measured, not assumed: `AccountRecord`
+appears nowhere outside `src/model.rs` and its `lib.rs` re-export, and nothing in this crate or in
+dig-app persists one. There is no sealed artifact keyed by the old shape, no chain state that references
+it, and no funded key that depends on it. Any future change to a record that IS persisted requires a
+migration path, exactly as the 0.2.0 entry above requires.
 
 **Adopting 0.2.0 REQUIRES a legacy-detection-and-re-enrolment path in the host (normative).** An
 existing legacy account is WEDGED, not merely unreadable: `AccountSession::unlock` surfaces
