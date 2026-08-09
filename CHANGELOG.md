@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.8.0] - 2026-08-09
+
+### Features
+- **wallet:** The ordinary-transfer spend builder (#10)
+
 ## [0.7.0] - 2026-08-09
 
 ### Features
