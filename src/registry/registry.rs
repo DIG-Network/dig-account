@@ -1044,31 +1044,43 @@ mod tests {
             );
         }
 
-        /// The same fabricated height, on an anchor. Height 1 is the lowest honest value and must
-        /// still load, so the rejection is the `0` and not an over-eager lower bound.
+        /// A registry carrying exactly one anchor, confirmed at the two heights given.
+        fn registry_with_anchor_at(did_height: u32, store_height: u32) -> String {
+            format!(
+                r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                entry_confirmed_at(0, did_height, store_height)
+            )
+        }
+
+        /// The same fabricated height, on an anchor's DID half.
+        ///
+        /// **The two anchor heights are asserted in SEPARATE tests on purpose.** Asserting both here
+        /// would make one test fail whichever guard was removed, so a revert-proof could not tell a
+        /// working pair from one live guard beside one dead one — the store height is varied alone
+        /// below, and the control keeps the other half honest in each.
         #[test]
-        fn an_anchor_confirmed_at_height_zero_is_rejected() {
+        fn an_anchor_whose_did_confirmed_at_height_zero_is_rejected() {
             assert_rejected(
-                format!(
-                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
-                    entry_confirmed_at(0, 0, 11)
-                ),
+                registry_with_anchor_at(0, 11),
                 "whose DID confirmed at the genesis height",
             );
+        }
+
+        /// The store half of the rule above, varied alone.
+        #[test]
+        fn an_anchor_whose_store_confirmed_at_height_zero_is_rejected() {
             assert_rejected(
-                format!(
-                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
-                    entry_confirmed_at(0, 10, 0)
-                ),
+                registry_with_anchor_at(10, 0),
                 "whose store confirmed at the genesis height",
             );
+        }
 
-            let at_bound = format!(
-                r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
-                entry_confirmed_at(0, 1, 1)
-            );
+        /// The control for both: height 1 is the lowest honest value and must still load, so the
+        /// two rejections above are the `0` and not an over-eager lower bound.
+        #[test]
+        fn an_anchor_confirmed_in_the_first_block_after_genesis_loads() {
             assert!(
-                ProfileRegistry::from_json(&at_bound).is_ok(),
+                ProfileRegistry::from_json(&registry_with_anchor_at(1, 1)).is_ok(),
                 "the first block after genesis is an honest height"
             );
         }
