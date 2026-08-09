@@ -428,12 +428,14 @@ impl ProfileRegistry {
             }
             if anchor.did_confirmed_height() == 0 {
                 return Err(format!(
-                    "profile {ix}'s DID claims to have confirmed at height 0"
+                    "profile {ix}'s did_confirmed_height is 0, which no on-chain confirmation can \
+                     produce; MintedDid::from_confirmed refuses it"
                 ));
             }
             if anchor.store_confirmed_height() == 0 {
                 return Err(format!(
-                    "profile {ix}'s store claims to have confirmed at height 0"
+                    "profile {ix}'s store_confirmed_height is 0, which no on-chain confirmation \
+                     can produce; ConfirmedStore::from_confirmed refuses it"
                 ));
             }
         }
