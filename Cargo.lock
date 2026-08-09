@@ -1270,6 +1270,7 @@ dependencies = [
  "async-trait",
  "bip39",
  "chia-bls 0.26.0",
+ "chia-consensus 0.26.0",
  "chia-protocol 0.26.0",
  "chia-puzzle-types 0.26.0",
  "chia-sdk-test",

@@ -854,6 +854,14 @@ is still absent. Otherwise a node behind the inclusion (payment absent) paired w
 test of this property MUST use a source that answers INCONSISTENTLY across successive reads; a single
 consistent snapshot cannot exhibit it.
 
+A chain source may also VIOLATE its contract outright, and an implementation MUST NOT assume otherwise:
+an aggregating source is several nodes stitched together, so a record answering a `coin_record` query
+may describe a coin other than the one asked for. Every record MUST therefore be re-checked against the
+id it is supposed to describe before it is treated as evidence, and one that does not match MUST be
+discarded rather than trusted because of where it came from. A test of this property MUST use a double
+capable of answering with a record for a DIFFERENT coin; a double that resolves records BY the
+requested id cannot exhibit the violation, and a suite built only on one leaves the check unfalsifiable.
+
 #### 6.7.6 `payment_coin_id` is not a bundle identity
 
 `payment_coin_id` identifies the PAYMENT, not the bundle that produced it: it is determined by

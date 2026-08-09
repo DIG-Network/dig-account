@@ -1847,7 +1847,8 @@ mod tests {
     #[test]
     fn an_orphaned_secondary_input_is_refused_by_consensus_even_when_correctly_signed() {
         use chia_bls::Signature;
-        use chia_sdk_test::Simulator;
+        use chia_consensus::validation_error::ErrorCode;
+        use chia_sdk_test::{Simulator, SimulatorError};
         use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
         use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
 
@@ -1913,10 +1914,17 @@ mod tests {
             orphans.clone(),
             orphan_signature.clone(),
         ));
-        assert!(
-            refused.is_err(),
-            "a correctly-signed secondary input must still be un-includable without its lead"
-        );
+        // Pinned to the SPECIFIC consensus refusal. A bare `is_err()` here would be satisfied by a
+        // signature failure, a malformed bundle, or a simulator misconfiguration — every one of which
+        // would leave the binding untested while the test stayed green, since the validator never
+        // reaches the announcement check once it has already rejected the bundle for another reason.
+        // `AssertCoinAnnouncementFailed` is the announcement the lead never made, and nothing else.
+        match refused {
+            Err(SimulatorError::Validation(ErrorCode::AssertCoinAnnouncementFailed)) => {}
+            other => panic!(
+                "the orphaned subset must be refused for the UNSATISFIED ANNOUNCEMENT specifically,                  not for some other reason that would hide a missing binding: {other:?}"
+            ),
+        }
 
         // The control: the SAME coins, the SAME keys, the SAME simulator — with the lead restored.
         let whole = plan.coin_spends().to_vec();
