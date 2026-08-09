@@ -293,6 +293,47 @@ mod tests {
         // There is deliberately no `MintedDid::from(record)`; see the module docs.
     }
 
+    /// Each mirror copies every field of its evidence, asserted field-by-field against its own
+    /// source so a swapped or dropped field fails rather than merely producing a plausible record.
+    #[test]
+    fn each_record_mirrors_every_field_of_its_evidence() {
+        use crate::mint::fixtures::{confirmed_store, pending_mint, pending_store_launch};
+
+        let minted = minted_did(2);
+        let did_record = MintedDidRecord::from(&minted);
+        assert_eq!(did_record.did, minted.did());
+        assert_eq!(did_record.launcher_id, minted.launcher_id());
+        assert_eq!(did_record.coin_id, minted.coin_id());
+        assert_eq!(did_record.confirmed_height, minted.confirmed_height());
+
+        let store = confirmed_store(2);
+        let store_record = ConfirmedStoreRecord::from(&store);
+        assert_eq!(store_record.launcher_id, store.launcher_id());
+        assert_eq!(store_record.coin_id, store.coin_id());
+        assert_eq!(store_record.confirmed_height, store.confirmed_height());
+        assert_eq!(store_record.committed_root, store.committed_root());
+
+        // The two pending mirrors are built from distinct byte patterns per field, so a
+        // constructor that transposed two ids would be visible here.
+        let pending_mint = pending_mint();
+        let mint_record = PendingMintRecord::from(&pending_mint);
+        assert_eq!(mint_record.launcher_id, pending_mint.launcher_id());
+        assert_eq!(mint_record.did_coin_id, pending_mint.did_coin_id());
+        assert_eq!(mint_record.source_coin_id, pending_mint.source_coin_id());
+        assert_eq!(mint_record.pushed_at_height, 77);
+
+        let pending_launch = pending_store_launch();
+        let launch_record = PendingStoreLaunchRecord::from(&pending_launch);
+        assert_eq!(launch_record.launcher_id, pending_launch.launcher_id());
+        assert_eq!(launch_record.store_coin_id, pending_launch.store_coin_id());
+        assert_eq!(launch_record.did_coin_id, pending_launch.did_coin_id());
+        assert_eq!(
+            launch_record.committed_root,
+            pending_launch.committed_root()
+        );
+        assert_eq!(launch_record.pushed_at_height, 88);
+    }
+
     /// No stage's label may assert that a profile exists — at every stage that would be false, and
     /// a host is invited to render these verbatim.
     #[test]

@@ -26,6 +26,27 @@ fn confirmed_record(coin: Coin) -> CoinRecord {
     }
 }
 
+/// A [`PendingMint`] with a distinct byte pattern per field, so a transposed field is visible.
+pub(crate) fn pending_mint() -> PendingMint {
+    PendingMint::new(
+        Bytes32::new([1; 32]),
+        Bytes32::new([2; 32]),
+        Bytes32::new([3; 32]),
+        77,
+    )
+}
+
+/// A [`PendingStoreLaunch`] with a distinct byte pattern per field.
+pub(crate) fn pending_store_launch() -> PendingStoreLaunch {
+    PendingStoreLaunch::new(
+        Bytes32::new([4; 32]),
+        Bytes32::new([5; 32]),
+        Bytes32::new([6; 32]),
+        [7; 32],
+        88,
+    )
+}
+
 /// A [`MintedDid`] proven from a real confirmed record, distinct per `seed`.
 pub(crate) fn minted_did(seed: u8) -> MintedDid {
     let coin = coin(seed);

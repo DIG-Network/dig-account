@@ -51,17 +51,16 @@ pub struct PendingStoreLaunch {
     pushed_at_height: u32,
 }
 
-// Nothing PRODUCES a store launch yet: the spend that does lands with the profile mint
-// (dig_ecosystem#2342). The types, their invariants and their tests are complete and exercised;
-// only the caller is missing, so the crate is warning-clean rather than silently shipping a
-// half-checked evidence path later.
-#[allow(
-    dead_code,
-    reason = "constructed by the profile mint, which lands next"
-)]
 impl PendingStoreLaunch {
     /// Record what a pushed store launch is, and when. `pub(crate)`: only the mint flow constructs
     /// one, and only from the bundle it actually built and pushed.
+    //
+    // Nothing in a NON-TEST build produces a store launch yet: the spend that does lands with phase
+    // B of the profile mint (dig_ecosystem#2342). Deliberately `allow` and not `expect`: the test
+    // build DOES construct these (via `mint::fixtures`), so an expectation would be fulfilled in the
+    // lib build and unfulfilled in the lib-test build, and `--all-targets` compiles both. `expect`
+    // fails the build here today — verified, not assumed.
+    #[allow(dead_code, reason = "constructed by the profile mint, which lands next")]
     pub(crate) fn new(
         launcher_id: Bytes32,
         store_coin_id: Bytes32,
@@ -124,10 +123,6 @@ pub struct ConfirmedStore {
     committed_root: [u8; 32],
 }
 
-#[allow(
-    dead_code,
-    reason = "from_confirmed is called by the profile mint, which lands next"
-)]
 impl ConfirmedStore {
     /// The ONLY way to obtain a [`ConfirmedStore`].
     ///
@@ -145,6 +140,12 @@ impl ConfirmedStore {
     /// 5. **It is buried under [`MIN_CONFIRMATION_DEPTH`] blocks**, so a shallow reorg cannot
     ///    silently undo a store already recorded as permanent. This also rejects a height in the
     ///    FUTURE — one past the source's own peak has a depth of 1.
+    //
+    // Dead in a non-test build for the same reason as `PendingStoreLaunch::new`, and `allow` for the
+    // same reason too. Worth stating plainly, because it is the crate's own admission: this is the
+    // ONLY way to obtain a `ConfirmedStore`, and a `ConfirmedStore` is half of what a `ProfileAnchor`
+    // needs — so while this lint fires, NO production path can record a profile at all.
+    #[allow(dead_code, reason = "called by the profile mint, which lands next")]
     pub(crate) fn from_confirmed(
         pending: &PendingStoreLaunch,
         record: &CoinRecord,
