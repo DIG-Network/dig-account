@@ -901,8 +901,10 @@ exceed the fee it replaces (`ReplacementFeeNotHigher`), and when any input is no
 confirmed-and-unspent (`SourcesNoLongerSpendable`) — that second case usually means the ORIGINAL has
 already been included, so a replacement would be a second payment. It MUST NOT select a substitute
 input: the higher fee comes out of the change, so a transfer whose inputs were consumed exactly cannot
-be fee-bumped at all, and MUST be refused with the reused inputs' total rather than the wallet's
-balance.
+be fee-bumped at all. That shortfall MUST be refused as `ReplacementInputsInsufficient`,
+reporting `reused_total`, and MUST NOT reuse `InsufficientFunds` — that variant's `available` is the
+WALLET'S spendable balance wherever else it is produced, so a surface rendering the two alike would
+report a balance the user does not hold.
 
 Because the replacement reuses the lead, it shares `payment_coin_id` with the original and at most one
 of them can ever be included. What remains is an accounting hazard, not a double payment: watching the

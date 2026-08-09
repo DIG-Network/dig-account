@@ -614,12 +614,13 @@ fn a_replacement_refuses_rather_than_reaching_for_another_coin() -> anyhow::Resu
         .build_transfer_replacing(&chain, &hot(), &pending, 5_000)
         .expect_err("an exactly-consumed input cannot fund a higher fee");
     match refused {
-        TransferError::InsufficientFunds {
+        TransferError::ReplacementInputsInsufficient {
             required: 605_000,
-            available: 600_000,
+            reused_total: 600_000,
         } => {}
         other => panic!(
-            "the refusal must name the REUSED inputs' total, proving no substitute was taken: \
+            "the refusal must name the REUSED inputs' total in its OWN variant, proving both that \
+             no substitute was taken and that the figure cannot be read as a wallet balance: \
              {other}"
         ),
     }

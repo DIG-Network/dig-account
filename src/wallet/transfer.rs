@@ -177,6 +177,24 @@ pub enum TransferError {
         coin_id: Bytes32,
     },
 
+    /// The transfer's ORIGINAL input coins cannot cover the amount plus the raised fee.
+    ///
+    /// Deliberately NOT [`InsufficientFunds`](Self::InsufficientFunds): that variant's `available` is
+    /// the WALLET'S spendable balance everywhere else it is produced, and a surface rendering this one
+    /// the same way would report a balance the user does not have. A replacement re-spends exactly the
+    /// original inputs by design — that is what makes it conflict with the bundle it replaces — so the
+    /// remedy is a lower fee or a fresh transfer, never a deposit.
+    #[error(
+        "the transfer's original input coins total {reused_total} mojos, which cannot cover the \
+         {required} this replacement needs; lower the fee or build a new transfer"
+    )]
+    ReplacementInputsInsufficient {
+        /// The amount plus the raised fee.
+        required: u64,
+        /// The total of the transfer's original input coins.
+        reused_total: u64,
+    },
+
     /// A replacement transfer's fee does not exceed the fee it replaces.
     ///
     /// A bundle that does not outbid the one already in the mempool cannot displace it, so building
@@ -781,12 +799,13 @@ impl WalletOps {
     /// usually means the ORIGINAL transfer has already been included, so a replacement would be a
     /// second payment rather than a faster one. Neither is reported as a shortfall.
     ///
-    /// [`TransferError::InsufficientFunds`] means something NARROWER here than it does in
-    /// [`build_transfer`](Self::build_transfer): its `available` is the total of the REUSED INPUTS,
-    /// not the wallet's balance, because a replacement may not reach for another coin — doing so is
-    /// the naive rebuild that pays the recipient twice. A transfer whose inputs were consumed exactly
-    /// therefore cannot be fee-bumped at all, and the honest remedy is to wait rather than to fund
-    /// the wallet further.
+    /// [`TransferError::ReplacementInputsInsufficient`] when the original inputs cannot cover the
+    /// raised total. It is a SEPARATE variant from [`InsufficientFunds`](TransferError::InsufficientFunds)
+    /// on purpose: this method may not reach for another coin — doing so is the naive rebuild that
+    /// pays the recipient twice — so the number it can report is the reused inputs' total, and a
+    /// surface rendering that as a wallet balance would tell the user they hold far less than they do.
+    /// A transfer whose inputs were consumed exactly cannot be fee-bumped at all; the remedy is a
+    /// lower fee or a fresh transfer, never a deposit.
     pub fn build_transfer_replacing<C>(
         &self,
         chain: &C,
@@ -825,14 +844,14 @@ impl WalletOps {
             inputs.push(reread_spendable_input(chain, &wallet, *coin_id)?);
         }
 
-        let total = inputs
+        let reused_total = inputs
             .iter()
             .try_fold(0u64, |sum, coin: &Coin| sum.checked_add(coin.amount))
             .ok_or(TransferError::BalanceUnjudgeable)?;
-        if total < required {
-            return Err(TransferError::InsufficientFunds {
+        if reused_total < required {
+            return Err(TransferError::ReplacementInputsInsufficient {
                 required,
-                available: total,
+                reused_total,
             });
         }
 
@@ -2468,19 +2487,18 @@ mod tests {
         );
     }
 
-    /// **A replacement whose reused inputs cannot cover the higher fee is refused, and `available`
-    /// names the REUSED INPUTS rather than the wallet.**
+    /// **A replacement whose reused inputs cannot cover the higher fee is refused BY ITS OWN NAME.**
     ///
     /// The original here consumes its lead exactly (1_000 mojos, no fee, no change), so there is no
-    /// headroom to raise a fee from. The wallet does hold more money — a 1_200 coin — and spending it
-    /// is exactly what a replacement must NOT do: pulling in a different input is the naive rebuild
-    /// that pays twice. So the refusal is correct, and the number it reports is deliberately the
-    /// total of the reused inputs.
+    /// headroom to raise a fee from. Reaching for the wallet's other coin is exactly what a
+    /// replacement must NOT do — that is the naive rebuild that pays twice — so refusing is correct.
     ///
-    /// The honest remedy for a caller is to wait, not to top up: a transfer whose inputs are consumed
-    /// exactly cannot be fee-bumped at all without becoming a different transfer.
+    /// What this test pins is the VARIANT. `InsufficientFunds` would be wrong here even though the
+    /// sentence fits: its `available` is the wallet's spendable balance everywhere else it is
+    /// produced, so a surface rendering this one the same way would report a balance the user does
+    /// not have.
     #[test]
-    fn a_replacement_the_reused_inputs_cannot_cover_is_refused_with_their_total() {
+    fn a_replacement_the_reused_inputs_cannot_cover_is_refused_by_its_own_name() {
         let ops = ops();
         let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000, 1_200]);
         let pending = ops
@@ -2498,13 +2516,87 @@ mod tests {
         assert!(
             matches!(
                 error,
-                TransferError::InsufficientFunds {
+                TransferError::ReplacementInputsInsufficient {
                     required: 1_100,
-                    available: 1_000
+                    reused_total: 1_000
                 }
             ),
-            "available must be the reused inputs' total, not the wallet's 2_200: {error}"
+            "{error}"
         );
+    }
+
+    /// **The assertion the variant exists for: a WEALTHY wallet is refused with the REUSED INPUTS'
+    /// total, and nothing in the error resembles its balance.**
+    ///
+    /// The wallet holds 10_000_000 mojos across other coins while the transfer's own input is 1_000.
+    /// Under the old shape this refused with `InsufficientFunds { available: 1_000 }`, and a surface
+    /// rendering `available` as a balance — the natural rendering, and the one #2404 is about to
+    /// write — would have told a user holding 10 million that they had a thousand. That is the UI lie
+    /// this variant exists to make unexpressible.
+    ///
+    /// The fixture is what makes it able to fail: the gap between `reused_total` and the wallet
+    /// balance is four orders of magnitude, so a regression that reported either the balance or a
+    /// wallet-wide shortfall cannot coincide with the expected numbers. A fixture where the wallet
+    /// held only the input coin would have passed under both shapes and proven nothing.
+    ///
+    /// It does NOT prove how a consumer renders the field — no test here can. It proves the error
+    /// carries no number a consumer could mistake for a balance.
+    #[test]
+    fn a_wealthy_wallet_is_refused_with_the_reused_total_not_its_balance() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000, 10_000_000]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+        assert_eq!(
+            pending.source_coin_ids().len(),
+            1,
+            "the transfer must rest on the SMALL coin, or the gap this test needs does not exist"
+        );
+
+        let error = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 500)
+            .expect_err("the 1_000 input cannot cover 1_500");
+        match error {
+            TransferError::ReplacementInputsInsufficient {
+                required,
+                reused_total,
+            } => {
+                assert_eq!(required, 1_500);
+                assert_eq!(
+                    reused_total, 1_000,
+                    "the figure must be the reused inputs' total, never the 10_001_000 balance"
+                );
+            }
+            other => panic!("a replacement shortfall must not borrow the balance variant: {other}"),
+        }
+    }
+
+    /// The positive control: a SMALLER raise, over the same wallet and the same input, succeeds. So
+    /// the refusals above are about the headroom and not about the method refusing every replacement.
+    #[test]
+    fn a_replacement_the_reused_inputs_can_cover_is_built() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_500, 10_000_000]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        let replacement = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 400)
+            .expect("1_400 fits inside the 1_500 input");
+        assert_eq!(replacement.fee_mojos(), 400);
+        assert_eq!(replacement.change_mojos(), 100);
     }
 
     /// A replacement that does not OUTBID the original is refused by name. It could not displace the
