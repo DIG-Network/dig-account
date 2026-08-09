@@ -2445,7 +2445,7 @@ mod tests {
     /// a fresh `select_input_coins` call leaves this test green — verified by mutation.
     ///
     /// The reuse earns its keep in the REFUSAL cases, which is also where the money is lost:
-    /// `a_replacement_the_reused_inputs_cannot_cover_is_refused_with_their_total` and
+    /// `a_replacement_the_reused_inputs_cannot_cover_is_refused_by_its_own_name` and
     /// `a_replacement_over_a_spent_input_is_refused_by_name` both go red under that mutation, because
     /// re-selection quietly reaches for a DIFFERENT coin and builds a bundle that does not conflict
     /// with the original. Those two are the falsifiers; this one pins the contract they operate under.
