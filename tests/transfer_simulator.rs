@@ -363,20 +363,24 @@ fn the_signer_refuses_a_transfer_whose_change_is_off_by_one() -> anyhow::Result<
     let short_by_one = build_send_by_hand(&ops, source, AMOUNT, FEE, |change| change - 1);
     let honest = build_send_by_hand(&ops, source, AMOUNT, FEE, |change| change);
 
+    // The control must reach APPROVED specifically. `is_ok()` would also be satisfied by
+    // `RequiresConfirmation`, and if this fixture's amount ever drifted above the auto-send
+    // allowance BOTH spends would escalate — the honest one and the mutated one alike — and the test
+    // would pass having compared nothing.
     assert!(
-        gate(&ops)
-            .authorize_op(&honest, SpendOpClass::SmallSend)
-            .is_ok(),
-        "the control must pass, or the refusal below proves nothing"
-    );
-    let refused = gate(&ops).authorize_op(&short_by_one, SpendOpClass::SmallSend);
-    let signed_anyway = match refused {
-        Err(_) => None,
-        Ok(SpendRuling::RequiresConfirmation(_)) => None,
-        Ok(SpendRuling::Approved(approval)) => Some(
-            ops.money_signer(Network::Testnet)
-                .sign_approved(approval),
+        matches!(
+            gate(&ops).authorize_op(&honest, SpendOpClass::SmallSend),
+            Ok(SpendRuling::Approved(_))
         ),
+        "the control must be auto-approved, or the refusal below proves nothing"
+    );
+
+    let signed_anyway = match gate(&ops).authorize_op(&short_by_one, SpendOpClass::SmallSend) {
+        // Refused outright, or escalated instead of auto-approved: either way no signature exists.
+        Err(_) | Ok(SpendRuling::RequiresConfirmation(_)) => None,
+        Ok(SpendRuling::Approved(approval)) => {
+            Some(ops.money_signer(Network::Testnet).sign_approved(approval))
+        }
     };
     assert!(
         signed_anyway.is_none_or(|result| result.is_err()),

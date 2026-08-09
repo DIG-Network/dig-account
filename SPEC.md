@@ -697,8 +697,112 @@ reopen the vault-to-third-party path the rule exists to close.
 
 ### 6.6 Spend branding memo (NC-11)
 
-Spend construction MUST carry the DIG spend-branding memo per the ecosystem normative contract (NC-11);
-the concrete memo wiring lands with the spend-building path.
+Spends built by this crate do NOT yet carry the DIG spend-branding memo required by the ecosystem
+normative contract (NC-11). The memo's bytes and slot MUST be byte-identical across every DIG spend
+builder, so they belong in a shared helper in the lowest crate level all builders can depend on; that
+helper does not exist yet, and defining a local copy here would create exactly the second
+implementation the requirement exists to prevent. dig-account MUST NOT introduce one.
+
+Two constraints bind whichever unit lands the memo. It occupies memo slot 1 or later: slot 0 of a
+recipient's `CREATE_COIN` memos is the load-bearing hint, and displacing it changes which wallet can
+find the coin. And the memo MUST NOT alter any created coin's `(parent, puzzle_hash, amount)`, so it
+can never change a spend's value flow or its coin ids.
+
+### 6.7 The ordinary-transfer builder
+
+`WalletOps::build_transfer(chain, custody, request) -> TransferPlan` builds the unsigned coin spends for
+a native-XCH payment out of a profile's wallet. It is a BUILDER and nothing more: it MUST NOT authorize,
+sign, or broadcast. The caller passes `TransferPlan::coin_spends` unchanged to §6.3's
+`PolicyAuthorizer::authorize_op` and the resulting approval to §6.2's `sign_approved`. A builder that
+also gated and signed would be a second route to a signature beside a gated one, which is the shape
+§6.2's owned approval exists to make unreachable.
+
+#### 6.7.1 Scope
+
+- **Native XCH only.** A CAT payment requires a different destination puzzle hash and a per-asset
+  selection, and §6.3 already refuses a CAT auto-send as `PolicyIndeterminate` because no
+  mojo-denominated limit can bound one. This builder MUST NOT emit a partial CAT path.
+- **Hot-wallet tier only.** A `CustodyPolicy::Vault` profile MUST be refused with
+  `TransferError::VaultTransferUnsupported`, whose message states that funds move vault → hot wallet
+  through the clawback window first. It MUST NOT be reported as a shortfall or a build failure — both
+  would send the user looking for a problem that does not exist.
+- **No self-payment.** A recipient equal to the wallet's own puzzle hash MUST be refused
+  (`TransferError::SelfPayment`). It moves no value while costing a fee, and §5.2's summary excludes
+  outputs that provably return to a puzzle the spend already unlocks — so the confirmation ceremony
+  would show a spend with no recipient at all.
+
+#### 6.7.2 Coin selection
+
+Only CONFIRMED, UNSPENT coins are spendable. An unconfirmed or spent coin MUST NOT be selected, and MUST
+NOT be counted toward the `available` figure `TransferError::InsufficientFunds` reports — that figure is
+the wallet's entire spendable balance, never however far a selection loop happened to get.
+
+Selection minimises the input COUNT: the smallest single coin that covers `amount + fee` when one
+exists, otherwise largest-first accumulation until the total covers it. Selecting SMALLEST-first is
+FORBIDDEN. Anyone may send dust to any address, so a smallest-first sweep lets a stranger make a wallet
+unspendable by dusting it past the input cap: the selection would consume the cap on 1-mojo coins and
+refuse a transfer a single large coin plainly covers.
+
+At most `MAX_TRANSFER_INPUT_COINS` (12) inputs may be consumed. A transfer whose value IS available but
+needs more coins than the cap MUST fail with `TransferError::TooManyInputCoins`, naming the cap — never
+`InsufficientFunds`, which would be false about a wallet that holds the money. The remedy is a
+consolidating spend, not a deposit.
+
+#### 6.7.3 Outputs, change and fee
+
+The LEAD input creates the payment coin (hinted to the recipient), the change coin (to the wallet's own
+puzzle hash), and reserves the fee. Secondary inputs create nothing and contribute value only.
+
+`change = total_selected - amount - fee` MUST be exact, and the change coin MUST be omitted entirely when
+that is zero. Chia treats unspent input value as fee silently, so a change figure short by even one mojo
+does not fail — it donates the difference to a farmer, and the only place it surfaces is the user's
+balance.
+
+Every secondary input MUST assert a coin announcement created by the lead. A secondary spend creates
+nothing, so unbound it is value handed to whoever includes it: a node could take the secondaries, drop
+the lead, and burn the coins into fees. The binding runs in ONE direction only, and MUST NOT be
+duplicated in reverse — the lead alone is already un-includable, because without the secondaries its
+outputs plus fee exceed its input and consensus refuses a spend that creates value.
+
+No two coins a bundle creates may share `(parent, puzzle_hash, amount)`; consensus rejects a duplicate
+coin id deterministically, and since re-selection is deterministic the wallet would wedge on that amount
+forever. The lead's two outputs can collide only when the payment goes to the wallet's own puzzle hash
+with an amount equal to the change, which §6.7.1's self-payment refusal makes unreachable.
+
+There is NO separate fee ceiling, deliberately. §6A's `MAX_MINT_FEE_MOJOS` exists because a mint bundle
+is a singleton launch the gate cannot decode, leaving its fee ungated. A transfer passes the FULL gate,
+whose `native_total_mojos` counts recipients PLUS the fee — so the per-transaction auto-send limit
+already bounds amount and fee together and anything larger escalates to a human who is shown the fee on
+its own line. A fee the selected inputs cannot cover MUST be refused.
+
+#### 6.7.4 The honest-outcome contract
+
+A push is not a payment. `TransferPlan::pushed_at(pre_push_peak)` yields a `PendingTransfer`, which MUST
+expose no success-flavoured accessor, and `transfer_status(pending, chain)` is the only route to a
+`ConfirmedTransfer`.
+
+`pre_push_peak` MUST be read BEFORE the bundle is pushed. A transfer cannot be included in a block that
+already existed when it was broadcast, so this height is the only thing that later makes a back-dated
+confirmation contradict something the chain itself said earlier; read afterwards, the number a
+fabricating source would have to contradict is one it also supplied.
+
+`transfer_status` returns exactly one of:
+
+- `Confirmed(ConfirmedTransfer)` — the payment coin exists at a height that is non-zero, not before the
+  push, and buried under `MIN_CONFIRMATION_DEPTH` blocks. A coin id commits to
+  `(parent, puzzle_hash, amount)`, so a matching id is itself the proof that the recipient and amount are
+  the ones that were built. A record WITHOUT a confirmed height is a mempool observation and MUST NOT be
+  treated as evidence, however deep the chain has since advanced.
+- `Awaiting { blocks_since_push }` — in flight, or dead in a way the chain cannot attest to. This MUST be
+  a real elapsed block count so a caller can set a deadline rather than poll an unchanging absence.
+- `Failed { reason }` — an input coin was spent while NO payment coin exists, so a different spend
+  consumed it and this bundle can never be included. The payment coin is checked for EXISTENCE, not
+  confirmation: a payment coin seen in the mempool is this bundle succeeding, and calling that a failure
+  would be the worse error.
+
+A chain that cannot answer — including one that cannot report a peak — MUST fail closed with
+`TransferError::ChainUnreachable`. The state is then UNKNOWN, never an absence, and a caller MUST NOT
+record a result from it.
 
 ## 6A. The on-chain DID mint
 

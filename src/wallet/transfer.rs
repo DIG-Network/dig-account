@@ -1566,6 +1566,32 @@ mod tests {
         ));
     }
 
+    /// **A payment coin the node has SEEN but no block has confirmed is not evidence.** A
+    /// mempool-aware node (and the coinset API, whose `created_height` is `None` for a mempool coin)
+    /// answers with the real coin and no height — so the record exists, names the right recipient and
+    /// the right amount, and still proves nothing.
+    ///
+    /// The peak here is deep enough that a burial check alone would pass, which is the point: this
+    /// pins the CONFIRMED-HEIGHT requirement specifically, and it is the only test that can see an
+    /// implementation which substitutes the push height for a missing one.
+    #[test]
+    fn a_payment_coin_observed_without_a_confirmed_height_is_not_evidence() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FixedChain::with_records(vec![record(payment, None, None)])
+            .at_peak(PEAK + MIN_CONFIRMATION_DEPTH * 10);
+
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Awaiting { .. }
+            ),
+            "a mempool observation is not a confirmation, however deep the chain has since gone"
+        );
+    }
+
     /// A confirmation BACK-DATED to before the push is not evidence: a transfer cannot appear in a
     /// block that already existed when it was broadcast.
     #[test]
