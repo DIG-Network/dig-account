@@ -739,11 +739,26 @@ also gated and signed would be a second route to a signature beside a gated one,
   outputs that provably return to a puzzle the spend already unlocks — so the confirmation ceremony
   would show a spend with no recipient at all.
 
+A request MUST be refused before any chain read when it is not a payment at all. A zero amount MUST
+fail with `TransferError::ZeroAmount`: a zero-value coin is not a payment and consensus has no use for
+one. An `amount + fee` that does not fit in a `u64` MUST fail with `TransferError::AmountOverflow` and
+MUST NOT be allowed to wrap — a wrapped total is a small number a wallet could accidentally cover,
+which turns an impossible request into a spend. A recipient string that is not decodable bech32m with a
+32-byte payload MUST fail with `TransferError::InvalidRecipient`, the same variant the prefix rule
+above uses: there is no destination to pay either way, and the error carries the address as supplied
+plus the reason it was rejected.
+
 #### 6.7.2 Coin selection
 
 Only CONFIRMED, UNSPENT coins are spendable. An unconfirmed or spent coin MUST NOT be selected, and MUST
 NOT be counted toward the `available` figure `TransferError::InsufficientFunds` reports — that figure is
 the wallet's entire spendable balance, never however far a selection loop happened to get.
+
+The spendable total MUST be summed with CHECKED arithmetic, and a total that does not fit in a `u64`
+MUST be refused with `TransferError::BalanceUnjudgeable` rather than clamped. A saturating sum pinned
+at `u64::MAX` passes every shortfall test, so clamping converts "this balance cannot be judged" into
+"proceed", and the condition then surfaces later as arithmetic instead of as the unreadable balance it
+is.
 
 Selection minimises the input COUNT: the smallest single coin that covers `amount + fee` when one
 exists, otherwise largest-first accumulation until the total covers it. Selecting SMALLEST-first is
@@ -765,6 +780,10 @@ puzzle hash), and reserves the fee. Secondary inputs create nothing and contribu
 that is zero. Chia treats unspent input value as fee silently, so a change figure short by even one mojo
 does not fail — it donates the difference to a farmer, and the only place it surfaces is the user's
 balance.
+
+A failure inside the SDK drivers while building the unsigned spend MUST be reported as
+`TransferError::Build`, distinct from every refusal above: those describe the request or the wallet,
+this one describes the builder, and a user is owed a different sentence for each.
 
 Every secondary input MUST assert a coin announcement created by the lead, so a spend that creates
 nothing is invalid on its own terms rather than only in company.
