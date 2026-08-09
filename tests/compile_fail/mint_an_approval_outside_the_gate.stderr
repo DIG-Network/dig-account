@@ -9,7 +9,6 @@ error[E0624]: associated function `new` is private
    | /     pub(crate) fn new(
    | |         coin_spends: Vec<CoinSpend>,
    | |         summary: SpendSummary,
-   | |         verified: TransactionSummary,
    | |         scope: CustodyScope,
    | |     ) -> Self {
    | |_____________- private associated function defined here
@@ -25,7 +24,6 @@ error[E0624]: associated function `new` is private
    | /     pub(crate) fn new(
    | |         coin_spends: Vec<CoinSpend>,
    | |         summary: SpendSummary,
-   | |         verified: TransactionSummary,
    | |         scope: CustodyScope,
    | |     ) -> Self {
    | |_____________- private associated function defined here

@@ -3,8 +3,8 @@
 //! - **Offline** — [`ProfileRegistry`]: which profiles exist, which is active, which mints are
 //!   half-finished. Public identifiers only, readable while the account is locked, and the sole
 //!   authority on whether a profile exists.
-//! - **Online** — [`Profile`]: a `dig_social_profile::IdentityProfile` (DID + dig-store + SMT)
-//!   resolved from chain, attached opportunistically once a chain source is available.
+//! - **Online** — [`Profile`]: a [`ProfileAnchor`] (the DID + dig-store the mint proved on chain),
+//!   attached opportunistically once a chain source is available.
 //!
 //! [`Account`] holds both and keeps them from disagreeing: a resolved profile may only be attached
 //! at an index the registry confirms. The model stays pure state — no seed, no crypto — so it is
@@ -12,25 +12,32 @@
 
 use std::collections::BTreeMap;
 
-use dig_social_profile::IdentityProfile;
-
 use crate::error::{AccountError, Result};
 use crate::id::{AccountId, ProfileIx};
-use crate::registry::ProfileRegistry;
+use crate::registry::{ProfileAnchor, ProfileRegistry};
 
-/// One profile within an account: a DID + dig-store + profile SMT, tagged with the HD index its
-/// identity + wallet keys derive at.
+/// One profile within an account: the DID + dig-store the mint proved on chain, tagged with the HD
+/// index its identity + wallet keys derive at.
+///
+/// # Why the anchor, and not a resolved social profile
+///
+/// Until 0.9.0 this embedded a `dig_social_profile::IdentityProfile`, which put a THIRD party's
+/// chia types (its `Bytes32`, `Coin`, `Did`) in dig-account's own public API. A crate cannot upgrade
+/// its chia family independently of every crate whose types it re-exports, and dig-account must
+/// track the family its spend builders ride. The anchor carries the same identifiers — the DID
+/// string, both launcher ids, both confirmed heights — over this crate's own `chia-protocol`, so
+/// the public surface names one chia family and one only.
 pub struct Profile {
     /// The HD profile index this profile's keys derive at.
     pub ix: ProfileIx,
-    /// The on-chain identity: DID singleton + dig-store + profile-info SMT.
-    identity: IdentityProfile,
+    /// The on-chain identity: the confirmed DID singleton and the dig-store launched from it.
+    anchor: ProfileAnchor,
 }
 
 impl Profile {
-    /// Build a profile at `ix` backed by `identity`.
-    pub fn new(ix: ProfileIx, identity: IdentityProfile) -> Self {
-        Self { ix, identity }
+    /// Build a profile at `ix` backed by `anchor`.
+    pub fn new(ix: ProfileIx, anchor: ProfileAnchor) -> Self {
+        Self { ix, anchor }
     }
 
     /// The HD profile index this profile's keys derive at.
@@ -38,9 +45,9 @@ impl Profile {
         self.ix
     }
 
-    /// The underlying on-chain identity (DID + dig-store + SMT).
-    pub fn identity(&self) -> &IdentityProfile {
-        &self.identity
+    /// The on-chain identity this profile is anchored to (DID + dig-store).
+    pub fn anchor(&self) -> &ProfileAnchor {
+        &self.anchor
     }
 }
 
@@ -154,38 +161,17 @@ pub struct AccountRecord {
 mod tests {
     use super::*;
     use crate::mint::fixtures::bound_mint;
-    use chia_wallet_sdk::utils::Address;
-    use dig_social_profile::{
-        Bytes32, Coin, Did, IdentityProfile, IdentitySingleton, Profile as Metadata,
-        SingletonLineage, StoreRecord, DID_CHIA_PREFIX,
-    };
 
-    /// Build a minimal, pairing-valid [`Profile`] at `ix` for model-level tests.
+    /// Build a [`Profile`] at `ix` from GENUINE mint evidence.
     ///
-    /// It resolves a real [`IdentityProfile`] over synthetic-but-consistent records: a store whose
-    /// description IS the DID string (discovery) and whose launcher parent is a member of the DID's
-    /// lineage (authority) — the exact predicate `IdentityProfile::resolve` enforces.
+    /// `bound_mint` produces the two halves of one real mint, and [`ProfileAnchor::from_confirmed`]
+    /// is the only constructor there is — so the fixture exercises the same pairing rule a live
+    /// mint does rather than fabricating a shape that could not occur.
     fn profile_at(ix: ProfileIx) -> Profile {
-        let launcher = Bytes32::new([0x42; 32]);
-        let did_str = Address::new(launcher, DID_CHIA_PREFIX.to_string())
-            .encode()
-            .unwrap();
-        let did = Did::parse(&did_str).unwrap();
-        let did_coin_id = Bytes32::new([0x11; 32]);
-        let singleton = IdentitySingleton {
-            did,
-            lineage: SingletonLineage::new(did_coin_id, [did_coin_id]),
-        };
-        let store = StoreRecord {
-            description: did_str,
-            launcher_coin: Coin {
-                parent_coin_info: did_coin_id,
-                puzzle_hash: Bytes32::new([0u8; 32]),
-                amount: 1,
-            },
-        };
-        let identity = IdentityProfile::resolve(singleton, store, Metadata::new()).unwrap();
-        Profile::new(ix, identity)
+        let (did, store) = bound_mint(1);
+        let anchor = ProfileAnchor::from_confirmed(&did, &store)
+            .expect("bound_mint yields two halves of ONE mint");
+        Profile::new(ix, anchor)
     }
 
     /// Register a confirmed profile at `ix` so a resolved view may be attached there.

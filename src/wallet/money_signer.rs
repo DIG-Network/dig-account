@@ -66,16 +66,17 @@ pub trait MoneySigner: Send + Sync {
     /// pair the signature it receives with different bytes.
     ///
     /// Fail-closed: before any `bls_sign` runs, the vetted core re-derives the value flow from these
-    /// very coin spends and requires value conservation, quote-form delegated puzzles, a sole
-    /// `AGG_SIG_ME` per coin, and wallet-owned change.
+    /// very coin spends and requires value conservation, quote-form delegated puzzles, and a sole
+    /// `AGG_SIG_ME` per coin.
     ///
-    /// It ALSO compares the `UnsignedSpend.summary` parameter against its own re-derivation. **That
-    /// comparison is not a check this crate relies on, and this crate does not claim it as one:** the
-    /// parameter is the gate's derivation of the same bytes, so the two sides can only ever agree. It is
-    /// a required field being filled correctly, not a second opinion — a second opinion would have to
-    /// come from an independent derivation, which is precisely the two-answers-can-disagree shape the
-    /// owned approval exists to remove. The property that protects the caller is that the bytes signed
-    /// are the bytes the gate judged, because they are the same `Vec`.
+    /// The vetted core also requires an `UnsignedSpend.summary` parameter and compares it against its
+    /// own re-derivation. **That comparison is not a check this crate relies on, and this crate does
+    /// not claim it as one:** the parameter is rendered from the very bytes being signed, so the two
+    /// sides can only ever agree. It is a required field being filled correctly, not a second opinion
+    /// — a second opinion would have to come from an independent derivation, which is precisely the
+    /// two-answers-can-disagree shape the owned approval exists to remove. The property that protects
+    /// the caller is that the bytes signed are the bytes the gate judged, because they are the same
+    /// `Vec`.
     fn sign_approved(&self, approval: SpendApproval) -> Result<SpendBundle>;
 }
 
@@ -218,12 +219,28 @@ impl MoneySigner for LocalMoneySigner {
             .scope()
             .assert_signable_by(self.profile_ix, self.wallet_puzzle_hash())?;
 
-        // The summary is the gate's OWN derivation, carried by the approval — not re-derived here.
-        // Two derivations of the same spend are two answers that could differ; one answer cannot.
+        // The `summary` PARAMETER is rendered by the signer, from the approval's own coin spends.
+        //
+        // It is not a judgement and carries no authority — the gate has already ruled, over these very
+        // bytes. It is a field `dig-wallet-backend` defines as the KEY-AWARE egress: every created
+        // coin the wallet cannot derive a key for. Only a key holder can answer that, and the gate
+        // deliberately holds no key, so a gate-side answer could only ever approximate it — and would
+        // approximate it by OVER-listing. A CAT send's change coin is the case that proves it: its
+        // destination is the wallet's inner p2 hash, which is no spent coin's puzzle hash, so the
+        // gate's proof-of-p2 rule cannot see it comes home and the core would refuse a legitimate
+        // spend.
+        //
+        // Rendering it HERE cannot weaken anything, because it cannot disagree with what is signed:
+        // it is computed from `approval.coin_spends()`, and those same bytes are what the signature
+        // covers. The custody decision stays the gate's, over that same `Vec`.
         let unsigned = UnsignedSpend {
             coin_spends: approval.coin_spends().to_vec(),
             required_signatures: Self::required_signatures(&signer, approval.coin_spends())?,
-            summary: approval.verified().clone(),
+            summary: signer
+                .reviewable_summary(approval.coin_spends())
+                .map_err(|e| {
+                    AccountError::Spend(format!("cannot render this spend for signing: {e}"))
+                })?,
         };
         Ok(self.sign_unsigned(&signer, &unsigned)?.bundle)
     }
@@ -326,7 +343,6 @@ mod tests {
     /// be tested is a defense nobody is holding. Minting here is possible only because these tests live
     /// INSIDE the crate: `SpendApproval::new` is `pub(crate)`, so no consumer can do this.
     fn approval_over(coin_spends: &[CoinSpend]) -> SpendApproval {
-        let verified = derive_summary(coin_spends).expect("fixture must be derivable");
         let summary = SpendSummary::from_coin_spends(coin_spends, SpendTier::AutoSend)
             .expect("fixture must be summarizable");
         // Scoped to the very wallet `signer()` signs with, so these tests exercise the signer's own
@@ -336,7 +352,7 @@ mod tests {
             &crate::wallet::policy::CustodyPolicy::Hot(Default::default()),
             money_key().puzzle_hash(),
         );
-        SpendApproval::new(coin_spends.to_vec(), summary, verified, scope)
+        SpendApproval::new(coin_spends.to_vec(), summary, scope)
     }
 
     /// Sign `coin_spends` through a freshly-minted approval, returning just the aggregate signature —
@@ -413,6 +429,14 @@ mod tests {
     }
 
     /// (d) A legitimate CAT send signs end-to-end through the same canonical signer.
+    ///
+    /// **This is the test that pins WHERE the `UnsignedSpend.summary` parameter is rendered**, and it
+    /// is the only shape that can see it. A CAT send's change coin is created at the wallet's INNER
+    /// p2 puzzle hash, while the coin being spent sits at the CAT-wrapped hash — so the gate's
+    /// proof-of-p2 rule cannot show that coin comes home, and a gate-rendered parameter lists it as
+    /// egress. The vetted core, which classifies by key ownership, then refuses to sign a spend that
+    /// is entirely legitimate. An XCH-only fixture cannot distinguish the two placements at all,
+    /// because there the change destination IS the spent coin's puzzle hash.
     #[test]
     fn legit_cat_send_signs() {
         use chia_wallet_sdk::driver::{Cat, CatSpend, SpendWithConditions};
@@ -428,7 +452,8 @@ mod tests {
             let issue_hint = issue_ctx.hint(wallet_ph).unwrap();
             let issue = Conditions::new().create_coin(wallet_ph, 1_000, issue_hint);
             let (_, cats) =
-                Cat::issue_with_coin(&mut issue_ctx, genesis.coin_id(), 1_000, issue).unwrap();
+                Cat::single_issuance(&mut issue_ctx, genesis.coin_id(), None, 1_000, issue)
+                    .unwrap();
             cats[0]
         };
 

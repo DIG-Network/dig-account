@@ -167,6 +167,47 @@ mod tests {
         );
     }
 
+    /// A `ProfileAnchor` exactly as dig-account 0.8.1 wrote it, under chia-protocol **0.26**.
+    ///
+    /// Committed as a literal rather than generated, because a fixture the current code produces can
+    /// only ever agree with the current code. This string is the artifact on a user's disk; the point
+    /// of the test below is that today's crate still reads it, and still writes it the same way.
+    const ANCHOR_JSON_0_26: &str = r#"{"did":"did:chia:1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqscdhf6s","launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101","did_coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202","did_confirmed_height":4200000,"store_launcher_id":"0x0303030303030303030303030303030303030303030303030303030303030303","store_confirmed_height":4200001}"#;
+
+    /// **A profile registry written by the pre-0.36 crate is still read, and re-written byte for byte.**
+    ///
+    /// A profile anchor is the record that a DID exists on chain. Failing to read one does not lose a
+    /// cosmetic preference — it loses the user's identity, and the mint that would recreate it costs
+    /// real XCH. So the chia-family migration (0.26 -> 0.36.1) has exactly one non-negotiable: the
+    /// bytes already on disk keep their meaning.
+    ///
+    /// The assertion is deliberately two-directional. Reading alone would pass against an encoder that
+    /// had started emitting bare hex, silently making every anchor this host writes unreadable by the
+    /// version that wrote the fixture; and writing alone proves nothing about existing files. Field
+    /// values are checked individually as well, because a round-trip is equally happy with two fields
+    /// transposed as long as both sides transpose them.
+    #[test]
+    fn an_anchor_written_before_the_chia_0_36_migration_still_round_trips_byte_identically() {
+        let anchor: ProfileAnchor = serde_json::from_str(ANCHOR_JSON_0_26)
+            .expect("an anchor written by 0.8.1 must still deserialize");
+
+        assert_eq!(anchor.launcher_id(), Bytes32::new([1; 32]));
+        assert_eq!(anchor.did_coin_id(), Bytes32::new([2; 32]));
+        assert_eq!(anchor.store_launcher_id(), Bytes32::new([3; 32]));
+        assert_eq!(anchor.did_confirmed_height(), 4_200_000);
+        assert_eq!(anchor.store_confirmed_height(), 4_200_001);
+        assert_eq!(
+            anchor.did(),
+            "did:chia:1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqscdhf6s"
+        );
+
+        assert_eq!(
+            serde_json::to_string(&anchor).expect("an anchor always serializes"),
+            ANCHOR_JSON_0_26,
+            "the new chia family must re-emit the OLD encoding, or every file this host writes becomes unreadable to the version that wrote the fixture"
+        );
+    }
+
     #[test]
     fn an_anchor_round_trips_through_json() {
         let (did, store) = bound_mint(1);

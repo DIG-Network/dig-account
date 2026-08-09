@@ -769,6 +769,41 @@ mod tests {
     mod deserialize_rejections {
         use super::*;
 
+        /// A whole registry file, exactly as dig-account 0.8.1 wrote it under chia-protocol **0.26**.
+        ///
+        /// Committed as a literal for the same reason as the anchor fixture in `registry::anchor`:
+        /// a string the current code generates can only agree with the current code. This is the
+        /// file on a user's disk.
+        const REGISTRY_JSON_0_26: &str = r#"{"entries":[{"ix":0,"anchor":{"did":"did:chia:1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqscdhf6s","launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101","did_coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202","did_confirmed_height":4200000,"store_launcher_id":"0x0303030303030303030303030303030303030303030303030303030303030303","store_confirmed_height":4200001},"label":null,"visibility":"Shown"}],"active":0,"in_progress":[]}"#;
+
+        /// **The on-disk registry survives the chia 0.26 -> 0.36.1 family migration unchanged.**
+        ///
+        /// `registry::anchor` proves the anchor's own encoding is stable; this proves the shape a
+        /// host actually loads — entries, the active slot, the mint journal — is stable too, and
+        /// that it still passes the invariant re-check the deserialize path performs. Losing this
+        /// file loses every profile the account owns, and only a real on-chain mint restores one.
+        ///
+        /// Both directions are asserted: reading is what protects the file that already exists,
+        /// re-writing byte-identically is what protects the version that wrote it from being unable
+        /// to read the file this host writes back.
+        #[test]
+        fn a_registry_written_before_the_chia_0_36_migration_still_round_trips_byte_identically() {
+            let registry = ProfileRegistry::from_json(REGISTRY_JSON_0_26)
+                .expect("a registry written by 0.8.1 must still load, invariants and all");
+
+            assert_eq!(
+                registry.active().map(|entry| entry.ix()),
+                Some(ProfileIx(0))
+            );
+            assert_eq!(registry.entries().len(), 1);
+
+            assert_eq!(
+                registry.to_json().expect("a loaded registry always serializes"),
+                REGISTRY_JSON_0_26,
+                "the new chia family must re-emit the OLD encoding, or the file this host writes becomes unreadable to the version that wrote the fixture"
+            );
+        }
+
         /// The launcher id every fixture anchor claims.
         const LAUNCHER_ID: [u8; 32] = [1; 32];
 

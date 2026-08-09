@@ -32,7 +32,6 @@
 //! would give the signer a clock dependency it has no other use for.
 
 use chia_protocol::CoinSpend;
-use dig_wallet_backend::types::TransactionSummary;
 
 use crate::auth::provider::{AuthProvider, SpendConfirmRequest, SpendDecision};
 use crate::error::{AccountError, Result};
@@ -50,15 +49,6 @@ struct AuthorizedSpend {
     coin_spends: Vec<CoinSpend>,
     /// This crate's tiered, human-renderable view of those spends.
     summary: SpendSummary,
-    /// The hinted-only summary `dig-wallet-backend`'s signer takes as a required PARAMETER, derived by
-    /// the gate alongside `summary` so the signer never has to re-parse the spend.
-    ///
-    /// The signer does compare it against its own re-derivation, but this crate does not treat that as
-    /// a check and does not rely on it: both sides come from these same bytes, so it can only agree. A
-    /// genuine second opinion would need an INDEPENDENT derivation — exactly the two-answers-can-
-    /// disagree shape this whole type exists to remove. What protects the caller is that `coin_spends`
-    /// below is the same `Vec` the gate judged.
-    verified: TransactionSummary,
     /// WHOSE money the gate that minted this was configured to rule over, so the signer can refuse a
     /// permission granted by some other profile's gate. See [`CustodyScope`].
     scope: CustodyScope,
@@ -80,14 +70,12 @@ impl SpendApproval {
     pub(crate) fn new(
         coin_spends: Vec<CoinSpend>,
         summary: SpendSummary,
-        verified: TransactionSummary,
         scope: CustodyScope,
     ) -> Self {
         Self {
             inner: AuthorizedSpend {
                 coin_spends,
                 summary,
-                verified,
                 scope,
             },
         }
@@ -101,12 +89,6 @@ impl SpendApproval {
     /// The exact coin spends this approval authorizes — the same bytes the signer signs.
     pub fn coin_spends(&self) -> &[CoinSpend] {
         &self.inner.coin_spends
-    }
-
-    /// The gate's verified derivation, for the signer's pre-signing cross-check. `pub(crate)`: this is
-    /// plumbing between the gate and the signer, not part of the custody contract a host reads.
-    pub(crate) fn verified(&self) -> &TransactionSummary {
-        &self.inner.verified
     }
 
     /// The custody scope the minting gate was configured for. `pub(crate)`: the signer's admission
@@ -130,14 +112,12 @@ impl PendingApproval {
     pub(crate) fn new(
         coin_spends: Vec<CoinSpend>,
         summary: SpendSummary,
-        verified: TransactionSummary,
         scope: CustodyScope,
     ) -> Self {
         Self {
             inner: AuthorizedSpend {
                 coin_spends,
                 summary,
-                verified,
                 scope,
             },
         }
@@ -231,15 +211,7 @@ pub enum SpendRuling {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wallet::summary::{SpendRecipient, SpendTier};
-    use dig_wallet_backend::types::Amount;
-
-    fn verified() -> TransactionSummary {
-        TransactionSummary {
-            outputs: vec![],
-            fee: Amount(0),
-        }
-    }
+    use crate::wallet::summary::{SpendDestination, SpendRecipient, SpendTier};
 
     /// Any scope: these tests are about the ceremony's OUTCOME, not about admission, which is
     /// enforced in the signer and tested in `policy.rs`/`authorizer.rs`.
@@ -258,6 +230,7 @@ mod tests {
                 address: "xch1abc".into(),
                 amount_mojos: 42,
                 asset_id: None,
+                destination: SpendDestination::Address,
             }],
             7,
         )
@@ -287,7 +260,7 @@ mod tests {
     /// from the same construction, so they cannot describe different spends.
     #[test]
     fn an_approval_exposes_the_spends_and_the_summary_it_was_built_from() {
-        let approval = SpendApproval::new(vec![coin_spend(99)], summary(), verified(), scope());
+        let approval = SpendApproval::new(vec![coin_spend(99)], summary(), scope());
         assert_eq!(approval.coin_spends(), &[coin_spend(99)]);
         assert_eq!(approval.summary().recipients[0].amount_mojos, 42);
         assert_eq!(approval.summary().fee, 7);
@@ -297,7 +270,7 @@ mod tests {
     /// spends, so these are the spends that become signable.
     #[test]
     fn confirming_a_pending_approval_yields_an_approval_over_the_very_same_spends() {
-        let pending = PendingApproval::new(vec![coin_spend(1234)], summary(), verified(), scope());
+        let pending = PendingApproval::new(vec![coin_spend(1234)], summary(), scope());
         assert_eq!(pending.summary().recipients[0].amount_mojos, 42);
 
         let approval = pending.decided(SpendDecision::Approve).unwrap();
@@ -308,7 +281,7 @@ mod tests {
     /// A decline is `UserDeclined` — terminal — not an escalatable refusal a caller could re-prompt.
     #[test]
     fn a_declined_ceremony_denies_outright_and_never_yields_an_approval() {
-        let pending = PendingApproval::new(vec![coin_spend(1)], summary(), verified(), scope());
+        let pending = PendingApproval::new(vec![coin_spend(1)], summary(), scope());
         let err = denial(pending.decided(SpendDecision::Decline(Some("not mine".into()))));
         assert!(
             matches!(&err, AccountError::UserDeclined(m) if m.contains("declined") && m.contains("not mine")),
@@ -319,7 +292,7 @@ mod tests {
     /// A decline with no stated reason is still a decline, and still denied.
     #[test]
     fn a_reasonless_decline_is_still_denied() {
-        let pending = PendingApproval::new(vec![coin_spend(1)], summary(), verified(), scope());
+        let pending = PendingApproval::new(vec![coin_spend(1)], summary(), scope());
         let err = denial(pending.decided(SpendDecision::Decline(None)));
         assert!(matches!(err, AccountError::UserDeclined(_)), "{err:?}");
     }

@@ -94,13 +94,14 @@ mod tests {
 
     #[test]
     fn spend_confirm_request_holds_its_context() {
-        use crate::wallet::summary::{SpendRecipient, SpendTier};
+        use crate::wallet::summary::{SpendDestination, SpendRecipient, SpendTier};
         let summary = SpendSummary::new(
             SpendTier::Confirm,
             vec![SpendRecipient {
                 address: "xch1recipient".into(),
                 amount_mojos: 1_000_000_000_000,
                 asset_id: None,
+                destination: SpendDestination::Address,
             }],
             0,
         );

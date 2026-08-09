@@ -1,5 +1,5 @@
-//! Minting a new profile: a DID + dig-store are launched on-chain and bound together via
-//! `dig_social_profile::IdentityProfile`, signed with the account seed's key at the profile index.
+//! Minting a new profile: a DID + dig-store are launched on-chain and bound together into a
+//! [`ProfileAnchor`], signed with the account seed's key at the profile index.
 //!
 //! # What is implemented
 //!
@@ -7,18 +7,18 @@
 //! a real `did:chia:` mint, and [`ProfileMinter::mint_status`](crate::mint) turns its on-chain
 //! confirmation into [`MintedDid`](crate::mint::MintedDid) evidence. See [`crate::mint`].
 //!
-//! [`mint`](ProfileMinter::mint) — the FULL profile (DID + dig-store + SMT seed, bound into an
-//! `IdentityProfile`) — still awaits the dig-store half; it fixes the public shape only.
+//! [`mint`](ProfileMinter::mint) — the FULL profile (DID + dig-store + seeded SMT) — still awaits
+//! the dig-store half; it fixes the public shape only.
 
 use std::sync::Arc;
 
 use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
-use dig_social_profile::IdentityProfile;
 use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::id::ProfileIx;
 use crate::mint::error::{MintError, MintResult};
+use crate::registry::ProfileAnchor;
 use crate::session_residency::Residency;
 
 /// Mints new profiles for an unlocked account.
@@ -65,28 +65,32 @@ impl ProfileMinter {
         Ok(self.seed.master_seed())
     }
 
-    /// **NOT YET IMPLEMENTED — calling this panics.** See `# Panics`.
+    /// **NOT YET IMPLEMENTED — calling this panics, and it is being REPLACED.** See `# Panics`.
     ///
-    /// When it exists it will mint a whole profile at HD index `ix`: launch its DID + dig-store and
-    /// bind them into an [`IdentityProfile`], signed with the profile's derived identity key. The
-    /// current signature is not the final one — a profile mint is a two-phase on-chain ceremony, so
-    /// it needs a `ChainSource`, a `SpendPublisher` and a `MintNetwork` this signature does not
-    /// take. That shape lands with phase B (dig_ecosystem#2342).
+    /// It was never implementable in this shape. A profile mint is a two-phase on-chain ceremony —
+    /// launch, then wait for burial, then launch the store against the confirmed DID coin — so it
+    /// needs a `ChainSource`, a `SpendPublisher` and a `MintNetwork`, none of which a
+    /// `&self`-plus-index signature can reach. A single call that returned a finished profile
+    /// would have to either block on the chain or invent a confirmation, and inventing one is the
+    /// specific lie [`ProfileAnchor`] exists to make unrepresentable.
+    ///
+    /// **The replacement lands in 0.10.0** as the same three-step shape the DID half already uses:
+    /// `begin_profile_mint` (build, sign, push), `advance_profile_mint` (drive the ceremony from
+    /// whatever the chain now says), and `profile_mint_status` (report it), resolving to a
+    /// [`ProfileAnchor`] only once BOTH halves are buried. Tracked as dig_ecosystem#2342.
     ///
     /// The DID half IS real today: [`crate::mint`] builds, signs and pushes a `did:chia:` mint and
     /// turns its confirmation into [`MintedDid`](crate::mint::MintedDid) evidence.
-    ///
-    /// **Once the body exists, broadcasting the resulting spends on mainnet spends real DIG/XCH.**
     ///
     /// # Panics
     ///
     /// Unconditionally, on every call, with a `todo!()`. There is no argument that makes it
     /// succeed, and nothing is derived, signed or pushed before it panics.
-    pub fn mint(&self, ix: ProfileIx) -> Result<IdentityProfile> {
+    pub fn mint(&self, ix: ProfileIx) -> Result<ProfileAnchor> {
         // Both parameters are unread only because the body does not exist yet; discarding them
         // keeps the signature — which is part of this cut's public shape — warning-free.
         let _ = (&self.seed, ix);
-        todo!("Phase 2: DID launch + dig-store create + SMT seed via IdentityProfile::mint_from_did, signed with the profile's derived key")
+        todo!("Phase 2 (0.10.0): begin_profile_mint / advance_profile_mint / profile_mint_status")
     }
 }
 

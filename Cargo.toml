@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -26,12 +26,10 @@ include = [
 ]
 
 [dependencies]
-dig-social-profile = "0.2"
 # The canonical money signer + independent spend verification live in dig-wallet-backend's `client`
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
-# 0.16.1 exactly: the overflow boundary this crate pins in `enforcer` was only made observable there.
-dig-wallet-backend = { version = "0.16.1", default-features = false, features = ["client"] }
+dig-wallet-backend = { version = "0.27", default-features = false, features = ["client"] }
 dig-session = "0.5"
 dig-identity = "0.6"
 dig-keystore = "0.4.1"
@@ -40,19 +38,19 @@ dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
 # spend bundle; it supplies the funding coin, signs what dig-did reports, and broadcasts.
-dig-did = "0.4"
+dig-did = "0.6"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
-dig-chainsource-interface = "0.1"
+dig-chainsource-interface = "0.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-chia-bls = "0.26"
+chia-bls = "0.36.1"
 # The `serde` feature is required: coin ids and launcher ids are persisted in the profile
 # registry as canonical 0x-hex strings (SPEC §2.4).
-chia-protocol = { version = "0.26", features = ["serde"] }
-chia-puzzle-types = "0.26"
-chia-wallet-sdk = { version = "0.30", features = ["chip-0035"] }
-clvmr = "0.14"
+chia-protocol = { version = "0.36.1", features = ["serde"] }
+chia-puzzle-types = "0.36.1"
+chia-wallet-sdk = { version = "0.34", features = ["chip-0035"] }
+clvmr = "0.16"
 # Asset ids and puzzle hashes are rendered as lowercase hex in a summary line.
 hex = "0.4"
 thiserror = "2"
@@ -73,15 +71,15 @@ tokio = { version = "1", features = ["macros", "rt"] }
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
-chia-sdk-test = "0.30"
+chia-sdk-test = "0.34"
 # Test-only: the consensus ErrorCode enum, so the orphaned-secondary test can pin its refusal to
 # AssertCoinAnnouncementFailed specifically. A bare is_err() there would be satisfied by a signature
-# failure and would leave the input binding untested. Pinned to the version chia-sdk-test 0.30
+# failure and would leave the input binding untested. Pinned to the version chia-sdk-test 0.34
 # resolves to; a divergence makes the two ErrorCode types differ and fails LOUDLY at compile time.
-chia-consensus = "0.26"
+chia-consensus = "0.36.1"
 # Test-only: a DERIVED k1 keypair for the secp-refusal fixture (the gate must refuse a signature
-# requirement a DID mint never produces). Pinned to the version chia-wallet-sdk 0.30 resolves to.
-chia-secp = "0.26"
+# requirement a DID mint never produces). Pinned to the version chia-wallet-sdk 0.34 resolves to.
+chia-secp = "0.36.1"
 sha2 = "0.10"
 # Compile-fail proofs: several custody properties of `SpendApproval` are TYPE-SYSTEM properties, so
 # the only honest test for them is that the wrong code does not compile.
