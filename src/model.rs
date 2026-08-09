@@ -1,14 +1,22 @@
-//! The account object model: an [`Account`] is one master seed plus N [`Profile`]s, exactly one of
-//! which is the default.
+//! The account object model, split into an OFFLINE half and an ONLINE half.
 //!
-//! A [`Profile`] wraps a `dig_social_profile::IdentityProfile` (its DID + dig-store + SMT), tagged
-//! with the [`ProfileIx`] its keys derive at. The model is pure state — no seed, no crypto — so it is
-//! trivially testable and serialization-friendly ([`AccountRecord`] is the on-disk shape).
+//! - **Offline** — [`ProfileRegistry`]: which profiles exist, which is active, which mints are
+//!   half-finished. Public identifiers only, readable while the account is locked, and the sole
+//!   authority on whether a profile exists.
+//! - **Online** — [`Profile`]: a `dig_social_profile::IdentityProfile` (DID + dig-store + SMT)
+//!   resolved from chain, attached opportunistically once a chain source is available.
+//!
+//! [`Account`] holds both and keeps them from disagreeing: a resolved profile may only be attached
+//! at an index the registry confirms. The model stays pure state — no seed, no crypto — so it is
+//! trivially testable, and [`AccountRecord`] is its on-disk shape.
+
+use std::collections::BTreeMap;
 
 use dig_social_profile::IdentityProfile;
 
 use crate::error::{AccountError, Result};
 use crate::id::{AccountId, ProfileIx};
+use crate::registry::ProfileRegistry;
 
 /// One profile within an account: a DID + dig-store + profile SMT, tagged with the HD index its
 /// identity + wallet keys derive at.
@@ -36,40 +44,32 @@ impl Profile {
     }
 }
 
-/// A live account: its stable [`AccountId`], its profiles, and which profile is the default.
+/// A live account: its stable [`AccountId`], its offline [`ProfileRegistry`], and whatever profiles
+/// have been resolved from chain so far.
 ///
-/// The exactly-one-default invariant is enforced at construction and by
-/// [`set_default_profile`](Self::set_default_profile): the default index always names a profile that
-/// is present.
+/// # Why construction is total
+///
+/// It takes no `Result`. The previous shape REJECTED an empty profile set, which made a pre-mint
+/// account — every account, on its first run — literally unrepresentable, and forced callers to
+/// invent a profile before one existed. The registry now carries the "which profiles exist"
+/// question and answers "none" honestly, so there is nothing left for `new` to refuse.
 pub struct Account {
     id: AccountId,
-    profiles: Vec<Profile>,
-    default_profile_ix: ProfileIx,
+    registry: ProfileRegistry,
+    /// Chain-resolved views, keyed by index. A subset of the registry's confirmed entries: a
+    /// profile may be confirmed and not yet resolved, never the reverse.
+    resolved: BTreeMap<ProfileIx, Profile>,
 }
 
 impl Account {
-    /// Build an account from its `profiles`, with `default_profile_ix` as the default.
-    ///
-    /// Errors with [`AccountError::DefaultProfileInvariant`] if `profiles` is empty, and with
-    /// [`AccountError::ProfileNotFound`] if `default_profile_ix` names no present profile.
-    pub fn new(
-        id: AccountId,
-        profiles: Vec<Profile>,
-        default_profile_ix: ProfileIx,
-    ) -> Result<Self> {
-        if profiles.is_empty() {
-            return Err(AccountError::DefaultProfileInvariant(
-                "an account must have at least one profile".to_string(),
-            ));
-        }
-        if !profiles.iter().any(|p| p.ix == default_profile_ix) {
-            return Err(AccountError::ProfileNotFound(default_profile_ix));
-        }
-        Ok(Self {
+    /// Build an account around its registry. Total: every registry, including an empty one,
+    /// describes a real account.
+    pub fn new(id: AccountId, registry: ProfileRegistry) -> Self {
+        Self {
             id,
-            profiles,
-            default_profile_ix,
-        })
+            registry,
+            resolved: BTreeMap::new(),
+        }
     }
 
     /// The account's stable identifier.
@@ -77,47 +77,83 @@ impl Account {
         &self.id
     }
 
-    /// Every profile in the account.
-    pub fn profiles(&self) -> &[Profile] {
-        &self.profiles
+    /// The offline profile registry — the authority on which profiles exist.
+    pub fn registry(&self) -> &ProfileRegistry {
+        &self.registry
     }
 
-    /// The default profile (always present by the exactly-one-default invariant).
-    pub fn default_profile(&self) -> &Profile {
-        self.profiles
-            .iter()
-            .find(|p| p.ix == self.default_profile_ix)
-            .expect("the exactly-one-default invariant guarantees the default profile is present")
+    /// The offline profile registry, mutably.
+    pub fn registry_mut(&mut self) -> &mut ProfileRegistry {
+        &mut self.registry
     }
 
-    /// Make `ix` the default profile, atomically clearing the previous default.
+    /// Attach a chain-resolved view of a profile.
     ///
-    /// Errors with [`AccountError::ProfileNotFound`] if no profile has index `ix` (the previous
-    /// default is left unchanged — fail-closed).
-    pub fn set_default_profile(&mut self, ix: ProfileIx) -> Result<()> {
-        if !self.profiles.iter().any(|p| p.ix == ix) {
+    /// # Errors
+    ///
+    /// [`AccountError::ProfileNotFound`] for an index the registry does not confirm, so the
+    /// resolved map can never disagree with the registry about which profiles exist.
+    pub fn attach_resolved(&mut self, profile: Profile) -> Result<()> {
+        let ix = profile.ix();
+        if !self.registry.contains(ix) {
             return Err(AccountError::ProfileNotFound(ix));
         }
-        self.default_profile_ix = ix;
+        self.resolved.insert(ix, profile);
         Ok(())
+    }
+
+    /// The chain-resolved view of the profile at `ix`, if one has been attached.
+    pub fn resolved(&self, ix: ProfileIx) -> Option<&Profile> {
+        self.resolved.get(&ix)
+    }
+
+    /// The account's persistence shape.
+    pub fn record(&self) -> AccountRecord {
+        AccountRecord {
+            id: self.id.clone(),
+            profiles: self.registry.clone(),
+        }
+    }
+
+    /// The active profile's resolved view.
+    #[deprecated(
+        since = "0.7.0",
+        note = "an account may have NO active profile; use `registry().active()` and resolve it"
+    )]
+    pub fn default_profile(&self) -> Option<&Profile> {
+        let ix = self.registry.active()?.ix();
+        self.resolved(ix)
+    }
+
+    /// Make `ix` the active profile.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::ProfileNotFound`] if `ix` names no confirmed profile.
+    #[deprecated(
+        since = "0.7.0",
+        note = "use `registry_mut().set_active()`, whose ActiveSwitch the host MUST disclose"
+    )]
+    pub fn set_default_profile(&mut self, ix: ProfileIx) -> Result<()> {
+        self.registry.set_active(ix).map(|_switch| ())
     }
 }
 
-/// The serializable persistence shape of an account: its id, the indices of its profiles, and the
-/// default index. The live [`Profile`] state is rehydrated from chain/dig-store on load.
+/// The serializable persistence shape of an account: its id and its profile registry.
+///
+/// It carries no secret, and the live [`Profile`] views are re-resolved from chain on load.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccountRecord {
     /// The account's stable identifier.
     pub id: AccountId,
-    /// The HD indices of every profile in the account.
-    pub profile_indexes: Vec<u32>,
-    /// The HD index of the default profile.
-    pub default_profile_ix: u32,
+    /// Every profile the account has, plus the active slot and the mint journal.
+    pub profiles: ProfileRegistry,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mint::fixtures::{confirmed_store, minted_did};
     use chia_wallet_sdk::utils::Address;
     use dig_social_profile::{
         Bytes32, Coin, Did, IdentityProfile, IdentitySingleton, Profile as Metadata,
@@ -152,54 +188,91 @@ mod tests {
         Profile::new(ix, identity)
     }
 
-    #[test]
-    fn set_default_profile_switches_to_a_present_profile() {
-        let mut account = Account::new(
-            AccountId::new("a"),
-            vec![profile_at(ProfileIx::ROOT), profile_at(ProfileIx(1))],
-            ProfileIx::ROOT,
-        )
-        .unwrap();
+    /// Register a confirmed profile at `ix` so a resolved view may be attached there.
+    fn registry_with(ix: ProfileIx) -> ProfileRegistry {
+        let mut registry = ProfileRegistry::empty();
+        registry
+            .record_minted(ix, &minted_did(1), &confirmed_store(1), None)
+            .unwrap();
+        registry
+    }
 
-        account.set_default_profile(ProfileIx(1)).unwrap();
-        assert_eq!(account.default_profile().ix(), ProfileIx(1));
+    /// The pre-mint state of EVERY account on its first run. The previous `Account::new` refused
+    /// it, which made the state a host actually starts in unrepresentable.
+    #[test]
+    fn an_account_with_no_profiles_is_representable() {
+        let account = Account::new(AccountId::new("a"), ProfileRegistry::empty());
+
+        assert!(account.registry().is_empty());
+        assert!(account.registry().active().is_none());
+        assert!(account.resolved(ProfileIx::ROOT).is_none());
+        assert_eq!(account.record().profiles, ProfileRegistry::empty());
+    }
+
+    /// The resolved map may never claim a profile the registry does not confirm — that is exactly
+    /// the disagreement (a chain view of something unrecorded) the split exists to prevent.
+    #[test]
+    fn attaching_a_resolved_profile_for_an_unregistered_index_is_refused() {
+        let mut account = Account::new(AccountId::new("a"), registry_with(ProfileIx::ROOT));
+
+        let result = account.attach_resolved(profile_at(ProfileIx(9)));
+
+        assert!(matches!(
+            result,
+            Err(AccountError::ProfileNotFound(ProfileIx(9)))
+        ));
+        assert!(account.resolved(ProfileIx(9)).is_none());
     }
 
     #[test]
-    fn set_default_profile_rejects_an_absent_index_and_leaves_the_default_unchanged() {
-        // SPEC §2.1 fail-closed MUST: an absent target index is refused and the previous default
-        // stands (no partial mutation).
-        let mut account = Account::new(
-            AccountId::new("a"),
-            vec![profile_at(ProfileIx::ROOT)],
-            ProfileIx::ROOT,
-        )
-        .unwrap();
+    fn a_resolved_profile_at_a_confirmed_index_is_attached() {
+        let mut account = Account::new(AccountId::new("a"), registry_with(ProfileIx::ROOT));
 
-        let result = account.set_default_profile(ProfileIx(9));
-        assert!(matches!(result, Err(AccountError::ProfileNotFound(_))));
+        account.attach_resolved(profile_at(ProfileIx::ROOT)).unwrap();
+
         assert_eq!(
-            account.default_profile().ix(),
-            ProfileIx::ROOT,
-            "a rejected switch must not disturb the existing default"
+            account.resolved(ProfileIx::ROOT).map(Profile::ix),
+            Some(ProfileIx::ROOT)
         );
     }
 
+    /// The deprecated delegates still work, so a consumer gets a compiler-guided path rather than
+    /// a wall: `set_default_profile` moves the registry's active slot, and `default_profile`
+    /// returns the resolved view of it.
     #[test]
-    fn account_requires_at_least_one_profile() {
-        let result = Account::new(AccountId::new("a"), vec![], ProfileIx::ROOT);
-        assert!(matches!(
-            result,
-            Err(AccountError::DefaultProfileInvariant(_))
-        ));
+    #[allow(deprecated)]
+    fn the_deprecated_default_profile_api_delegates_to_the_registry() {
+        let mut registry = registry_with(ProfileIx::ROOT);
+        registry
+            .record_minted(ProfileIx(1), &minted_did(3), &confirmed_store(3), None)
+            .unwrap();
+        let mut account = Account::new(AccountId::new("a"), registry);
+        account.attach_resolved(profile_at(ProfileIx(1))).unwrap();
+
+        account.set_default_profile(ProfileIx(1)).unwrap();
+
+        assert_eq!(account.registry().active().unwrap().ix(), ProfileIx(1));
+        assert_eq!(account.default_profile().map(Profile::ix), Some(ProfileIx(1)));
+    }
+
+    /// Fail-closed, unchanged from the pre-0.7.0 contract: an absent target index is refused and
+    /// the previous active profile stands.
+    #[test]
+    #[allow(deprecated)]
+    fn set_default_profile_rejects_an_absent_index_and_leaves_the_active_profile_unchanged() {
+        let mut account = Account::new(AccountId::new("a"), registry_with(ProfileIx::ROOT));
+
+        let result = account.set_default_profile(ProfileIx(9));
+
+        assert!(matches!(result, Err(AccountError::ProfileNotFound(_))));
+        assert_eq!(account.registry().active().unwrap().ix(), ProfileIx::ROOT);
     }
 
     #[test]
     fn account_record_serde_round_trips() {
         let record = AccountRecord {
             id: AccountId::new("acct"),
-            profile_indexes: vec![0, 1, 7],
-            default_profile_ix: 1,
+            profiles: registry_with(ProfileIx(7)),
         };
         let json = serde_json::to_string(&record).unwrap();
         let back: AccountRecord = serde_json::from_str(&json).unwrap();
