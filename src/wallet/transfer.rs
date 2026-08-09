@@ -115,7 +115,9 @@ pub enum TransferError {
     /// no money while costing a fee; and the custody summary excludes outputs that provably return to
     /// a puzzle the spend is already unlocking, so the confirmation ceremony would show a spend with
     /// NO recipient and a fee — a true statement that reads as a completely different transaction.
-    #[error("the recipient is this wallet's own address; a self-payment moves nothing and costs a fee")]
+    #[error(
+        "the recipient is this wallet's own address; a self-payment moves nothing and costs a fee"
+    )]
     SelfPayment,
 
     /// The amount is zero. A zero-value coin is not a payment, and consensus has no use for one.
@@ -713,14 +715,17 @@ fn build_transfer_spends(
         .ok_or_else(|| TransferError::Build("the selected inputs overflow u64".into()))?;
     let change = total
         .checked_sub(request.required_total()?)
-        .ok_or_else(|| TransferError::Build("the selected inputs do not cover the transfer".into()))?;
+        .ok_or_else(|| {
+            TransferError::Build("the selected inputs do not cover the transfer".into())
+        })?;
 
     let mut ctx = SpendContext::new();
     let hint = ctx
         .hint(request.recipient)
         .map_err(|e| TransferError::Build(format!("recipient hint: {e}")))?;
 
-    let mut lead_conditions = Conditions::new().create_coin(request.recipient, request.amount_mojos, hint);
+    let mut lead_conditions =
+        Conditions::new().create_coin(request.recipient, request.amount_mojos, hint);
     if change > 0 {
         lead_conditions = lead_conditions.create_coin(wallet.puzzle_hash(), change, Memos::None);
     }
@@ -728,7 +733,8 @@ fn build_transfer_spends(
         lead_conditions = lead_conditions.reserve_fee(request.fee_mojos);
     }
     if !secondaries.is_empty() {
-        lead_conditions = lead_conditions.create_coin_announcement(INPUT_BINDING_MESSAGE.to_vec().into());
+        lead_conditions =
+            lead_conditions.create_coin_announcement(INPUT_BINDING_MESSAGE.to_vec().into());
     }
 
     let layer = StandardLayer::new(wallet.public_key());
@@ -1670,8 +1676,8 @@ mod tests {
         let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
         let (pending, _) = pending_and_payment(&ops, &source);
 
-        let error = transfer_status(&pending, &source.without_peak())
-            .expect_err("no peak, no bound");
+        let error =
+            transfer_status(&pending, &source.without_peak()).expect_err("no peak, no bound");
         assert!(
             matches!(error, TransferError::ChainUnreachable(_)),
             "{error}"
