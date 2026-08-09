@@ -417,7 +417,29 @@ impl TransferPlan {
         self.change_mojos
     }
 
-    /// Record that this plan has been broadcast, at a chain peak of `pre_push_peak`.
+    /// Record that this plan is about to be broadcast, anchoring it to the chain's CURRENT peak.
+    ///
+    /// This is the path callers should use. It reads the peak itself, immediately before the push, so
+    /// the anchor cannot be a number the caller invented, defaulted, or read at the wrong moment —
+    /// which is the difference between a real backdating check and a decorative one.
+    ///
+    /// # Errors
+    ///
+    /// [`TransferError::ChainUnreachable`] when the peak cannot be established. That is a refusal to
+    /// proceed, not a zero: a transfer pushed without a usable anchor can never have a confirmation
+    /// bounded, so it would accept a back-dated one forever.
+    pub fn pushed_now<C>(&self, chain: &C) -> TransferResult<PendingTransfer>
+    where
+        C: ChainSource + ?Sized,
+    {
+        Ok(self.pushed_at(peak_height(chain)?))
+    }
+
+    /// Record that this plan has been broadcast, at a caller-supplied chain peak of `pre_push_peak`.
+    ///
+    /// Prefer [`pushed_now`](Self::pushed_now), which reads the peak itself. This variant exists for
+    /// callers that already hold a peak read at the right moment, and for tests that need to place
+    /// the anchor deliberately.
     ///
     /// # `pre_push_peak` MUST be read BEFORE the push
     ///
@@ -427,6 +449,9 @@ impl TransferPlan {
     /// itself said earlier. Read it after the push and a source that invents a confirmation is free
     /// to place it anywhere, because the number it would have to contradict is one it also supplied,
     /// after seeing the bundle.
+    ///
+    /// A `0` here makes the check VACUOUS — every height is at or above genesis — so a caller that
+    /// cannot read a peak MUST refuse to push rather than anchor at zero.
     pub fn pushed_at(&self, pre_push_peak: u32) -> PendingTransfer {
         PendingTransfer {
             payment_coin_id: self.payment_coin_id,
@@ -833,8 +858,16 @@ where
         return Ok(TransferStatus::Confirmed(settled));
     }
 
+    // A payment coin seen HERE vetoes a death verdict outright, and that is a correctness rule
+    // rather than an optimisation. `proof_of_death` re-reads the payment coin itself, so deleting
+    // this line leaves every existing test green — but the two checks are not the same check. This
+    // one remembers the FIRST read: once any read has reported the payment coin, no later answer
+    // that omits it can be read as "the coin never existed". Without it, a source that showed the
+    // payment and then stopped showing it — an aggregating source answering from a node that has
+    // since fallen behind — turns an already-observed payment into a proof of death, and `Failed`
+    // tells the caller to send the money again.
     if payment.is_none() {
-        if let Some(reason) = proof_of_death(pending, chain)? {
+        if let Some(reason) = proof_of_death(pending, chain, peak)? {
             return Ok(TransferStatus::Failed { reason });
         }
     }
@@ -868,7 +901,30 @@ where
 /// The payment record is checked for EXISTENCE rather than confirmation throughout: a payment coin
 /// seen in the mempool, or confirmed but not yet buried, is this bundle succeeding, and calling that
 /// dead would be a worse error than calling it slow.
-fn proof_of_death<C>(pending: &PendingTransfer, chain: &C) -> TransferResult<Option<String>>
+///
+/// # The spend must be BURIED, not merely reported
+///
+/// The re-read above narrows the window but does not close it: nothing forces the two reads to come
+/// from the same node or the same height, so an aggregating source can still answer "payment absent"
+/// from a lagging node twice while a node ahead of it reports the input spent.
+///
+/// Requiring the input's spend to be buried under [`MIN_CONFIRMATION_DEPTH`] blocks removes the
+/// asymmetry that makes that pairing dangerous. A lagging node is behind by definition, so a spend it
+/// has not yet seen cannot be deeply buried from the same source's own peak; by the time a spend IS
+/// that deep, a source lagging far enough to still hide the payment coin would have to be
+/// inconsistent with itself rather than merely stale.
+///
+/// This uses only [`CoinRecord`] data plus the peak, and it errs strictly toward
+/// [`Awaiting`](TransferStatus::Awaiting). That matters more than the tightness of the bound: the
+/// exact meaning of a peak height is not specified across chain sources, so an off-by-one here can
+/// only make this marginally more or less conservative — it can never flip a correct verdict into a
+/// wrong one. Declaring a live transfer dead is the expensive direction, because
+/// [`Failed`](TransferStatus::Failed) tells the caller to send again.
+fn proof_of_death<C>(
+    pending: &PendingTransfer,
+    chain: &C,
+    peak_height: u32,
+) -> TransferResult<Option<String>>
 where
     C: ChainSource + ?Sized,
 {
@@ -879,14 +935,21 @@ where
     };
 
     for source_id in &pending.source_coin_ids {
-        if !read(*source_id)?.as_ref().is_some_and(CoinRecord::is_spent) {
+        let Some(spent_height) = read(*source_id)?.and_then(|record| record.spent_height) else {
+            continue;
+        };
+        // The confirming block is the first of the depth, hence the +1 — the same arithmetic
+        // `ConfirmedTransfer::from_confirmed` uses to judge the payment coin's burial.
+        let spend_depth = peak_height.saturating_sub(spent_height).saturating_add(1);
+        if spend_depth < MIN_CONFIRMATION_DEPTH {
             continue;
         }
         if read(pending.payment_coin_id)?.is_some() {
             return Ok(None);
         }
         return Ok(Some(format!(
-            "input coin {} was spent by a different spend; this transfer can never confirm",
+            "input coin {} was spent by a different spend at height {spent_height}, now buried \
+             under {spend_depth} blocks; this transfer can never confirm",
             hex::encode(source_id)
         )));
     }
@@ -2139,6 +2202,48 @@ mod tests {
         );
     }
 
+    /// `pushed_now` anchors to the chain's OWN peak, so the backdating check cannot be defeated by a
+    /// caller that supplies a convenient number.
+    #[test]
+    fn pushed_now_anchors_to_the_chains_own_peak() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]).at_peak(PEAK + 42);
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+            )
+            .expect("builds");
+
+        let pending = plan.pushed_now(&chain).expect("the chain reports a peak");
+        assert_eq!(pending.pushed_at_height(), PEAK + 42);
+    }
+
+    /// A source that cannot report a peak makes `pushed_now` REFUSE rather than anchor at zero. An
+    /// anchor of `0` would make the backdating check vacuous, and a caller acting on it would accept
+    /// any invented confirmation height forever.
+    #[test]
+    fn pushed_now_refuses_when_the_chain_has_no_peak() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let plan = ops
+            .build_transfer(
+                &source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 600),
+            )
+            .expect("builds");
+
+        let error = plan
+            .pushed_now(&source.without_peak())
+            .expect_err("no peak, no anchor");
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "{error}"
+        );
+    }
+
     // ------------------------------------------------------------------- fee-bump replacement
 
     /// **THE DEFECT, pinned so it cannot silently return.** Two plans built by the ORDINARY
@@ -2501,19 +2606,25 @@ mod tests {
         assert!(!asserting.contains(&lead_id));
     }
 
-    /// **The binding, proven against the real consensus validator, with the signature removed as a
-    /// confounder.**
+    /// **The binding, proven against the real consensus validator.**
     ///
-    /// The obvious version of this test — drop the lead spend and resubmit the rest with the ORIGINAL
-    /// aggregate signature — proves nothing: an aggregate over four `AGG_SIG_ME` messages cannot
-    /// verify against three spends, so the validator refuses it for a signature failure and never
-    /// evaluates the unsatisfied `ASSERT_COIN_ANNOUNCEMENT`. Deleting the binding entirely would leave
-    /// that test green.
+    /// The orphaned subset is RE-SIGNED here, correctly, for exactly the spends it contains, so that
+    /// a signature failure cannot be what the refusal is measuring. The full bundle is then submitted
+    /// to the SAME simulator and accepted, which proves the refusal was about the missing lead and
+    /// not about the coins, the keys or the fixture.
     ///
-    /// So the orphaned subset is RE-SIGNED here, correctly, for exactly the spends it contains. The
-    /// only remaining reason for the validator to refuse it is the announcement the lead never made.
-    /// The full bundle is then submitted to the SAME simulator and accepted, which proves the refusal
-    /// was about the missing lead and not about the coins, the keys or the fixture.
+    /// # What the re-signing does and does not buy, measured rather than assumed
+    ///
+    /// Replacing the correct signature with `Signature::default()` leaves this test PASSING, still
+    /// reporting `AssertCoinAnnouncementFailed` — so THIS validator evaluates the announcement before
+    /// it verifies signatures, and the signature is not the confounder it would be under a validator
+    /// that checked in the other order. The re-signing is kept because it costs little and makes the
+    /// test independent of that ordering; the claim that it is REQUIRED here would be false.
+    ///
+    /// What the test genuinely proves is the binding itself. Removing the
+    /// `assert_coin_announcement` and re-running leaves the orphaned subset ACCEPTED — three
+    /// 200_000-mojo coins spent at height 1 with no output at all, which is the user's money burned
+    /// into fees. That is the outcome this condition exists to make impossible.
     ///
     /// This lives in the crate rather than the integration suite because re-signing needs the wallet's
     /// secret key, which dig-account deliberately does not expose.
@@ -2942,6 +3053,58 @@ mod tests {
         );
     }
 
+    /// **A SHALLOW competing spend is not yet a proof of death.** The verdict rests on three reads
+    /// taken at three moments, and an aggregating source answers them from different nodes: one ahead
+    /// of the chain reports the input spent, one behind it still shows no payment coin, and the pair
+    /// reads as death for a transfer that may be perfectly alive. Since `Failed` tells the caller to
+    /// send again, that mistake costs a second payment.
+    ///
+    /// Requiring the spend to be BURIED removes the asymmetry — a node lagging far enough to hide the
+    /// payment coin cannot also have seen a deeply-buried spend. The fixture is one block short of the
+    /// bound, and the control below is the same fixture at the bound.
+    #[test]
+    fn a_shallow_competing_spend_is_not_yet_a_proof_of_death() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let spent_at = PEAK;
+        let chain = FixedChain::with_records(vec![record(input, Some(PEAK - 100), Some(spent_at))])
+            .at_peak(spent_at + MIN_CONFIRMATION_DEPTH - 2);
+
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Awaiting { .. }
+            ),
+            "one block short of the bound must not be reported as dead"
+        );
+    }
+
+    /// The other side of that bound: the SAME competing spend, buried to exactly
+    /// [`MIN_CONFIRMATION_DEPTH`], IS a proof of death. Without it the refusal above would be equally
+    /// satisfied by an implementation that had stopped reporting `Failed` at all.
+    #[test]
+    fn a_competing_spend_buried_to_the_bound_is_a_proof_of_death() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, _) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let spent_at = PEAK;
+        let chain = FixedChain::with_records(vec![record(input, Some(PEAK - 100), Some(spent_at))])
+            .at_peak(spent_at + MIN_CONFIRMATION_DEPTH - 1);
+
+        assert!(
+            matches!(
+                transfer_status(&pending, &chain).expect("readable"),
+                TransferStatus::Failed { .. }
+            ),
+            "exactly MIN_CONFIRMATION_DEPTH blocks of burial is enough to declare death"
+        );
+    }
+
     /// **The control that makes the failure test load-bearing, and it must be an INCONSISTENT one.**
     ///
     /// A control built from one consistent snapshot — a spent input and a present payment coin,
@@ -2965,6 +3128,7 @@ mod tests {
             other: vec![spent(source.records[0].coin)],
             payment_reads: Cell::new(0),
             peak: PEAK + 1,
+            vanishing: false,
         };
 
         let status = transfer_status(&pending, &chain).expect("readable");
@@ -2993,6 +3157,66 @@ mod tests {
             other: vec![spent(source.records[0].coin)],
             payment_reads: Cell::new(usize::MAX),
             peak: PEAK + 1,
+            vanishing: false,
+        };
+
+        assert!(matches!(
+            transfer_status(&pending, &chain).expect("readable"),
+            TransferStatus::Failed { .. }
+        ));
+    }
+
+    /// **A payment coin seen on the FIRST read is never a proof of death, even if the source stops
+    /// reporting it.**
+    ///
+    /// This is what the `payment.is_none()` veto in [`transfer_status`] buys, and it is a different
+    /// property from the re-read inside [`proof_of_death`]. The re-read protects the case where the
+    /// payment appears LATE; this protects the case where it appears EARLY and then vanishes — an
+    /// aggregating source answering the first question from a node that is current and the rest from
+    /// one that has fallen behind.
+    ///
+    /// Both spellings look equivalent because `proof_of_death` also returns `None` when it can see
+    /// the payment coin. They diverge exactly here: the veto remembers an observation the later reads
+    /// have lost. Deleting the guard makes this test go red while every other test stays green.
+    #[test]
+    fn a_payment_coin_seen_on_the_first_read_is_never_a_failure() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let chain = FlickeringChain {
+            payment: record(payment, Some(PEAK + 1), None),
+            // Spent, and buried well past the bound, so the death path is genuinely reachable.
+            other: vec![record(input, Some(PEAK - 100), Some(PEAK - 50))],
+            payment_reads: Cell::new(0),
+            peak: PEAK,
+            vanishing: true,
+        };
+
+        let status = transfer_status(&pending, &chain).expect("readable");
+        assert!(
+            !matches!(status, TransferStatus::Failed { .. }),
+            "a payment coin this source has already reported must not become a death: {status:?}"
+        );
+    }
+
+    /// The truthful control: the SAME fixture, the SAME buried spend, with the payment coin absent on
+    /// EVERY read, IS a proof of death. Without it the test above would pass against an
+    /// implementation that had simply stopped reporting `Failed`.
+    #[test]
+    fn the_same_fixture_with_the_payment_never_seen_is_a_failure() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+        let input = source.records[0].coin;
+
+        let chain = FlickeringChain {
+            payment: record(payment, Some(PEAK + 1), None),
+            other: vec![record(input, Some(PEAK - 100), Some(PEAK - 50))],
+            payment_reads: Cell::new(usize::MAX),
+            peak: PEAK,
+            vanishing: false,
         };
 
         assert!(matches!(
@@ -3003,14 +3227,19 @@ mod tests {
 
     /// A chain source whose answer about the payment coin CHANGES between reads.
     ///
-    /// `payment_reads` counts calls for the payment coin: the first is answered absent, later ones
-    /// present. Setting it to `usize::MAX` makes every read absent, which is how the same double
-    /// serves as its own control.
+    /// `payment_reads` counts calls for the payment coin: by default the first is answered absent and
+    /// later ones present. Setting it to `usize::MAX` makes every read absent, which is how the same
+    /// double serves as its own control.
+    ///
+    /// `vanishing` INVERTS that — present first, absent afterwards. A double that can only appear
+    /// cannot express a source that has fallen behind after answering, and that direction is the one
+    /// the `payment.is_none()` veto in [`transfer_status`] exists to handle.
     struct FlickeringChain {
         payment: CoinRecord,
         other: Vec<CoinRecord>,
         payment_reads: Cell<usize>,
         peak: u32,
+        vanishing: bool,
     }
 
     impl ChainSource for FlickeringChain {
@@ -3020,7 +3249,12 @@ mod tests {
             if coin_id == self.payment.coin.coin_id() {
                 let seen = self.payment_reads.get();
                 self.payment_reads.set(seen.saturating_add(1));
-                return Ok((seen > 0 && seen != usize::MAX).then(|| self.payment.clone()));
+                let present = if self.vanishing {
+                    seen == 0
+                } else {
+                    seen > 0 && seen != usize::MAX
+                };
+                return Ok(present.then(|| self.payment.clone()));
             }
             Ok(self
                 .other

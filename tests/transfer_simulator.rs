@@ -265,12 +265,27 @@ fn a_source_coin_spent_elsewhere_reports_failed() -> anyhow::Result<()> {
     chain.mempool.borrow_mut().clear();
     chain.report_spent(pending.source_coin_ids()[0]);
 
+    // A FRESH spend is not yet a proof of death. The reads that produce this verdict come from three
+    // separate moments, and on an aggregating source they can come from three separate nodes: a node
+    // ahead of the chain reports the input spent while a lagging node still shows no payment coin.
+    // Requiring the spend to be BURIED removes that asymmetry, because a node lagging far enough to
+    // hide the payment coin cannot also have seen a deeply-buried spend.
+    assert!(
+        matches!(
+            transfer_status(&pending, &chain)?,
+            TransferStatus::Awaiting { .. }
+        ),
+        "a spend the chain has barely recorded is not yet proof that this transfer is dead"
+    );
+
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+
     assert!(
         matches!(
             transfer_status(&pending, &chain)?,
             TransferStatus::Failed { .. }
         ),
-        "an input consumed by another spend is a proof of death, not a wait"
+        "once the competing spend is buried, the input is provably gone and this transfer is dead"
     );
     Ok(())
 }
