@@ -750,9 +750,21 @@ plus the reason it was rejected.
 
 #### 6.7.2 Coin selection
 
-Only CONFIRMED, UNSPENT coins are spendable. An unconfirmed or spent coin MUST NOT be selected, and MUST
-NOT be counted toward the `available` figure `TransferError::InsufficientFunds` reports — that figure is
-the wallet's entire spendable balance, never however far a selection loop happened to get.
+Only CONFIRMED, UNSPENT coins are spendable. A SPENT coin MUST NOT be selected, and MUST NOT be counted
+toward the `available` figure `TransferError::InsufficientFunds` reports — that figure is the wallet's
+entire spendable balance, never however far a selection loop happened to get.
+
+A record the implementation cannot JUDGE MUST be refused by name rather than skipped, because silently
+dropping it under-counts the balance and tells the user something false about their money:
+
+- `confirmed_height == None` means the SOURCE DOES NOT KNOW, never that the coin is unconfirmed or
+  absent. It MUST be refused with `TransferError::SpendabilityUnknown`. A source that does not populate
+  the field would otherwise make a funded wallet report `InsufficientFunds { available: 0 }`.
+- A record whose `coin.puzzle_hash` is not the wallet's own MUST be refused with
+  `TransferError::UnexpectedCoinPuzzleHash`. Native-XCH-only is ENFORCED, not merely implied by the
+  query: a CAT coin lives at `CatArgs::curry_tree_hash(asset_id, p2)`, and a chain source that indexes
+  by HINT rather than by puzzle hash would return coins this wallet can discover but not unlock —
+  counted as XCH mojos in `available` and spent with a standard-layer reveal.
 
 The spendable total MUST be summed with CHECKED arithmetic, and a total that does not fit in a `u64`
 MUST be refused with `TransferError::BalanceUnjudgeable` rather than clamped. A saturating sum pinned
@@ -871,14 +883,28 @@ requested id cannot exhibit the violation, and a suite built only on one leaves 
 #### 6.7.6 `payment_coin_id` is not a bundle identity
 
 `payment_coin_id` identifies the PAYMENT, not the bundle that produced it: it is determined by
-`(lead input, recipient, amount)` and commits to neither the fee nor the change. Because selection is
-deterministic, a fee-bumped retry of the same transfer re-selects the same lead and shares the id, so
-watching the original `PendingTransfer` will report the retry's confirmation as its own, and the two
-`ConfirmedTransfer` values compare equal.
+`(lead input, recipient, amount)` and commits to neither the fee nor the change.
 
-At most one such bundle can ever be included, because they spend the same lead coin — the recipient is
-paid exactly once, and this is NOT a double payment. It is an accounting hazard, and a caller MUST
-dedupe on `payment_coin_id` rather than counting confirmations.
+A fee-bumped retry MUST be built with `WalletOps::build_transfer_replacing`, which re-spends EXACTLY
+the input coins of the transfer it replaces. Rebuilding a retry by calling `build_transfer` again with
+a higher fee is FORBIDDEN: selection takes the smallest coin covering `amount + fee`, so raising the
+fee can cross a coin boundary and choose a DIFFERENT lead. The two bundles then spend disjoint inputs,
+do NOT conflict, may both sit in the mempool, and may BOTH be included — paying the recipient twice
+under two different payment coin ids.
+
+`build_transfer_replacing` MUST refuse by name rather than as a shortfall when the new fee does not
+exceed the fee it replaces (`ReplacementFeeNotHigher`), and when any input is no longer
+confirmed-and-unspent (`SourcesNoLongerSpendable`) — that second case usually means the ORIGINAL has
+already been included, so a replacement would be a second payment. It MUST NOT select a substitute
+input: the higher fee comes out of the change, so a transfer whose inputs were consumed exactly cannot
+be fee-bumped at all, and MUST be refused with the reused inputs' total rather than the wallet's
+balance.
+
+Because the replacement reuses the lead, it shares `payment_coin_id` with the original and at most one
+of them can ever be included. What remains is an accounting hazard, not a double payment: watching the
+original `PendingTransfer` reports the replacement's confirmation as its own and the two
+`ConfirmedTransfer` values compare equal, so a caller MUST dedupe on `payment_coin_id` rather than
+counting confirmations.
 
 ## 6A. The on-chain DID mint
 

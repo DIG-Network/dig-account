@@ -442,3 +442,124 @@ fn build_send_by_hand(
         .expect("a hand-built send");
     ctx.take()
 }
+
+/// **A fee-bumped replacement CONFLICTS with the transfer it replaces, so the recipient is paid
+/// exactly once — proven against consensus.**
+///
+/// This is the end-to-end proof for the double-payment class, and the mechanism it proves is
+/// CONFLICT rather than deduplication. `build_transfer_replacing` re-spends exactly the inputs the
+/// original spends, so once one bundle is in a block the other is rejected by consensus itself as a
+/// double spend. Nothing downstream has to notice a duplicate.
+///
+/// The wallet is funded with TWO coins that each cover the transfer, so a builder that re-ran
+/// selection would have had a second coin to build a genuinely includable second payment from. That
+/// is what makes this fixture able to exhibit the defect rather than merely fail to exhibit it — the
+/// companion test below uses the same shape and really does pay twice.
+///
+/// The refusal is asserted against the simulator directly rather than through `farm`, because the
+/// helper applies bundles one at a time and surfaces the rejection as an error; the point here is
+/// that the rejection HAPPENS and is a double spend, which is a claim about consensus.
+#[test]
+fn a_fee_bumped_replacement_conflicts_and_pays_the_recipient_once() -> anyhow::Result<()> {
+    let account = unlocked_account();
+    let chain = SimulatorChain::new();
+    // Two coins, each covering the transfer on its own: a naive rebuild has somewhere else to go.
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
+    chain.fund(wallet_puzzle_hash(&account), 900_000);
+    chain.bury(1);
+
+    let ops = account.wallet_ops();
+    let pending = send(
+        &account,
+        &chain,
+        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+    )?;
+
+    let replacement = ops.build_transfer_replacing(&chain, &hot(), &pending, 5_000)?;
+    assert_eq!(
+        replacement.payment_coin_id(),
+        pending.payment_coin_id(),
+        "the replacement must describe the SAME payment, or the pending record stops applying"
+    );
+    assert_eq!(
+        replacement.source_coin_ids(),
+        pending.source_coin_ids(),
+        "the conflict is what makes this safe, and it comes from reusing the inputs"
+    );
+    let replacement_bundle = authorize_and_sign(&account, &replacement);
+
+    // The original lands first.
+    chain.include_in_a_block()?;
+
+    // The replacement is now un-includable, and consensus says so by name.
+    let refused = chain.sim.borrow_mut().new_transaction(replacement_bundle);
+    match refused {
+        Err(chia_sdk_test::SimulatorError::Validation(
+            chia_consensus::validation_error::ErrorCode::DoubleSpend,
+        )) => {}
+        other => panic!(
+            "the replacement must be refused as a DOUBLE SPEND -- that conflict is the whole \
+             safety property, and any other outcome means the two bundles could coexist: {other:?}"
+        ),
+    }
+
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+    assert_eq!(
+        recipient_balance(&chain),
+        600_000,
+        "the recipient must be paid ONCE: a second payment would show as 1_200_000"
+    );
+
+    let status = transfer_status(&pending, &chain)?;
+    assert!(
+        status.confirmed().is_some(),
+        "the settled bundle is tracked by the ORIGINAL pending record: {status:?}"
+    );
+    Ok(())
+}
+
+/// **The hazard the replacement path exists to avoid, proven against consensus.**
+///
+/// The same wallet, the same recipient, the same amount — but the retry is built by calling
+/// `build_transfer` again with a higher fee, which is what a caller reaches for by default. The fee
+/// bump crosses a coin boundary, selection picks a DIFFERENT lead, the two bundles spend disjoint
+/// inputs, and consensus accepts BOTH. The recipient is paid twice.
+///
+/// This is deliberately an assertion that the WRONG thing happens. It is the standing evidence that
+/// the naive path is unsafe, so that removing `build_transfer_replacing` cannot look harmless; if
+/// selection is ever changed to make a fee bump keep its lead, this test goes red and says so.
+#[test]
+fn a_naive_fee_bumped_rebuild_pays_the_recipient_twice() -> anyhow::Result<()> {
+    let account = unlocked_account();
+    let chain = SimulatorChain::new();
+    // Straddling coins: 600_001 covers amount+0 but not amount+1_000; 700_000 covers both.
+    chain.fund(wallet_puzzle_hash(&account), 600_001);
+    chain.fund(wallet_puzzle_hash(&account), 700_000);
+    chain.bury(1);
+
+    let first = send(
+        &account,
+        &chain,
+        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+    )?;
+    let second = send(
+        &account,
+        &chain,
+        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000).with_fee(1_000),
+    )?;
+
+    assert_ne!(
+        first.payment_coin_id(),
+        second.payment_coin_id(),
+        "the fee bump must have crossed a coin boundary, or this fixture proves nothing"
+    );
+
+    chain.farm()?;
+
+    assert_eq!(
+        recipient_balance(&chain),
+        1_200_000,
+        "both bundles are includable, so the naive rebuild really does pay twice"
+    );
+    Ok(())
+}

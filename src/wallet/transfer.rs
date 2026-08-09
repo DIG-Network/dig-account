@@ -162,6 +162,70 @@ pub enum TransferError {
         reason: String,
     },
 
+    /// A source coin of the transfer being REPLACED is no longer confirmed-and-unspent, so the
+    /// original bundle's inputs can no longer be re-spent.
+    ///
+    /// Deliberately NOT [`InsufficientFunds`](Self::InsufficientFunds): the wallet's balance is not
+    /// the subject. Either the original transfer has already been included — in which case a
+    /// replacement would be a SECOND payment — or a different spend consumed the coin. Both demand a
+    /// fresh [`transfer_status`] read, not a bigger fee.
+    #[error(
+        "input coin {coin_id} of the transfer being replaced is no longer confirmed and unspent"
+    )]
+    SourcesNoLongerSpendable {
+        /// The coin that can no longer be spent.
+        coin_id: Bytes32,
+    },
+
+    /// A replacement transfer's fee does not exceed the fee it replaces.
+    ///
+    /// A bundle that does not outbid the one already in the mempool cannot displace it, so building
+    /// one produces a second bundle that will simply lose. That is a caller error worth naming rather
+    /// than a spend worth constructing.
+    #[error(
+        "a replacement must outbid the transfer it replaces: the current fee is {current} mojos and          the proposed fee is {proposed}"
+    )]
+    ReplacementFeeNotHigher {
+        /// The fee the original transfer carries.
+        current: u64,
+        /// The fee that was proposed for the replacement.
+        proposed: u64,
+    },
+
+    /// A coin at the wallet's puzzle hash carries NO confirmation height, so whether it is spendable
+    /// cannot be established and the balance cannot be judged.
+    ///
+    /// `confirmed_height: None` means "not known BY THIS SOURCE", never "does not exist". Treating it
+    /// as unspendable silently under-counts: a source that does not populate the field would make a
+    /// funded wallet report a zero balance and refuse every transfer it could afford. Refusing by name
+    /// tells the user the truth — the source cannot answer — instead of a false fact about their money.
+    #[error(
+        "coin {coin_id} has no confirmation height from this chain source, so its spendability is \
+         unknown and the balance cannot be judged"
+    )]
+    SpendabilityUnknown {
+        /// The coin whose confirmation height the source did not report.
+        coin_id: Bytes32,
+    },
+
+    /// A record returned for the wallet's puzzle hash describes a coin locked by a DIFFERENT puzzle.
+    ///
+    /// This builder is native-XCH only, and that is enforced rather than assumed. A CAT coin lives at
+    /// `CatArgs::curry_tree_hash(asset_id, p2)`, not at the wallet's own puzzle hash, so a chain
+    /// source that indexes by HINT rather than by puzzle hash — a plausible implementation, not a
+    /// contrived one — would feed CAT coins into selection. They would be counted as XCH mojos and
+    /// spent with a standard-layer puzzle reveal that cannot unlock them.
+    #[error(
+        "coin {coin_id} is locked by puzzle hash {puzzle_hash}, not this wallet's; a transfer spends \
+         only native XCH coins at the wallet's own puzzle hash"
+    )]
+    UnexpectedCoinPuzzleHash {
+        /// The offending coin.
+        coin_id: Bytes32,
+        /// The puzzle hash it is actually locked by.
+        puzzle_hash: Bytes32,
+    },
+
     /// The chain could NOT be reached or could not answer.
     ///
     /// The outcome is UNKNOWN, never "no": a coin that could not be read may well exist, and a status
@@ -369,6 +433,7 @@ impl TransferPlan {
             source_coin_ids: self.source_coin_ids.clone(),
             recipient: self.recipient,
             amount_mojos: self.amount_mojos,
+            fee_mojos: self.fee_mojos,
             pushed_at_height: pre_push_peak,
         }
     }
@@ -381,25 +446,34 @@ impl TransferPlan {
 /// when" — everything else must come from [`transfer_status`] and the chain. Making the wrong call
 /// unexpressible is stronger than documenting that it is wrong.
 ///
-/// # Not a bundle identity
+/// # Not a bundle identity, and a naive retry can pay TWICE
 ///
 /// [`payment_coin_id`](Self::payment_coin_id) identifies the PAYMENT, not the bundle that produced
 /// it. It is the id of a coin determined by `(lead input, recipient, amount)` and commits to neither
-/// the fee nor the change — and because selection is deterministic, a fee-bumped retry of the same
-/// transfer re-selects the same lead and yields the SAME id. Watching the original pending record
-/// will therefore report the retry's confirmation as its own.
+/// the fee nor the change.
 ///
-/// Be precise about what that is and is not. Both bundles spend the same lead coin, so at most one
-/// can ever be included and the recipient is paid exactly once — this is not a double payment. It is
-/// an ACCOUNTING hazard: a ledger that counts confirmations rather than deduping on
-/// `payment_coin_id` will record two settled payments where one occurred. Callers MUST dedupe on the
-/// id.
+/// A fee-bumped retry built by calling [`WalletOps::build_transfer`] again is NOT safe. Selection
+/// takes the smallest coin covering `amount + fee`, so raising the fee can cross a coin boundary and
+/// pick a DIFFERENT lead. The two bundles then spend disjoint inputs, do not conflict, can sit in the
+/// mempool together, and can BOTH confirm — the recipient is paid twice, out of two different coins,
+/// under two different payment coin ids.
+///
+/// [`WalletOps::build_transfer_replacing`] is the only correct retry: it re-spends EXACTLY the
+/// original inputs, so the lead is unchanged, `payment_coin_id` is identical, and the replacement
+/// genuinely conflicts with the original — at most one can ever be included.
+///
+/// What remains once the retry is built that way is an ACCOUNTING hazard rather than a double
+/// payment: the two bundles share a `payment_coin_id`, so watching the original pending record
+/// reports the replacement's confirmation as its own, and the two `ConfirmedTransfer` values compare
+/// equal. A ledger that counts confirmations rather than deduping on `payment_coin_id` will record
+/// two settled payments where one occurred. Callers MUST dedupe on the id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTransfer {
     payment_coin_id: Bytes32,
     source_coin_ids: Vec<Bytes32>,
     recipient: Bytes32,
     amount_mojos: u64,
+    fee_mojos: u64,
     pushed_at_height: u32,
 }
 
@@ -422,6 +496,14 @@ impl PendingTransfer {
     /// The amount this transfer was built to pay, in mojos.
     pub fn amount_mojos(&self) -> u64 {
         self.amount_mojos
+    }
+
+    /// The farmer fee this transfer was built with, in mojos.
+    ///
+    /// DESCRIPTIVE, like every other field here — it is what a replacement must outbid
+    /// ([`WalletOps::build_transfer_replacing`]), never evidence about the chain.
+    pub fn fee_mojos(&self) -> u64 {
+        self.fee_mojos
     }
 
     /// The chain's peak immediately before the push.
@@ -605,6 +687,122 @@ impl WalletOps {
         let selected = select_input_coins(chain, wallet.puzzle_hash(), required)?;
         build_transfer_spends(&wallet, &selected, request)
     }
+
+    /// Rebuild a pushed transfer at a HIGHER fee, re-spending EXACTLY the coins it already spends.
+    ///
+    /// # This exists because the obvious retry pays the recipient twice
+    ///
+    /// Calling [`build_transfer`](Self::build_transfer) again with a bigger fee re-runs selection,
+    /// and selection takes the smallest coin covering `amount + fee`. Raising the fee can cross a
+    /// coin boundary and choose a DIFFERENT lead, and two bundles spending disjoint inputs do not
+    /// conflict: both are valid, both can sit in the mempool, and both can be included. The recipient
+    /// is paid twice, out of two different coins.
+    ///
+    /// Re-spending the original inputs removes that possibility structurally rather than by warning.
+    /// The lead is unchanged, so the payment coin — `(lead, recipient, amount)` — keeps the SAME id
+    /// and the caller's existing [`PendingTransfer`] still describes what to watch; and because both
+    /// bundles spend the same coins, consensus can include at most one of them.
+    ///
+    /// # Errors
+    ///
+    /// [`TransferError::ReplacementFeeNotHigher`] when the new fee would not outbid the original, and
+    /// [`TransferError::SourcesNoLongerSpendable`] when an input can no longer be spent — which
+    /// usually means the ORIGINAL transfer has already been included, so a replacement would be a
+    /// second payment rather than a faster one. Neither is reported as a shortfall.
+    ///
+    /// [`TransferError::InsufficientFunds`] means something NARROWER here than it does in
+    /// [`build_transfer`](Self::build_transfer): its `available` is the total of the REUSED INPUTS,
+    /// not the wallet's balance, because a replacement may not reach for another coin — doing so is
+    /// the naive rebuild that pays the recipient twice. A transfer whose inputs were consumed exactly
+    /// therefore cannot be fee-bumped at all, and the honest remedy is to wait rather than to fund
+    /// the wallet further.
+    pub fn build_transfer_replacing<C>(
+        &self,
+        chain: &C,
+        custody: &CustodyPolicy,
+        pending: &PendingTransfer,
+        new_fee_mojos: u64,
+    ) -> TransferResult<TransferPlan>
+    where
+        C: ChainSource + ?Sized,
+    {
+        if let CustodyPolicy::Vault(_) = custody {
+            return Err(TransferError::VaultTransferUnsupported);
+        }
+        if new_fee_mojos <= pending.fee_mojos {
+            return Err(TransferError::ReplacementFeeNotHigher {
+                current: pending.fee_mojos,
+                proposed: new_fee_mojos,
+            });
+        }
+
+        let wallet = self.wallet_key();
+        let request = TransferRequest {
+            recipient: pending.recipient,
+            amount_mojos: pending.amount_mojos,
+            fee_mojos: new_fee_mojos,
+        };
+        let required = request.required_total()?;
+
+        // ORDER is preserved deliberately: `build_transfer_spends` takes the LAST coin as the lead,
+        // so re-reading the ids in the order the original plan recorded them is what keeps the lead —
+        // and therefore the payment coin id — identical.
+        let mut inputs = Vec::with_capacity(pending.source_coin_ids.len());
+        for coin_id in &pending.source_coin_ids {
+            inputs.push(reread_spendable_input(chain, &wallet, *coin_id)?);
+        }
+
+        let total = inputs
+            .iter()
+            .try_fold(0u64, |sum, coin: &Coin| sum.checked_add(coin.amount))
+            .ok_or(TransferError::BalanceUnjudgeable)?;
+        if total < required {
+            return Err(TransferError::InsufficientFunds {
+                required,
+                available: total,
+            });
+        }
+
+        build_transfer_spends(&wallet, &inputs, &request)
+    }
+}
+
+/// Re-read one input of a transfer being replaced, refusing anything that is not still spendable.
+///
+/// The record is re-checked against the id it is supposed to describe before anything is read out of
+/// it. A chain source may answer with a record for a DIFFERENT coin — an aggregating source is
+/// several nodes stitched together — and taking the coin from an unverified record would rebuild the
+/// bundle around inputs the wallet never selected.
+fn reread_spendable_input<C>(
+    chain: &C,
+    wallet: &WalletKey,
+    coin_id: Bytes32,
+) -> TransferResult<Coin>
+where
+    C: ChainSource + ?Sized,
+{
+    let record = chain
+        .coin_record(coin_id)
+        .map_err(|e| TransferError::ChainUnreachable(e.to_string()))?
+        .ok_or(TransferError::SourcesNoLongerSpendable { coin_id })?;
+
+    if record.coin.coin_id() != coin_id {
+        return Err(TransferError::ChainUnreachable(format!(
+            "the chain source answered a request for coin {} with a record for {}",
+            hex::encode(coin_id),
+            hex::encode(record.coin.coin_id())
+        )));
+    }
+    if record.confirmed_height.is_none() || record.is_spent() {
+        return Err(TransferError::SourcesNoLongerSpendable { coin_id });
+    }
+    if record.coin.puzzle_hash != wallet.puzzle_hash() {
+        return Err(TransferError::UnexpectedCoinPuzzleHash {
+            coin_id,
+            puzzle_hash: record.coin.puzzle_hash,
+        });
+    }
+    Ok(record.coin)
 }
 
 /// Ask the chain where `pending` stands.
@@ -717,8 +915,14 @@ where
 
 /// Picks the wallet coins to spend, using as FEW inputs as will cover `required`.
 ///
-/// A coin that is unconfirmed or already spent is not spendable, so it is neither selected NOR
-/// counted toward `available`: reporting it would tell the user they hold money they cannot move.
+/// A coin already SPENT is not spendable, so it is neither selected NOR counted toward `available`:
+/// reporting it would tell the user they hold money they cannot move.
+///
+/// A record this function cannot JUDGE is a different matter and is refused by name rather than
+/// skipped. `confirmed_height: None` means the source does not know
+/// ([`TransferError::SpendabilityUnknown`]), and a coin at a foreign puzzle hash is not native XCH
+/// ([`TransferError::UnexpectedCoinPuzzleHash`]). Silently dropping either would under-count the
+/// balance, which is the same lie about the user's money that `available` exists to prevent.
 ///
 /// # Fewest inputs, not smallest inputs
 ///
@@ -749,11 +953,29 @@ where
         .coin_records_by_puzzle_hash(puzzle_hash, false)
         .map_err(|e| TransferError::ChainUnreachable(e.to_string()))?;
 
-    let mut spendable: Vec<Coin> = records
-        .iter()
-        .filter(|record: &&CoinRecord| record.confirmed_height.is_some() && !record.is_spent())
-        .map(|record| record.coin)
-        .collect();
+    // Every returned record is VALIDATED, never silently skipped. A record this function cannot
+    // judge is a refusal by name: dropping it would under-count the balance and tell the user
+    // something false about their money, which is the failure mode `available` exists to prevent.
+    let mut spendable: Vec<Coin> = Vec::with_capacity(records.len());
+    for record in &records {
+        if record.coin.puzzle_hash != puzzle_hash {
+            return Err(TransferError::UnexpectedCoinPuzzleHash {
+                coin_id: record.coin.coin_id(),
+                puzzle_hash: record.coin.puzzle_hash,
+            });
+        }
+        // `None` means "this source does not know", not "unconfirmed". A spent coin, by contrast, is
+        // a fact the source HAS reported, so it is simply not spendable and needs no refusal.
+        let Some(_) = record.confirmed_height else {
+            return Err(TransferError::SpendabilityUnknown {
+                coin_id: record.coin.coin_id(),
+            });
+        };
+        if record.is_spent() {
+            continue;
+        }
+        spendable.push(record.coin);
+    }
     // Coin id breaks ties, so two coins of equal value are ordered by something stable rather than by
     // whatever order the chain source happened to answer in. CACHED, because the plain `sort_by_key`
     // re-invokes its closure on every comparison — and `coin_id()` is a SHA-256, so an attacker who
@@ -967,6 +1189,13 @@ mod tests {
         offline: bool,
         /// When set, EVERY `coin_record` query is answered with this record, whatever was asked for.
         answers_with: Option<CoinRecord>,
+        /// When set, `coin_records_by_puzzle_hash` answers with these records WITHOUT filtering.
+        ///
+        /// A source is not obliged to index by puzzle hash. One that indexes by HINT — plausible,
+        /// since the hint is what makes a coin discoverable by its owner — returns coins locked by
+        /// other puzzles, CAT coins among them. A double that filters by the requested puzzle hash
+        /// cannot answer that way, so it cannot exhibit the property the XCH-only guard is about.
+        answers_puzzle_hash_query_with: Option<Vec<CoinRecord>>,
     }
 
     impl FixedChain {
@@ -987,6 +1216,7 @@ mod tests {
                 peak: Some(PEAK),
                 offline: false,
                 answers_with: None,
+                answers_puzzle_hash_query_with: None,
             }
         }
 
@@ -996,6 +1226,7 @@ mod tests {
                 peak: Some(PEAK),
                 offline: false,
                 answers_with: None,
+                answers_puzzle_hash_query_with: None,
             }
         }
 
@@ -1010,12 +1241,19 @@ mod tests {
                 peak: Some(PEAK),
                 offline: true,
                 answers_with: None,
+                answers_puzzle_hash_query_with: None,
             }
         }
 
         /// Answer every `coin_record` query with `record`, regardless of the id asked for.
         fn answering_every_query_with(mut self, record: CoinRecord) -> Self {
             self.answers_with = Some(record);
+            self
+        }
+
+        /// Answer `coin_records_by_puzzle_hash` with `records`, without filtering by puzzle hash.
+        fn answering_puzzle_hash_query_with(mut self, records: Vec<CoinRecord>) -> Self {
+            self.answers_puzzle_hash_query_with = Some(records);
             self
         }
 
@@ -1075,6 +1313,9 @@ mod tests {
         ) -> std::result::Result<Vec<CoinRecord>, String> {
             if self.offline {
                 return self.unavailable();
+            }
+            if let Some(answer) = &self.answers_puzzle_hash_query_with {
+                return Ok(answer.clone());
             }
             Ok(self
                 .records
@@ -1254,17 +1495,16 @@ mod tests {
         );
     }
 
-    /// An unconfirmed or already-spent coin cannot fund a spend, so it is neither selected NOR
-    /// counted toward `available`. Reporting it would tell the user they hold money they cannot move.
+    /// An already-spent coin cannot fund a spend, so it is neither selected NOR counted toward
+    /// `available`. Reporting it would tell the user they hold money they cannot move.
     ///
-    /// The fixture holds 30_005 mojos in total and only 5 of them spendable, so an implementation
+    /// The fixture holds 20_005 mojos in total and only 5 of them spendable, so an implementation
     /// that filtered selection but not the reported balance fails on the number.
     #[test]
-    fn unconfirmed_and_spent_coins_are_neither_selected_nor_counted_as_available() {
+    fn spent_coins_are_neither_selected_nor_counted_as_available() {
         let ops = ops();
         let ph = ops.puzzle_hash();
         let chain = FixedChain::with_records(vec![
-            unconfirmed(Coin::new(Bytes32::new([1; 32]), ph, 10_000)),
             spent(Coin::new(Bytes32::new([2; 32]), ph, 20_000)),
             confirmed(Coin::new(Bytes32::new([3; 32]), ph, 5)),
         ]);
@@ -1286,6 +1526,118 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    /// **A coin with NO confirmation height makes the balance unjudgeable, and is refused by name
+    /// rather than dropped.**
+    ///
+    /// `dig-chainsource-interface` defines `confirmed_height: None` as "not known BY THIS SOURCE",
+    /// never "does not exist". A source that does not populate the field would therefore have every
+    /// coin skipped, and the user would be told `InsufficientFunds { available: 0 }` while holding a
+    /// funded wallet — a false statement about their money, produced by a source limitation.
+    ///
+    /// The fixture makes the difference visible: the unknown-height coin holds 10_000 mojos and the
+    /// request is for 1_000, which a SILENT DROP would answer with `InsufficientFunds`. Pinning the
+    /// variant is what separates "we cannot judge this" from "you do not have it".
+    #[test]
+    fn a_coin_with_no_confirmation_height_is_refused_rather_than_silently_dropped() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let unknown = Coin::new(Bytes32::new([1; 32]), ph, 10_000);
+        let chain = FixedChain::with_records(vec![unconfirmed(unknown)]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect_err("a source that cannot report a height cannot judge the balance");
+        assert!(
+            matches!(
+                error,
+                TransferError::SpendabilityUnknown { coin_id } if coin_id == unknown.coin_id()
+            ),
+            "{error}"
+        );
+    }
+
+    /// The truthful control: the SAME coin with a height DOES fund the transfer. Without it the
+    /// refusal above would be equally satisfied by a builder that refuses everything.
+    #[test]
+    fn the_same_coin_with_a_confirmation_height_funds_the_transfer() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let chain = FixedChain::with_records(vec![confirmed(Coin::new(
+            Bytes32::new([1; 32]),
+            ph,
+            10_000,
+        ))]);
+
+        assert!(ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+            )
+            .is_ok());
+    }
+
+    /// **A coin at a FOREIGN puzzle hash is refused by name — XCH-only is enforced, not emergent.**
+    ///
+    /// Nothing in the builder previously checked this; only the shape of the query kept other assets
+    /// out. A CAT coin lives at `CatArgs::curry_tree_hash(asset_id, p2)`, so a chain source that
+    /// indexes by HINT rather than by puzzle hash — plausible, not contrived — answers
+    /// `coin_records_by_puzzle_hash` with CAT coins the wallet can find but not unlock. They would be
+    /// counted as XCH mojos in `available` and spent with a standard-layer reveal.
+    ///
+    /// The fixture pairs one such coin with a genuine one, so a builder that merely skipped the
+    /// foreign coin would still build and this test would be silent about it.
+    #[test]
+    fn a_coin_at_a_foreign_puzzle_hash_is_refused_by_name() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let foreign_ph = Bytes32::new([0xCA; 32]);
+        let foreign = Coin::new(Bytes32::new([1; 32]), foreign_ph, 10_000);
+        let chain = FixedChain::with_records(Vec::new()).answering_puzzle_hash_query_with(vec![
+            confirmed(Coin::new(Bytes32::new([2; 32]), ph, 5_000)),
+            confirmed(foreign),
+        ]);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect_err("a coin this wallet's puzzle cannot unlock is not spendable value");
+        assert!(
+            matches!(
+                error,
+                TransferError::UnexpectedCoinPuzzleHash { coin_id, puzzle_hash }
+                    if coin_id == foreign.coin_id() && puzzle_hash == foreign_ph
+            ),
+            "{error}"
+        );
+    }
+
+    /// The truthful control: the SAME fixture with both coins at the wallet's own puzzle hash builds.
+    #[test]
+    fn the_same_coins_all_at_the_wallets_puzzle_hash_build() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let chain = FixedChain::with_records(Vec::new()).answering_puzzle_hash_query_with(vec![
+            confirmed(Coin::new(Bytes32::new([2; 32]), ph, 5_000)),
+            confirmed(Coin::new(Bytes32::new([1; 32]), ph, 10_000)),
+        ]);
+
+        assert!(ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000)
+            )
+            .is_ok());
     }
 
     /// The truthful control: the SAME amounts, all confirmed and unspent, DO fund the transfer.
@@ -1784,6 +2136,312 @@ mod tests {
         assert!(
             displayed.starts_with(MAINNET_ADDRESS_PREFIX),
             "the displayed address must bear the one prefix: {displayed}"
+        );
+    }
+
+    // ------------------------------------------------------------------- fee-bump replacement
+
+    /// **THE DEFECT, pinned so it cannot silently return.** Two plans built by the ORDINARY
+    /// `build_transfer` path at fees that straddle a coin boundary select DIFFERENT leads.
+    ///
+    /// Selection takes the smallest coin covering `amount + fee`. With coins of 1_000 and 1_200 and
+    /// an amount of 1_000, a fee of 0 needs 1_000 and takes the 1_000 coin; a fee of 100 needs 1_100
+    /// and takes the 1_200 coin. The two bundles spend DISJOINT inputs, so they do not conflict,
+    /// both are valid, and both can be included — paying the recipient twice.
+    ///
+    /// This test asserts the hazard rather than the fix. If selection is ever changed so that a fee
+    /// bump keeps the lead, this goes red and the reason `build_transfer_replacing` exists should be
+    /// re-examined; until then it is the standing proof that a naive retry is unsafe.
+    #[test]
+    fn a_naive_fee_bump_can_select_a_different_lead_and_pay_twice() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000, 1_200]);
+
+        let original = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect("builds");
+        let naive_retry = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(100),
+            )
+            .expect("builds");
+
+        assert_ne!(
+            original.source_coin_ids(),
+            naive_retry.source_coin_ids(),
+            "the fee bump must cross a coin boundary, or this fixture proves nothing"
+        );
+        assert_ne!(
+            original.payment_coin_id(),
+            naive_retry.payment_coin_id(),
+            "disjoint inputs mean two payment coins, so BOTH bundles can confirm"
+        );
+    }
+
+    /// The fix: a replacement re-spends EXACTLY the original inputs, so the lead — and therefore the
+    /// payment coin id — is unchanged, and the two bundles conflict rather than coexist.
+    ///
+    /// The wallet holds a coin with HEADROOM over the amount, because the extra fee has to come from
+    /// somewhere: reusing the same inputs means the bump is paid out of the change, never out of the
+    /// recipient's amount. The exact-cover case is a legitimate refusal and is pinned separately.
+    #[test]
+    fn a_replacement_reuses_the_exact_inputs_and_keeps_the_payment_coin_id() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_500, 5_000]);
+
+        let original = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect("builds");
+        let pending = original.pushed_at(PEAK);
+
+        let replacement = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 100)
+            .expect("a higher fee over the same inputs");
+
+        assert_eq!(
+            replacement.source_coin_ids(),
+            original.source_coin_ids(),
+            "a replacement must re-spend exactly the coins the original spends"
+        );
+        assert_eq!(
+            replacement.payment_coin_id(),
+            original.payment_coin_id(),
+            "the same lead yields the same payment coin, so the pending record still applies"
+        );
+        assert_eq!(replacement.fee_mojos(), 100);
+        assert_eq!(replacement.amount_mojos(), original.amount_mojos());
+        assert_eq!(replacement.recipient(), original.recipient());
+        assert_eq!(
+            replacement.change_mojos(),
+            original.change_mojos() - 100,
+            "the extra fee comes out of the change, never out of the recipient"
+        );
+    }
+
+    /// **A replacement whose reused inputs cannot cover the higher fee is refused, and `available`
+    /// names the REUSED INPUTS rather than the wallet.**
+    ///
+    /// The original here consumes its lead exactly (1_000 mojos, no fee, no change), so there is no
+    /// headroom to raise a fee from. The wallet does hold more money — a 1_200 coin — and spending it
+    /// is exactly what a replacement must NOT do: pulling in a different input is the naive rebuild
+    /// that pays twice. So the refusal is correct, and the number it reports is deliberately the
+    /// total of the reused inputs.
+    ///
+    /// The honest remedy for a caller is to wait, not to top up: a transfer whose inputs are consumed
+    /// exactly cannot be fee-bumped at all without becoming a different transfer.
+    #[test]
+    fn a_replacement_the_reused_inputs_cannot_cover_is_refused_with_their_total() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000, 1_200]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        let error = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 100)
+            .expect_err("an exactly-consumed input has no headroom for a bigger fee");
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds {
+                    required: 1_100,
+                    available: 1_000
+                }
+            ),
+            "available must be the reused inputs' total, not the wallet's 2_200: {error}"
+        );
+    }
+
+    /// A replacement that does not OUTBID the original is refused by name. It could not displace the
+    /// bundle already in the mempool, so building one produces a second bundle that simply loses.
+    #[test]
+    fn a_replacement_fee_that_does_not_outbid_is_refused_by_name() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        for proposed in [0u64, 49, 50] {
+            let error = ops
+                .build_transfer_replacing(&chain, &hot(), &pending, proposed)
+                .expect_err("a replacement must outbid the transfer it replaces");
+            assert!(
+                matches!(
+                    error,
+                    TransferError::ReplacementFeeNotHigher { current: 50, proposed: p } if p == proposed
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    /// The bound from the other side: ONE mojo above the original fee IS accepted. Without this the
+    /// refusal above would be satisfied by a method that refuses every replacement.
+    #[test]
+    fn a_replacement_fee_one_mojo_higher_is_accepted() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        let replacement = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 51)
+            .expect("one mojo more is a higher bid");
+        assert_eq!(replacement.fee_mojos(), 51);
+    }
+
+    /// **A source coin that is no longer spendable is refused BY NAME, never as a shortfall.**
+    ///
+    /// The likeliest cause is the one that matters: the ORIGINAL transfer has already been included,
+    /// so its inputs are spent. A replacement built anyway would be a SECOND payment, and reporting
+    /// this as `InsufficientFunds` would send the user to top up their wallet and try again — which
+    /// is precisely the action that pays twice.
+    #[test]
+    fn a_replacement_over_a_spent_input_is_refused_by_name() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let original = ops
+            .build_transfer(
+                &source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds");
+        let pending = original.pushed_at(PEAK);
+        let input = source.records[0].coin;
+
+        let consumed = FixedChain::with_records(vec![spent(input)]);
+        let error = ops
+            .build_transfer_replacing(&consumed, &hot(), &pending, 100)
+            .expect_err("a spent input cannot be re-spent");
+        assert!(
+            matches!(
+                error,
+                TransferError::SourcesNoLongerSpendable { coin_id } if coin_id == input.coin_id()
+            ),
+            "{error}"
+        );
+
+        // The same refusal when the coin has vanished from the source entirely.
+        let absent = FixedChain::with_records(Vec::new());
+        let error = ops
+            .build_transfer_replacing(&absent, &hot(), &pending, 100)
+            .expect_err("an input the source no longer reports cannot be re-spent");
+        assert!(
+            matches!(
+                error,
+                TransferError::SourcesNoLongerSpendable { coin_id } if coin_id == input.coin_id()
+            ),
+            "{error}"
+        );
+    }
+
+    /// The truthful control: the SAME pending transfer over the SAME still-spendable input builds.
+    /// Without it the refusals above could be a method that never succeeds.
+    #[test]
+    fn a_replacement_over_a_still_spendable_input_builds() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let pending = ops
+            .build_transfer(
+                &source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        assert!(ops
+            .build_transfer_replacing(&source, &hot(), &pending, 100)
+            .is_ok());
+    }
+
+    /// A chain source that answers a re-read with a record for a DIFFERENT coin is a contract
+    /// violation, and the replacement fails CLOSED rather than rebuilding around a coin the wallet
+    /// never selected. `SourcesNoLongerSpendable` would be the wrong answer: nothing is known to be
+    /// unspendable, the source simply did not answer the question asked.
+    #[test]
+    fn a_replacement_refuses_a_record_for_a_different_coin() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let pending = ops
+            .build_transfer(
+                &source,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        let impostor = confirmed(Coin::new(
+            Bytes32::new([0xAB; 32]),
+            ops.puzzle_hash(),
+            10_000,
+        ));
+        let chain = FixedChain::with_records(Vec::new()).answering_every_query_with(impostor);
+
+        let error = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 100)
+            .expect_err("a record about another coin answers nothing about this input");
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "{error}"
+        );
+    }
+
+    /// A vault-tier profile cannot replace a transfer either — the tier rule is about the profile,
+    /// not about which builder was called.
+    #[test]
+    fn a_vault_profile_cannot_build_a_replacement() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[10_000]);
+        let pending = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 1_000).with_fee(50),
+            )
+            .expect("builds")
+            .pushed_at(PEAK);
+
+        let error = ops
+            .build_transfer_replacing(
+                &chain,
+                &CustodyPolicy::Vault(Vault::default()),
+                &pending,
+                100,
+            )
+            .expect_err("a vault profile cannot pay a third party by any route");
+        assert!(
+            matches!(error, TransferError::VaultTransferUnsupported),
+            "{error}"
         );
     }
 
