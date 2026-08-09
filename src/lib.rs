@@ -4,8 +4,8 @@
 //! encapsulation of everything an account can do.
 //!
 //! An **Account** is one master seed plus one or more **Profiles** (exactly one default). A
-//! **Profile** is a DID + dig-store + SMT-of-profile-info (dig-social-profile's `IdentityProfile`),
-//! minted and signed with the account seed's key at that profile index.
+//! **Profile** is a DID + dig-store + SMT-of-profile-info, minted and signed with the account
+//! seed's key at that profile index and recorded as a [`registry::ProfileAnchor`].
 //!
 //! This crate owns the object model, the unlock policy + keystore crypto, the in-process
 //! identity+money signer, per-profile key/DEK derivation, the on-chain **DID mint**, and all wallet
@@ -92,7 +92,7 @@ pub use wallet::clock::{Clock, FixedClock, SystemClock};
 pub use wallet::enforcer::PolicyAuthorizer;
 pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};
 pub use wallet::policy::{CustodyPolicy, HotWallet, Vault};
-pub use wallet::summary::{SpendRecipient, SpendSummary, SpendTier};
+pub use wallet::summary::{SpendDestination, SpendRecipient, SpendSummary, SpendTier};
 pub use wallet::transfer::{
     transfer_status, ConfirmedTransfer, PayableDestination, PendingTransfer, TransferError,
     TransferPlan, TransferRequest, TransferResult, TransferStatus, MAX_TRANSFER_INPUT_COINS,

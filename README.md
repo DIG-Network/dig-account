@@ -4,7 +4,7 @@ The DIG Network **user Account** crate — the fat, strictly-logical (headless, 
 of everything an account does.
 
 An **Account** = one master seed + one or more **Profiles** (exactly one default). A **Profile** =
-a DID + dig-store + SMT-of-profile-info (dig-social-profile `IdentityProfile`), minted and signed
+a DID + dig-store + SMT-of-profile-info, recorded as a `ProfileAnchor`, minted and signed
 with the account seed's key at that profile index.
 
 This crate owns the object model, unlock policy + keystore crypto, the in-process identity+money

@@ -53,11 +53,17 @@
 //! **A [`SpendSummary`] counts every output by DESTINATION, never by hint status** — so this
 //! paragraph's former warning (that an un-hinted output was invisible to every amount limit) no
 //! longer holds, and neither does any custody claim built on it. An output is weighed unless it pays
-//! a puzzle hash the spend is itself spending from. The signer's change-ownership check remains a
-//! required second layer, because this one bounds how MUCH value leaves while that one bounds where
-//! it may go; `an_unhinted_output_to_an_owned_derivation_is_counted_not_hidden` and
-//! `refuses_to_sign_unhinted_value_leaving_the_wallet_even_when_the_policy_approves` pin the two
-//! halves.
+//! a puzzle hash the spend is itself spending from.
+//!
+//! **This authorizer is the SINGLE layer enforcing WHERE value may go** — destination only; the
+//! signer's own guarantees (value conservation, quote-form delegated puzzles, a sole `AGG_SIG_ME`
+//! per coin) are unaffected. The money signer no longer refuses an output
+//! that does not return to this wallet — `dig-wallet-backend` 0.27 classifies one as a recipient
+//! instead of rejecting it — so nothing here may lean on a second check downstream. Each charged
+//! destination is decided by its tier: [`SpendTier::Vault`] denies any destination that is not the
+//! hot wallet's puzzle hash, whatever the amount; [`SpendTier::AutoSend`] bounds it by the
+//! per-transaction limit and the rolling-period cap; [`SpendTier::Confirm`] renders it for approval.
+//! `an_unhinted_output_to_an_owned_derivation_is_counted_not_hidden` pins the counting half.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -71,7 +77,7 @@ use crate::wallet::approval::{PendingApproval, SpendApproval, SpendRuling};
 use crate::wallet::autosend::{AutoSendPolicy, SpendOpClass, MAX_LEDGER_ENTRIES};
 use crate::wallet::clock::Clock;
 use crate::wallet::policy::{CustodyPolicy, CustodyScope};
-use crate::wallet::summary::{DerivedSpend, SpendSummary, SpendTier};
+use crate::wallet::summary::{DerivedSpend, SpendDestination, SpendSummary, SpendTier};
 
 /// One auto-approved spend, recorded so the rolling period cap can be measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,11 +222,26 @@ impl PolicyAuthorizer {
     /// The rule is stated over the CLASS of destination, not over a particular hostile one: EVERY
     /// recipient must be the hot wallet, so a spend that pays the hot wallet AND a third party is
     /// refused, as is one that pays a recipient whose address cannot be decoded at all.
+    ///
+    /// A [`ProtocolStructure`](SpendDestination::ProtocolStructure) line is DENIED by name rather
+    /// than run through the address decoder. The two verdicts differ in what they claim: committing
+    /// vault funds to the offer settlement puzzle or a singleton launcher is a destination this rule
+    /// understands perfectly well and forbids, whereas "indeterminate" would say the gate could not
+    /// tell — which would be false, and would invite a host to treat a known-forbidden spend as a
+    /// gap in the policy.
     fn reject_vault_outflow_to_anyone_but_the_hot_wallet(
         &self,
         summary: &SpendSummary,
     ) -> Result<()> {
         for recipient in &summary.recipients {
+            if recipient.destination == SpendDestination::ProtocolStructure {
+                return Err(AccountError::PolicyDenied(format!(
+                    "a vault spend may only pay this profile's own hot wallet, but this one commits \
+                     value to {}; move the funds vault -> hot wallet through the 24h clawback \
+                     window first",
+                    recipient.address
+                )));
+            }
             let address = Address::decode(&recipient.address).map_err(|e| {
                 AccountError::PolicyIndeterminate(format!(
                     "a vault spend pays {:?}, which is not a decodable address ({e}), so it cannot \
@@ -278,7 +299,6 @@ impl PolicyAuthorizer {
             CapVerdict::Charged => Ok(SpendRuling::Approved(SpendApproval::new(
                 coin_spends.to_vec(),
                 derived.summary,
-                derived.verified,
                 self.scope,
             ))),
             CapVerdict::OverCap => self.escalate(coin_spends, derived),
@@ -400,7 +420,6 @@ impl PolicyAuthorizer {
         Ok(SpendRuling::RequiresConfirmation(PendingApproval::new(
             coin_spends.to_vec(),
             derived.summary,
-            derived.verified,
             self.scope,
         )))
     }
@@ -457,7 +476,7 @@ mod tests {
     use crate::wallet::autosend::{OpClassLimits, DEFAULT_PERIOD_SECONDS};
     use crate::wallet::clock::{FixedClock, UnreadableClock};
     use crate::wallet::policy::{HotWallet, Vault};
-    use crate::wallet::summary::SpendRecipient;
+    use crate::wallet::summary::{SpendDestination, SpendRecipient};
     use chia_protocol::Coin;
     use chia_puzzle_types::Memos;
     use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
@@ -500,10 +519,18 @@ mod tests {
     /// A conserving standard-layer spend of a wallet-owned coin, paying each `(puzzle_hash, amount)`
     /// as a HINTED output plus `fee`.
     ///
-    /// Hinting matters: `dig-wallet-backend`'s re-derivation files an UN-hinted output as change and
-    /// excludes it from the recipient list, so an un-hinted fixture would be invisible to every amount
-    /// limit and a test built on one would prove nothing about the limits. The input coin is exactly
-    /// the total, so there is no change output to muddy what the gate sees.
+    /// Hinting here is a FIXTURE CONVENTION, not a requirement for the limits to see the value.
+    /// `dig-wallet-backend` 0.27 returns outputs UNDIVIDED — it draws no hinted/un-hinted split, because
+    /// that split is key-relative and it holds no key — and this gate charges by DESTINATION, never by
+    /// hint status. So an UN-HINTED fixture is charged by exactly the same rule.
+    ///
+    /// **Write the un-hinted fixture when the property calls for it.** Un-hinted is the #1702 attack
+    /// shape, and `an_unhinted_output_to_an_owned_derivation_is_counted_not_hidden` is built on one
+    /// precisely because it must be. An earlier version of this comment claimed such a fixture would be
+    /// invisible to the limits; believing it would steer every new test toward the hinted shape and
+    /// leave the adversarial one unwritten.
+    ///
+    /// The input coin is exactly the total, so there is no change output to muddy what the gate sees.
     ///
     /// **This is the whole point of the 0.5.0 shape in fixture form:** the gate is handed spends, so a
     /// test cannot describe a spend as something it is not — every amount asserted below is an amount
@@ -574,7 +601,8 @@ mod tests {
             let hint = issue_ctx.hint(wallet_ph).unwrap();
             let issue = Conditions::new().create_coin(wallet_ph, amount, hint);
             let (_, cats) =
-                Cat::issue_with_coin(&mut issue_ctx, genesis.coin_id(), amount, issue).unwrap();
+                Cat::single_issuance(&mut issue_ctx, genesis.coin_id(), None, amount, issue)
+                    .unwrap();
             cats[0]
         };
 
@@ -805,6 +833,55 @@ mod tests {
     /// the gate DERIVES the addresses it compares (from puzzle hashes, via the wallet backend), so no
     /// caller can present it an undecodable one. The rule is still reachable by any future caller that
     /// hands it a summary from elsewhere, so its failure arm stays tested where it can be reached.
+    /// **A vault spend that commits value to a protocol structure is DENIED, not called
+    /// indeterminate.**
+    ///
+    /// The distinction is the point. Both verdicts refuse the spend, so a test asserting only
+    /// `is_err()` would pass against either — and against a version that never learned about
+    /// protocol structures at all, since a structure NAME does not decode as an address and would
+    /// fall through to the indeterminate arm by accident. Pinning the variant is what makes the
+    /// explicit branch load-bearing.
+    ///
+    /// The truthful control is the hot-wallet line beside it: the same summary carrying a legitimate
+    /// destination passes, so the refusal is the structure being rejected rather than the rule
+    /// rejecting everything.
+    #[test]
+    fn a_vault_spend_committing_value_to_a_protocol_structure_is_denied() {
+        let gate = gate_with(vault_custody(), permissive_auto_send());
+        let summary = SpendSummary::new(
+            SpendTier::Vault,
+            vec![SpendRecipient {
+                address: "the singleton launcher".to_string(),
+                amount_mojos: 500,
+                asset_id: None,
+                destination: SpendDestination::ProtocolStructure,
+            }],
+            0,
+        );
+
+        let err = gate
+            .reject_vault_outflow_to_anyone_but_the_hot_wallet(&summary)
+            .unwrap_err();
+
+        assert!(
+            matches!(err, AccountError::PolicyDenied(ref message) if message.contains("the singleton launcher")),
+            "a structural commitment is a destination the gate understands and forbids: {err}"
+        );
+
+        let permitted = SpendSummary::new(
+            SpendTier::Vault,
+            vec![SpendRecipient {
+                address: hot_wallet().address().unwrap(),
+                amount_mojos: 500,
+                asset_id: None,
+                destination: SpendDestination::Address,
+            }],
+            0,
+        );
+        gate.reject_vault_outflow_to_anyone_but_the_hot_wallet(&permitted)
+            .expect("the profile's own hot wallet is the one permitted destination");
+    }
+
     #[test]
     fn a_vault_recipient_with_an_undecodable_address_is_indeterminate() {
         let gate = gate_with(vault_custody(), permissive_auto_send());
@@ -816,6 +893,7 @@ mod tests {
                     address: address.to_string(),
                     amount_mojos: 500,
                     asset_id: None,
+                    destination: SpendDestination::Address,
                 }],
                 0,
             );
@@ -836,6 +914,7 @@ mod tests {
                 address: hot,
                 amount_mojos: 500,
                 asset_id: None,
+                destination: SpendDestination::Address,
             }],
             0,
         );
@@ -1285,7 +1364,8 @@ mod tests {
             let hint = issue_ctx.hint(wallet_ph).unwrap();
             let issue = Conditions::new().create_coin(wallet_ph, CAT_UNITS, hint);
             let (_, cats) =
-                Cat::issue_with_coin(&mut issue_ctx, genesis.coin_id(), CAT_UNITS, issue).unwrap();
+                Cat::single_issuance(&mut issue_ctx, genesis.coin_id(), None, CAT_UNITS, issue)
+                    .unwrap();
             cats[0]
         };
         let wrapper_hash = cat.coin.puzzle_hash;
@@ -1774,12 +1854,15 @@ mod tests {
     /// **The value the gate charges is the value that LEAVES — the author cannot shrink it by
     /// omitting a memo.**
     ///
-    /// This is the #1702 exploit, and the fixture is built so that the *only* thing that can refuse it
-    /// is the rule under test. The destination is `ProfileIx(1)` of the spender's OWN seed: an address
-    /// `owns_puzzle_hash` accepts, inside the signer's `0..address_gap` window. So the downstream
-    /// "change must be wallet-owned" check — the thing that refused the previous version of this test,
-    /// where the destination was a stranger — is silent here by construction. Aim the same 999 mojos at
-    /// a stranger and it is impossible to tell which layer refused.
+    /// This is the #1702 exploit, and the rule under test is now the ONLY thing that can refuse it.
+    /// `dig-wallet-backend` 0.27 removed the signer-side "change must be wallet-owned" refusal (it files
+    /// a non-owned output as a recipient instead), so there is no second layer here to isolate against —
+    /// see this module's header, and dig_ecosystem#2516 for the decision about re-asserting one.
+    ///
+    /// The destination stays `ProfileIx(1)` of the spender's OWN seed, but for a different reason than
+    /// it was first chosen: an owned derivation is the case where the value demonstrably could have been
+    /// filed as change, so charging it anyway is precisely what pins the COUNTING rule. A stranger
+    /// destination would be charged by the same rule and prove less, not more.
     ///
     /// Before the fix, `analyze` filed the un-hinted output as CHANGE, `recipients` was empty, the
     /// summary read "no recipients, fee 1", the ledger was charged **1**, and the signature authorized
@@ -1798,7 +1881,9 @@ mod tests {
             .spend(
                 &mut ctx,
                 Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
-                // No memo: `analyze` files this as change, so a hinted-recipient sum cannot see it.
+                // No memo — the #1702 shape. Under dig-wallet-backend 0.27 `analyze` returns outputs
+                // undivided, so this is charged by DESTINATION regardless of hint status; that it is
+                // counted anyway is the property under test.
                 Conditions::new()
                     .create_coin(attacker_owned, 999, Memos::None)
                     .reserve_fee(1),
@@ -1930,7 +2015,8 @@ mod tests {
     ///
     /// The exploit above is a hot-wallet one: omitting a memo shrank the CHARGED total. The vault arm
     /// fails differently and worse. `reject_vault_outflow_to_anyone_but_the_hot_wallet` iterates
-    /// `summary.recipients`, so while that list held only HINTED outputs, a vault spend paying a
+    /// `summary.recipients`, and while that list HELD ONLY HINTED OUTPUTS — it no longer does, since
+    /// dig-wallet-backend 0.27 returns outputs undivided — a vault spend paying a
     /// stranger with no memo presented an EMPTY recipient list: the destination rule looped zero times
     /// and returned `Ok`, the spend escalated as if it were an ordinary vault move, and the 24-hour
     /// clawback window — the entire reason the rule exists — never applied to it.
@@ -1954,8 +2040,9 @@ mod tests {
             .spend(
                 &mut ctx,
                 Coin::new(Bytes32::new([1u8; 32]), spender().puzzle_hash(), 1_000),
-                // No memo. `analyze` files this under `change`, which is precisely how it used to
-                // slip past a destination rule that only ever read `recipients`.
+                // No memo. This used to be filed under `change` and so slipped past a destination rule
+                // that only ever read `recipients`; dig-wallet-backend 0.27 draws no such split, and the
+                // rule reads every charged destination. That it is refused anyway is the property here.
                 Conditions::new()
                     .create_coin(stranger, 999, Memos::None)
                     .reserve_fee(1),
@@ -2067,12 +2154,15 @@ mod tests {
     /// is the smallest pair that both overflows and lands back on a plausible coin amount, so the
     /// test cannot pass merely because the numbers were too big to be believed.
     ///
-    /// Requires `dig-wallet-backend` >= 0.16.1, where all four accumulation sites route through a
-    /// fallible `accumulate`. Pinned by EXECUTION against 0.16.0, where it fails in both build
-    /// profiles for the same underlying reason: debug panics on the unchecked `+=` at
-    /// `client/verify.rs:165`, release wraps and the gate returns an approval. That version
-    /// difference is the whole content of the guarantee, which is why the dependency floor is
-    /// `0.16.1` and not `0.16`.
+    /// Requires `dig-wallet-backend` >= 0.16.1, where every accumulation site routes through a
+    /// fallible `accumulate`; re-confirmed against 0.27, which has fourteen such sites and no
+    /// unchecked `+=` on any ledger total. It was originally pinned by EXECUTION against 0.16.0,
+    /// where it failed in both build profiles for the same underlying reason: debug panicked on the
+    /// unchecked `+=`, release wrapped and the gate returned an approval.
+    ///
+    /// That 0.16.0 execution is no longer repeatable — the version predates the API this crate now
+    /// compiles against — so the floor is now the ordinary semver minimum rather than an exact pin.
+    /// The property itself is unchanged and still asserted here from both sides.
     #[test]
     fn a_spend_whose_output_amounts_overflow_is_never_approved() {
         let gate = gate_with(hot_custody(), permissive_auto_send());

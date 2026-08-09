@@ -10,11 +10,13 @@
 //!
 //! # Why every output counts, hinted or not
 //!
-//! `analyze` splits created coins into HINTED "recipients" and un-hinted "change". Summarizing only
-//! the hinted half would make the summary a view **the spend's author chooses what appears in**:
-//! dropping a memo moves an output out of sight, and with it out of the amount limits, out of the
-//! vault's destination rule, and out of the line the human confirms. A one-mojo fee could then be
-//! displayed and charged while the signature authorized six orders of magnitude more.
+//! `analyze` reports created coins UNDIVIDED — it performs no recipient-vs-change split at all,
+//! because that split is key-relative and it holds no key. An earlier version of it split on the
+//! memo HINT, and summarizing only the hinted half would have made the summary a view **the spend's
+//! author chooses what appears in**: dropping a memo moves an output out of sight, and with it out
+//! of the amount limits, out of the vault's destination rule, and out of the line the human
+//! confirms. A one-mojo fee could then be displayed and charged while the signature authorized six
+//! orders of magnitude more. This crate never leaned on that split, and now there is none to lean on.
 //!
 //! So a [`SpendSummary`] counts **every** created coin except those paying a **proven p2 destination
 //! of this very spend** — a puzzle hash shown to be a bare
@@ -44,6 +46,21 @@
 //! wallet is counted, because this layer holds no key and cannot tell that address from a stranger's.
 //! Over-counting escalates a spend to the human; under-counting approves one. Only the latter is a
 //! custody failure.
+//!
+//! # Value committed to a protocol structure is COUNTED, and NAMED rather than addressed
+//!
+//! `analyze` files separately any output committed to a consensus-enforced structural puzzle — the
+//! offer settlement puzzle or the singleton launcher. Such value genuinely LEAVES the wallet, so it is
+//! counted exactly like a recipient: it lands in [`SpendSummary::recipients`], it is weighed by
+//! [`native_total_mojos`](SpendSummary::native_total_mojos), and it faces every amount limit. The
+//! alternative — a third bucket outside the totals — is how a spend comes to be approved for less than
+//! it moves, which is the un-hinted-output defect wearing a better name.
+//!
+//! What must NOT be copied from a recipient is its ADDRESS. A launcher hash is not a payable
+//! destination and has no `xch1…` form worth showing; rendering one would present a structural
+//! constant as though a human had chosen to pay it. So every line carries a [`SpendDestination`]
+//! saying which it is, and a protocol-structure line NAMES the structure instead. A destination rule
+//! (the vault's) then refuses such a line outright rather than decoding a name into an address.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -51,27 +68,78 @@ use std::fmt;
 use chia_protocol::{Bytes32, CoinSpend};
 use chia_puzzle_types::standard::StandardArgs;
 use chia_wallet_sdk::driver::{Layer, Puzzle, StandardLayer};
+use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_wallet_sdk::utils::Address;
 use clvmr::serde::node_from_bytes;
 use clvmr::Allocator;
 use dig_wallet_backend::client::{analyze, DecodedOutput, SpendEffect};
-use dig_wallet_backend::types::{Amount, AssetId, SpendOutput, TransactionSummary};
 
 use crate::error::{AccountError, Result};
 use crate::wallet::policy::CustodyPolicy;
 
-/// One recipient line of a spend: where value goes, how much, and in which asset.
+/// What kind of destination a summary line pays — the one thing a confirm surface must not guess.
 ///
-/// Carries `(address, amount_mojos, asset_id)` in a named shape so a confirm surface (or an agent
-/// reading the request) never has to guess field order. `asset_id = None` denotes native XCH.
+/// Both kinds are rendered from the same fields and mean different things, and conflating them is a
+/// money lie in either direction: showing a structural constant as a chosen address invents an intent
+/// nobody had, and omitting the structural line entirely under-reports what the signature authorizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SpendDestination {
+    /// A chosen, payable address. [`SpendRecipient::address`] is its `xch1…` bech32m form.
+    Address,
+    /// A consensus-enforced structural puzzle the spend commits value to — the offer settlement
+    /// puzzle or the singleton launcher. There is no address to show, so
+    /// [`SpendRecipient::address`] NAMES the structure and MUST NOT be parsed as an address.
+    ProtocolStructure,
+}
+
+/// One line of a spend: where value goes, how much, and in which asset.
+///
+/// Carries `(address, amount_mojos, asset_id, destination)` in a named shape so a confirm surface (or
+/// an agent reading the request) never has to guess field order. `asset_id = None` denotes native XCH.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SpendRecipient {
-    /// The destination `xch1…` bech32m address.
+    /// Where the value goes, as it should be SHOWN: an `xch1…` bech32m address when
+    /// [`destination`](Self::destination) is [`Address`](SpendDestination::Address), and the NAME of
+    /// the structure when it is [`ProtocolStructure`](SpendDestination::ProtocolStructure).
     pub address: String,
     /// The amount sent, in mojos (native XCH) or the asset's base units (a CAT).
     pub amount_mojos: u64,
     /// The CAT asset id (tail hash, lowercase hex) the amount is denominated in; `None` = native XCH.
     pub asset_id: Option<String>,
+    /// Whether [`address`](Self::address) is a payable address or the name of a protocol structure.
+    pub destination: SpendDestination,
+}
+
+impl SpendRecipient {
+    /// One line paying a chosen, payable address.
+    pub fn to_address<A, S>(address: A, amount_mojos: u64, asset_id: Option<S>) -> Self
+    where
+        A: Into<String>,
+        S: Into<String>,
+    {
+        Self {
+            address: address.into(),
+            amount_mojos,
+            asset_id: asset_id.map(Into::into),
+            destination: SpendDestination::Address,
+        }
+    }
+
+    /// One line committing value to a named protocol structure.
+    pub fn to_protocol_structure<A, S>(structure: A, amount_mojos: u64, asset_id: Option<S>) -> Self
+    where
+        A: Into<String>,
+        S: Into<String>,
+    {
+        Self {
+            address: structure.into(),
+            amount_mojos,
+            asset_id: asset_id.map(Into::into),
+            destination: SpendDestination::ProtocolStructure,
+        }
+    }
 }
 
 /// How a spend must be handled under the profile's custody policy — the friction tier the confirm
@@ -158,21 +226,23 @@ impl SpendSummary {
 
     /// Project the driver's re-parse into this crate's display/policy view, tagged with `tier`.
     ///
-    /// Recipients and change are treated ALIKE and filtered by DESTINATION: an output is counted unless
-    /// it pays a [`p2_destinations`] member — a puzzle hash PROVEN to be a payable address of this
-    /// spend. Everything else is counted, including every wrapper layer's hash, because value sent
-    /// there has left the spender's control (see the module docs).
+    /// The UNDIVIDED outputs are filtered by DESTINATION: one is counted unless it pays a
+    /// [`p2_destinations`] member — a puzzle hash PROVEN to be a payable address of this spend.
+    /// Everything else is counted, including every wrapper layer's hash, because value sent there has
+    /// left the spender's control. Protocol-structure commitments are counted too, named rather than
+    /// addressed (see the module docs for both rules).
     fn from_effect(effect: &SpendEffect, coin_spends: &[CoinSpend], tier: SpendTier) -> Self {
         let returns_to_spender = p2_destinations(coin_spends);
+        let leaves_to_an_address = effect
+            .outputs
+            .iter()
+            .filter(|output| !returns_to_spender.contains(&output.puzzle_hash))
+            .map(address_line);
 
         Self {
             tier,
-            recipients: effect
-                .recipients
-                .iter()
-                .chain(effect.change.iter())
-                .filter(|output| !returns_to_spender.contains(&output.puzzle_hash))
-                .map(destination_line)
+            recipients: leaves_to_an_address
+                .chain(effect.protocol_sink.iter().map(protocol_structure_line))
                 .collect(),
             fee: effect.fee,
         }
@@ -287,7 +357,7 @@ pub(crate) fn p2_destinations(coin_spends: &[CoinSpend]) -> BTreeSet<Bytes32> {
     destinations
 }
 
-/// One line of the summary, for a created coin that leaves.
+/// One line of the summary, for a created coin that leaves to a chosen address.
 ///
 /// The address is encoded from the puzzle hash `analyze` decoded, so it names exactly the destination
 /// the condition creates. The vault destination rule decodes it straight back to a puzzle hash, so the
@@ -297,9 +367,9 @@ pub(crate) fn p2_destinations(coin_spends: &[CoinSpend]) -> BTreeSet<Bytes32> {
 /// value the transfer builder requires of a recipient address. Rendering a destination under a prefix
 /// the builder would not pay is how a user comes to approve a plausible address that is not the one
 /// they supplied.
-fn destination_line(output: &DecodedOutput) -> SpendRecipient {
-    SpendRecipient {
-        address: Address::new(
+fn address_line(output: &DecodedOutput) -> SpendRecipient {
+    SpendRecipient::to_address(
+        Address::new(
             output.puzzle_hash,
             crate::constants::MAINNET_ADDRESS_PREFIX.to_string(),
         )
@@ -309,9 +379,38 @@ fn destination_line(output: &DecodedOutput) -> SpendRecipient {
         // spend, and a summary line must exist for every output either way. The raw hash is the
         // honest fallback: unusable as an address, and impossible to mistake for one.
         .unwrap_or_else(|_| hex::encode(output.puzzle_hash)),
-        amount_mojos: output.amount,
-        asset_id: output.asset_id.map(hex::encode),
-    }
+        output.amount,
+        output.asset_id.map(hex::encode),
+    )
+}
+
+/// One line of the summary, for value committed to a consensus-enforced structural puzzle.
+///
+/// The amount and asset are carried exactly as for an address line — this value LEAVES, and every
+/// total and limit must see it. Only the destination differs: the structure is NAMED, because a
+/// launcher or settlement hash is not somewhere a human chose to pay and has no honest `xch1…` form.
+///
+/// `analyze` admits an output here only when its puzzle hash is one of the two canonical structural
+/// hashes, so the final arm is unreachable through that path. It is written anyway, and written to
+/// say "unrecognized": were a future decode to widen the bucket, the line reports a destination this
+/// crate cannot name rather than confidently asserting one of the two it can.
+fn protocol_structure_line(output: &DecodedOutput) -> SpendRecipient {
+    let structure = if output.puzzle_hash == Bytes32::new(SETTLEMENT_PAYMENT_HASH) {
+        "the offer settlement puzzle".to_string()
+    } else if output.puzzle_hash == Bytes32::new(SINGLETON_LAUNCHER_HASH) {
+        "the singleton launcher".to_string()
+    } else {
+        format!(
+            "an unrecognized protocol structure ({})",
+            hex::encode(output.puzzle_hash)
+        )
+    };
+
+    SpendRecipient::to_protocol_structure(
+        structure,
+        output.amount,
+        output.asset_id.map(hex::encode),
+    )
 }
 
 /// Re-parse `coin_spends` through `dig-wallet-backend`'s verify gate.
@@ -322,9 +421,9 @@ fn destination_line(output: &DecodedOutput) -> SpendRecipient {
 ///
 /// # Why the input amounts are summed first, even though the driver now sums them too
 ///
-/// `dig-wallet-backend` 0.16.1 routes all four of its accumulations through a fallible `accumulate`
-/// (#1708), so an unsummable total is refused there rather than panicking in debug and wrapping in
-/// release. This pre-check is therefore no longer the only thing standing between an attacker-chosen
+/// `dig-wallet-backend` routes every one of its accumulations through a fallible `accumulate`
+/// (#1708, since 0.16.1), so an unsummable total is refused there rather than panicking in debug and
+/// wrapping in release. This pre-check is therefore no longer the only thing standing between an attacker-chosen
 /// amount and a wrapped total — but it is kept, and deliberately:
 ///
 /// - It makes the ANSWER right, not merely the refusal. An unsummable input total is
@@ -353,33 +452,6 @@ fn derive_effect(coin_spends: &[CoinSpend]) -> Result<SpendEffect> {
         .map_err(|e| AccountError::Spend(format!("cannot derive spend summary: {e}")))
 }
 
-/// The hinted-recipient summary the `dig-wallet-backend` signer takes as a PARAMETER.
-///
-/// [`UnsignedSpend`](dig_wallet_backend::types::UnsignedSpend) requires a `summary` field, and the
-/// signer re-derives its own and compares. **That comparison is not a check this crate relies on** —
-/// both sides come from the same bytes, so it can only ever agree; see
-/// [`MoneySigner::sign_approved`](crate::wallet::money_signer::MoneySigner::sign_approved). This
-/// reproduces the shape `derive_summary` would produce (hinted outputs only) so the parameter is
-/// well-formed, and it is deliberately NOT the policy view above: a custody decision must count every
-/// output that leaves, whereas this field must match what the dependency expects.
-fn dependency_facing_summary(effect: &SpendEffect) -> TransactionSummary {
-    TransactionSummary {
-        outputs: effect
-            .recipients
-            .iter()
-            .map(|output| {
-                let line = destination_line(output);
-                SpendOutput {
-                    address: dig_wallet_backend::types::Address(line.address),
-                    amount: Amount(output.amount),
-                    asset_id: output.asset_id.map(|asset| AssetId(hex::encode(asset))),
-                }
-            })
-            .collect(),
-        fee: Amount(effect.fee),
-    }
-}
-
 /// Everything a custody decision needs about a spend, derived from the coin spends exactly once.
 ///
 /// The fields must agree, and the only way to guarantee that is to compute them together: the tier is
@@ -389,9 +461,6 @@ fn dependency_facing_summary(effect: &SpendEffect) -> TransactionSummary {
 pub(crate) struct DerivedSpend {
     /// The tiered, human-renderable view of the spend — every output that leaves.
     pub(crate) summary: SpendSummary,
-    /// The hinted-only summary the dependency's signer takes as a parameter. Not a check; see
-    /// [`dependency_facing_summary`].
-    pub(crate) verified: TransactionSummary,
     /// The CHECKED native total (value leaving plus fee) the tier and every mojo limit are decided from.
     pub(crate) native_total_mojos: u64,
 }
@@ -416,9 +485,9 @@ impl DerivedSpend {
     /// It is retained as defence-in-depth because that proof rests entirely on an invariant INSIDE a
     /// dependency, which no test in this crate can enforce and a patch release could weaken. What the
     /// crate can pin is the boundary itself, and
-    /// `a_spend_whose_output_amounts_overflow_is_never_approved` does: it fails against 0.16.0, so the
-    /// `0.16.1` floor is load-bearing rather than cosmetic. `scripts/probe-guards.sh` records this
-    /// guard as knowingly vacuous, and that exemption self-expires the moment any input makes it RED.
+    /// `a_spend_whose_output_amounts_overflow_is_never_approved` does, from both sides of the bound.
+    /// `scripts/probe-guards.sh` records this guard as knowingly vacuous, and that exemption
+    /// self-expires the moment any input makes it RED.
     ///
     /// The accessor must nonetheless stay the CHECKED one. Were it the saturating form and the
     /// dependency ever regressed, an overflowing spend would total `u64::MAX`, classify `Confirm`, and
@@ -433,7 +502,6 @@ impl DerivedSpend {
         summary.tier = SpendTier::classify(policy, native_total_mojos);
         Ok(Self {
             summary,
-            verified: dependency_facing_summary(&effect),
             native_total_mojos,
         })
     }
@@ -443,6 +511,11 @@ impl DerivedSpend {
 mod tests {
     use super::*;
     use crate::wallet::policy::{HotWallet, Vault};
+
+    /// A display-only recipient line paying a chosen address.
+    fn paying(address: &str, amount_mojos: u64, asset_id: Option<&str>) -> SpendRecipient {
+        SpendRecipient::to_address(address, amount_mojos, asset_id)
+    }
 
     /// **The address the confirm ceremony SHOWS is an address the transfer builder will PAY.**
     ///
@@ -457,11 +530,7 @@ mod tests {
     #[test]
     fn a_rendered_destination_is_an_address_the_transfer_builder_will_pay() {
         let puzzle_hash = Bytes32::new([0x5C; 32]);
-        let line = destination_line(&DecodedOutput {
-            puzzle_hash,
-            amount: 600,
-            asset_id: None,
-        });
+        let line = address_line(&decoded_output(puzzle_hash, 600));
 
         let request = crate::TransferRequest::to_address(&line.address, 600)
             .expect("a destination the ceremony displays must be one the builder will pay");
@@ -470,6 +539,179 @@ mod tests {
             puzzle_hash,
             "the displayed address must decode back to the puzzle hash the output creates"
         );
+    }
+
+    /// The classification fixtures: a real standard-layer spend of ONE wallet coin, creating
+    /// whatever `outputs` say plus the change that balances it.
+    ///
+    /// Change deliberately returns to the SPENT coin's own puzzle hash, which is the one destination
+    /// [`p2_destinations`] can prove — so every test below has an honest, provably-returning control
+    /// alongside whatever it is really asking about. Without that control a test cannot tell "the
+    /// rule dropped the right output" from "the rule dropped the last one".
+    #[cfg(test)]
+    fn spend_creating(
+        outputs: &[(Bytes32, u64)],
+        fee: u64,
+    ) -> (Vec<CoinSpend>, crate::keys::wallet_key::WalletKey) {
+        use crate::id::ProfileIx;
+        use crate::keys::wallet_key::WalletKey;
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        const COIN_AMOUNT: u64 = 10_000;
+
+        let key = WalletKey::from_seed_at(&[0x42u8; 32], ProfileIx::ROOT);
+        let mut ctx = SpendContext::new();
+        let coin = Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), COIN_AMOUNT);
+
+        let mut conditions = Conditions::new();
+        let mut spent = fee;
+        for (puzzle_hash, amount) in outputs {
+            conditions = conditions.create_coin(*puzzle_hash, *amount, Memos::None);
+            spent += amount;
+            // A coin that commits value to a structural puzzle MUST carry an announcement
+            // assertion, or `analyze` refuses the whole bundle as unbound egress — value that could
+            // be peeled off and given away for nothing. Real spends of this shape always carry one:
+            // an offer make asserts the requested payment's puzzle announcement, and a singleton
+            // launch asserts the launcher coin's announcement. Adding it keeps the fixture the
+            // shape a real spend has, rather than one the gate would never see.
+            if dig_wallet_backend::client::is_protocol_sink_hash(*puzzle_hash) {
+                conditions = conditions.assert_coin_announcement(Bytes32::new([0xAB; 32]));
+            }
+        }
+        conditions = conditions
+            .create_coin(key.puzzle_hash(), COIN_AMOUNT - spent, Memos::None)
+            .reserve_fee(fee);
+        StandardLayer::new(key.public_key())
+            .spend(&mut ctx, coin, conditions)
+            .expect("the fixture spend is well-formed");
+        (ctx.take(), key)
+    }
+
+    /// **Value returning to a PROVEN p2 destination is change; a coin to any other address is not.**
+    ///
+    /// The fixture varies exactly one actor. Both non-change outputs are un-hinted and structurally
+    /// identical, and they differ only in whether their puzzle hash is one this spend proved it can
+    /// spend from — which is the whole rule. A wrong implementation that dropped "the last output",
+    /// or that dropped every un-hinted output, or that dropped nothing, each produces a different
+    /// count here; only the rule under test produces exactly one line naming the stranger.
+    #[test]
+    fn only_an_output_returning_to_a_proven_p2_destination_is_treated_as_change() {
+        let stranger = Bytes32::new([0x7Au8; 32]);
+        let (coin_spends, key) = spend_creating(&[(stranger, 600)], 10);
+
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm).unwrap();
+
+        assert_eq!(
+            summary.recipients.len(),
+            1,
+            "the change back to the spent coin's own p2 hash is the ONLY excusable output: {summary:?}"
+        );
+        assert_eq!(summary.recipients[0].amount_mojos, 600);
+        assert_eq!(summary.recipients[0].destination, SpendDestination::Address);
+        assert_eq!(
+            Address::decode(&summary.recipients[0].address)
+                .expect("an address line must decode")
+                .puzzle_hash,
+            stranger,
+            "the line must name the stranger, not the wallet"
+        );
+        // The control: the wallet's own hash really was among the created coins, so the single line
+        // above is a filter having fired, not a spend that only ever created one coin.
+        assert_ne!(stranger, key.puzzle_hash());
+    }
+
+    /// **Value committed to a protocol structure is COUNTED, and NAMED rather than addressed.**
+    ///
+    /// Three properties in one fixture, each separating this implementation from a plausible wrong
+    /// one: dropping `protocol_sink` (the nearest wrong version, since `analyze` hands it over in its
+    /// own bucket) leaves no line and a total short by the sink amount; folding it in as an ordinary
+    /// address line yields a decodable `xch1…` for the launcher constant; and either mistake would
+    /// let a vault spend commit value to a structure while the summary showed nothing.
+    ///
+    /// A second, ordinary recipient is present so the test cannot pass merely because the sink
+    /// happened to be the only line — the sink must be counted ALONGSIDE it.
+    #[test]
+    fn value_committed_to_a_protocol_structure_is_counted_and_named_not_addressed() {
+        let launcher = Bytes32::new(SINGLETON_LAUNCHER_HASH);
+        let stranger = Bytes32::new([0x7Au8; 32]);
+        let (coin_spends, _) = spend_creating(&[(stranger, 600), (launcher, 1)], 10);
+
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm).unwrap();
+
+        let sink = summary
+            .recipients
+            .iter()
+            .find(|line| line.destination == SpendDestination::ProtocolStructure)
+            .expect("the launcher commitment must appear in the summary");
+        assert_eq!(sink.amount_mojos, 1);
+        assert_eq!(sink.address, "the singleton launcher");
+        assert!(
+            Address::decode(&sink.address).is_err(),
+            "a structural commitment must not render as a payable address"
+        );
+        assert_eq!(
+            summary.recipients.len(),
+            2,
+            "the ordinary recipient is counted too: {summary:?}"
+        );
+        // And the value it moves reaches the figure every limit is weighed against.
+        assert_eq!(summary.native_total_mojos(), 600 + 1 + 10);
+    }
+
+    /// The settlement puzzle is named too — the launcher is not simply the only branch that works.
+    ///
+    /// Naming ONE structure correctly is satisfied by a function that returns that name
+    /// unconditionally, so the second constant is what makes the branch load-bearing.
+    #[test]
+    fn the_offer_settlement_puzzle_is_named_distinctly_from_the_launcher() {
+        let settlement = Bytes32::new(SETTLEMENT_PAYMENT_HASH);
+        let (coin_spends, _) = spend_creating(&[(settlement, 500)], 10);
+
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm).unwrap();
+
+        assert_eq!(summary.recipients.len(), 1);
+        assert_eq!(summary.recipients[0].address, "the offer settlement puzzle");
+        assert_eq!(
+            summary.recipients[0].destination,
+            SpendDestination::ProtocolStructure
+        );
+    }
+
+    /// An unrecognized structural hash is reported as unrecognized rather than named as one of the
+    /// two this crate knows.
+    ///
+    /// Unreachable via `analyze` (which admits only the two canonical hashes), so it is exercised
+    /// directly on the line renderer — the only honest way to see a branch a real spend cannot
+    /// produce. The point of the branch is that a future widening of the bucket degrades into
+    /// "I cannot name this", never into a confident wrong name.
+    #[test]
+    fn an_unrecognized_protocol_structure_is_reported_as_unrecognized() {
+        let unknown = Bytes32::new([0x33u8; 32]);
+        let line = protocol_structure_line(&decoded_output(unknown, 9));
+
+        assert!(
+            line.address.contains("unrecognized") && line.address.contains(&hex::encode(unknown)),
+            "the line must say it cannot name the structure, and show which one: {line:?}"
+        );
+        assert_eq!(line.destination, SpendDestination::ProtocolStructure);
+        assert_eq!(line.amount_mojos, 9);
+    }
+
+    /// A [`DecodedOutput`] built through the dependency's own decode of a minimal spend.
+    ///
+    /// `DecodedOutput` is `#[non_exhaustive]`, so it cannot be constructed by literal outside its
+    /// crate; deriving one from a real spend is both the only way and the more honest fixture.
+    fn decoded_output(puzzle_hash: Bytes32, amount: u64) -> DecodedOutput {
+        let (coin_spends, _) = spend_creating(&[(puzzle_hash, amount)], 0);
+        analyze(&coin_spends)
+            .expect("the fixture spend is analyzable")
+            .outputs
+            .into_iter()
+            .find(|output| output.puzzle_hash == puzzle_hash)
+            .expect("the fixture creates this output")
     }
 
     #[test]
@@ -502,16 +744,8 @@ mod tests {
         let summary = SpendSummary::new(
             SpendTier::Confirm,
             vec![
-                SpendRecipient {
-                    address: "xch1a".into(),
-                    amount_mojos: 600,
-                    asset_id: None,
-                },
-                SpendRecipient {
-                    address: "xch1b".into(),
-                    amount_mojos: 999,
-                    asset_id: Some("deadbeef".into()),
-                },
+                paying("xch1a", 600, None),
+                paying("xch1b", 999, Some("deadbeef")),
             ],
             10,
         );
@@ -520,15 +754,7 @@ mod tests {
 
     #[test]
     fn display_renders_recipients_and_fee() {
-        let summary = SpendSummary::new(
-            SpendTier::AutoSend,
-            vec![SpendRecipient {
-                address: "xch1abc".into(),
-                amount_mojos: 42,
-                asset_id: None,
-            }],
-            5,
-        );
+        let summary = SpendSummary::new(SpendTier::AutoSend, vec![paying("xch1abc", 42, None)], 5);
         let line = summary.to_string();
         assert!(line.contains("42 XCH -> xch1abc"), "{line}");
         assert!(line.contains("fee 5 mojos"), "{line}");
@@ -557,11 +783,7 @@ mod tests {
     fn display_names_a_cat_asset() {
         let summary = SpendSummary::new(
             SpendTier::Confirm,
-            vec![SpendRecipient {
-                address: "xch1cat".into(),
-                amount_mojos: 7,
-                asset_id: Some("cafe".into()),
-            }],
+            vec![paying("xch1cat", 7, Some("cafe"))],
             0,
         );
         assert!(summary.to_string().contains("7 cafe -> xch1cat"));
@@ -578,16 +800,8 @@ mod tests {
         let summary = SpendSummary::new(
             SpendTier::Confirm,
             vec![
-                SpendRecipient {
-                    address: "xch1first".into(),
-                    amount_mojos: 100,
-                    asset_id: None,
-                },
-                SpendRecipient {
-                    address: "xch1second".into(),
-                    amount_mojos: 250,
-                    asset_id: Some("cafe".into()),
-                },
+                paying("xch1first", 100, None),
+                paying("xch1second", 250, Some("cafe")),
             ],
             7,
         );

@@ -101,8 +101,8 @@ probe "G7  an undeclared intent escalates" $E \
 # `accumulate` and then requires `xch_in == xch_out + fee`, so this crate's native total -- a subset
 # of those coins plus that fee -- is bounded by `xch_in` and cannot overflow. The guard is kept as
 # defence-in-depth because that proof lives inside a dependency. What IS pinned is the boundary:
-# `a_spend_whose_output_amounts_overflow_is_never_approved` fails against 0.16.0, so the version
-# floor is load-bearing. The exemption below still expires by itself the moment the guard goes RED.
+# `a_spend_whose_output_amounts_overflow_is_never_approved` asserts it from both sides, against the
+# real dependency. The exemption below still expires by itself the moment the guard goes RED.
 probe "G2  custody total is CHECKED, not saturating" $S \
   'let native_total_mojos = summary.checked_native_total_mojos()?;' \
   'let native_total_mojos = summary.native_total_mojos();' \

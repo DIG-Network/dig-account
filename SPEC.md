@@ -58,11 +58,16 @@ MUST NOT be derived from key material, so relabelling an account never disturbs 
 `registry_mut().set_active()`. `default_profile()` returns an `Option`, because an account may have no
 active profile.
 
-### 2.2 Profile (DID + dig-store + SMT; wraps dig-social-profile IdentityProfile)
+### 2.2 Profile (a ProfileIx tagging a ProfileAnchor)
 
-A `Profile` is a `dig_social_profile::IdentityProfile` (DID singleton + dig-store + profile-info SMT)
-tagged with the `ProfileIx` its identity + wallet keys derive at. The model is pure state — no seed, no
-crypto — so it is trivially testable and serialization-friendly.
+A `Profile` is a `ProfileAnchor` (§2.4 — the confirmed DID singleton and the dig-store launched from
+its coin) tagged with the `ProfileIx` its identity + wallet keys derive at, reachable as
+`Profile::anchor()`. The model is pure state — no seed, no crypto — so it is trivially testable and
+serialization-friendly.
+
+The anchor MUST be expressed in this crate's own `chia-protocol` types. A `Profile` MUST NOT embed a
+type re-exported from another crate's chia family: dig-account's public API names exactly one chia
+family, so the crate can move that family without a third party's release schedule.
 
 A `Profile` is the ONLINE, chain-resolved view. It MUST NOT be the authority on whether a profile
 exists — that is the registry's job (§2.4) — and it is attached opportunistically, once a chain source
@@ -351,7 +356,9 @@ controls a distinct never-funded key set and would fund-lock coins). It is const
 so the money key never leaves the crate, and MUST:
 
 1. Re-derive every required signature from the approval's OWN `coin_spends` — never sign caller-supplied
-   opaque bytes, and never re-derive the summary a second time (the approval carries the gate's, §6.4).
+   opaque bytes, and render the dependency's required `UnsignedSpend.summary` from
+   `approval.coin_spends()` in `sign_approved` as specified in §6.2, rather than trusting any carried
+   value.
    Two derivations of one spend are two answers that can differ. An engine-supplied required-signature list is UNTRUSTED (cross-checked against the re-derived
    set, never the signing source), so it cannot be used as a signing oracle.
 2. Be `AGG_SIG_ME`-only and fail-closed: refuse (error on the whole bundle) any `AGG_SIG_UNSAFE` /
@@ -365,7 +372,7 @@ vetted `client` seam, and dig-account only wires it to the canonical money key. 
 `AccountError::Spend`.
 
 `SpendSummary` is the structured, independently re-derived effect of a spend the confirm ceremony renders:
-`{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id}>, fee }`. It is built
+`{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id, destination}>, fee }`. It is built
 from the coin spends alone via `dig-wallet-backend`'s `client::verify::derive_summary` (never an
 engine-supplied claim); `SpendTier` (`AutoSend` / `Confirm` / `Vault`) classifies the spend under the
 profile's `CustodyPolicy`.
@@ -408,9 +415,9 @@ derived from the coins being spent, and this specification does not claim otherw
 - **Vault protection is a property of the AUTHORIZER, not of the funds.** An implementation MUST NOT
   present these rules to a user as protection that attaches to money held in a vault.
 - **Value is counted by DESTINATION, never by hint status** (§6.4). An output is weighed unless it pays
-  the exact puzzle hash of a coin the spend is itself spending — the one case where value demonstrably
-  has not moved. Hint status is never consulted, so an author cannot move value out of the charged total
-  or out of the vault destination rule by omitting a memo.
+  a proven p2 destination of that same spend — the one case where value demonstrably has not moved.
+  Hint status is never consulted, so an author cannot move value out of the charged total or out of the
+  vault destination rule by omitting a memo.
 - **This deliberately OVERCOUNTS change sent to a fresh derivation.** This layer holds no key, so it
   cannot distinguish a fresh derivation of the user's own wallet from a stranger's address. The only
   rule that could is "any owned derivation is change", and that is precisely an attacker's exfiltration
@@ -479,13 +486,22 @@ it of a host.** The enforcement is structural:
 | Not expiring | Deliberate. The rolling cap is charged when the approval is minted, so an aged approval cannot re-spend an allowance. A user re-locking DURING an async ceremony is a lock question, answered by building the signer after the ceremony from the live residency — not by dating the approval. |
 
 **Safety comes from the approval OWNING its spends. A same-bytes comparison is NOT a guard, and this
-crate MUST NOT claim one as a custody property.** The approval carries a `TransactionSummary` because
-the dependency's signer takes it as a required parameter, and that signer compares it against its own
-re-derivation. Both sides descend from the same `coin_spends` the approval owns, so the comparison can
-only ever agree: it is structurally incapable of detecting anything, and its value here is zero. It is
-passed to satisfy a signature and is explicitly NON-LOAD-BEARING. A genuine second opinion would require
-an INDEPENDENT derivation — which is the two-answers-can-disagree shape §6.2 exists to remove, so no such
-comparison SHOULD be reintroduced as a substitute for ownership.
+crate MUST NOT claim one as a custody property.** The dependency's signer takes a `TransactionSummary`
+as a required parameter and compares it against its own re-derivation. Both sides descend from the same
+`coin_spends` the approval owns, so the comparison can only ever agree: it is structurally incapable of
+detecting anything, and its value here is zero. It is passed to satisfy a signature and is explicitly
+NON-LOAD-BEARING. A genuine second opinion would require an INDEPENDENT derivation — which is the
+two-answers-can-disagree shape §6.2 exists to remove, so no such comparison SHOULD be reintroduced as a
+substitute for ownership.
+
+**That parameter MUST be rendered by the SIGNER, not carried on the approval.** The dependency defines
+it as the KEY-AWARE egress — every created coin the wallet cannot derive a key for — and only a key
+holder can answer that question. The custody gate holds no key by design, so a gate-rendered parameter
+could only approximate it, and would approximate it by OVER-listing: a CAT send's change coin is created
+at the wallet's inner p2 hash, which is no spent coin's `puzzle_hash`, so the proven-p2 rule below cannot
+see that it comes home and the signer refuses a legitimate spend. Rendering it in `sign_approved` from
+`approval.coin_spends()` cannot weaken anything, because those are the very bytes the signature covers.
+The approval therefore carries the display summary and the spends, and nothing else about value.
 
 `SpendSummary::new` and `WalletOps::summarize` remain public and confer NO authority: since no API
 accepts a `&SpendSummary` for a custody decision, a hand-built summary is a display value with nowhere
@@ -583,9 +599,10 @@ limit. Persisting the ledger is tracked separately.
    caller-chosen and need not name coins that exist, and an unchecked accumulation of them would wrap
    before value conservation was judged against it.
 2. **Vault.** Every entry of the charged destination list (§6.4, which is every output that is not a
-   proven p2 destination of the spend — never only the hinted ones) MUST be the hot wallet's puzzle hash,
-   else `PolicyDenied`; a destination that cannot be decoded is `PolicyIndeterminate`. A vault-tier spend
-   then always yields `RequiresConfirmation`.
+   proven p2 destination of the spend — never only the hinted ones) MUST be the hot wallet's puzzle hash.
+   A destination whose `SpendDestination` is a protocol structure is `PolicyDenied` by name; only an
+   address-kind destination that cannot be decoded is `PolicyIndeterminate`. Any other destination is
+   `PolicyDenied`. A vault-tier spend then always yields `RequiresConfirmation`.
 3. **One arm per tier.** Only `SpendTier::AutoSend` may proceed to the auto-send bounds. Every tier MUST
    be decided by exactly one arm of a wildcard-free match, so (a) a `SpendTier` variant added later is a
    compile error rather than a variant inheriting some other tier's decision, and (b) no two guards can
@@ -629,6 +646,10 @@ small allowance while the spend moves an enormous amount) and MUST NOT panic (`f
 where currying reproduces that coin's own `puzzle_hash`. Every other output is charged. Because hint
 status is never consulted, the total cannot be made incomplete by omitting a memo.
 
+Each charged line carries a `SpendDestination` distinguishing a payable address from a named protocol
+structure. Value committed to a canonical structural puzzle is COUNTED in that same charged destination
+list and weighed by `native_total_mojos()` exactly like any other output; only its rendering differs.
+
 **A spent coin's `puzzle_hash` MUST NOT be treated as a payable destination.** The two coincide only for
 a bare p2 coin. For a WRAPPED coin — CAT, NFT, DID, singleton, offer settlement — `coin.puzzle_hash` is
 the wrapper's hash, and value paid there is not returned to the spender but rendered PERMANENTLY
@@ -647,12 +668,20 @@ next layer added to the ecosystem, whereas a proof obligation is layer-agnostic 
 
 §6.1.1 records the deliberate overcount this implies. The vault destination rule (§6.1) reads the same
 list, so an un-hinted or wrapper-directed vault outflow is subject to the hot-wallet-only rule exactly as
-a hinted one is. The money signer's change-ownership check (§5.2) remains a required second layer.
+a hinted one is.
 
-**Output-amount arithmetic MUST be checked at both layers.** `dig-wallet-backend` **0.16.1** — the
-minimum this crate requires — routes all four of its value accumulations through a fallible `accumulate`,
-so an unsummable output total is a refusal from the dependency rather than a debug panic or a release
-wrap. `checked_native_total_mojos()` remains REQUIRED regardless: it is where an unsummable total becomes
+**The policy authorizer is the SINGLE layer enforcing WHERE value may go.** This scopes to DESTINATION only
+— §5.2's signer-side guarantees (value conservation, quote-form delegated puzzles, a sole `AGG_SIG_ME` per
+coin) are unaffected and remain REQUIRED. The money signer no longer refuses an output that
+does not return to this wallet: `dig-wallet-backend` **>= 0.27** classifies such an output as a recipient
+rather than rejecting it, so a reimplementation MUST NOT rely on the signer for a destination check. Every
+charged destination is instead decided by tier: at `Vault` the destination rule above denies it outright
+unless it pays the hot wallet's puzzle hash — regardless of amount; at `AutoSend` it is bounded by the
+per-transaction limit and the rolling-period cap; at `Confirm` it is rendered for the user to approve.
+
+**Output-amount arithmetic MUST be checked at both layers.** `dig-wallet-backend` **>= 0.16.1** routes
+every one of its value accumulations through a fallible `accumulate`, so an unsummable output total is a
+refusal from the dependency rather than a debug panic or a release wrap. `checked_native_total_mojos()` remains REQUIRED regardless: it is where an unsummable total becomes
 `PolicyIndeterminate` instead of a clamped figure judged against a limit, and the bound it enforces must
 not depend on a dependency's arithmetic continuing to be careful.
 `a_spend_whose_output_amounts_overflow_is_never_approved` pins the boundary against the real dependency,
@@ -735,8 +764,8 @@ also gated and signed would be a second route to a signature beside a gated one,
   encoding and a 32-byte payload but NOT the prefix, so `nft1…`, `did:chia:…`, `cat1…` and `txch1…` all
   decode and yield a puzzle hash. A payment built to one conserves value, signs, confirms and reports
   `Confirmed` truthfully — while the coin sits at a puzzle hash with no preimage and the funds are
-  permanently burned. No later check can catch it: every downstream rule is about value conservation
-  and change ownership, and the confirm ceremony re-encodes the destination for display with a
+  permanently burned. No later check can catch it: every downstream rule is about value conservation,
+  not about whether a destination is spendable, and the confirm ceremony re-encodes the destination for display with a
   hard-coded `xch` prefix, so the user is shown a plausible address that is not the one they supplied.
 - **No self-payment.** A recipient equal to the wallet's own puzzle hash MUST be refused
   (`TransferError::SelfPayment`). It moves no value while costing a fee, and §5.2's summary excludes

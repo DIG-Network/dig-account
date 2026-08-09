@@ -502,8 +502,6 @@ mod tests {
         coin_spends: &[chia_protocol::CoinSpend],
     ) -> crate::wallet::approval::SpendApproval {
         use crate::wallet::summary::{SpendSummary, SpendTier};
-        let verified = dig_wallet_backend::client::derive_summary(coin_spends)
-            .expect("the fixture spend must be derivable");
         let summary = SpendSummary::from_coin_spends(coin_spends, SpendTier::AutoSend)
             .expect("the fixture spend must be summarizable");
         let scope = crate::wallet::policy::CustodyScope::new(
@@ -511,7 +509,7 @@ mod tests {
             &crate::wallet::policy::CustodyPolicy::Hot(Default::default()),
             gate_money_key().puzzle_hash(),
         );
-        crate::wallet::approval::SpendApproval::new(coin_spends.to_vec(), summary, verified, scope)
+        crate::wallet::approval::SpendApproval::new(coin_spends.to_vec(), summary, scope)
     }
 
     #[test]
