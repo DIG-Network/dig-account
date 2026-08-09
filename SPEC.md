@@ -758,17 +758,33 @@ Only CONFIRMED, UNSPENT coins are spendable. A SPENT coin MUST NOT be selected, 
 toward the `available` figure `TransferError::InsufficientFunds` reports — that figure is the wallet's
 entire spendable balance, never however far a selection loop happened to get.
 
-A record the implementation cannot JUDGE MUST be refused by name rather than skipped, because silently
-dropping it under-counts the balance and tells the user something false about their money:
+**No individual record may abort the build.** The record set is chosen by the chain SOURCE, and a
+source is free to return coins this wallet does not own: a hint is memo data anybody may write, so one
+dust coin hinted at a victim puts an attacker-chosen record in front of selection on every call. An
+implementation that REFUSED the whole build on such a record would therefore expose a remote,
+unauthenticated, permanent denial of service on the wallet's ability to spend. A record that cannot be
+used MUST be EXCLUDED from both selection and `available`:
 
+- A record whose `coin.puzzle_hash` is not the wallet's own MUST be excluded. Native-XCH-only is
+  ENFORCED, not merely implied by the query: a CAT coin lives at
+  `CatArgs::curry_tree_hash(asset_id, p2)`, and a source that indexes by HINT rather than by puzzle
+  hash returns coins this wallet can discover but not unlock. Excluding one under-counts NOTHING,
+  because a coin at another puzzle hash was never part of this wallet's XCH balance.
 - `confirmed_height == None` means the SOURCE DOES NOT KNOW, never that the coin is unconfirmed or
-  absent. It MUST be refused with `TransferError::SpendabilityUnknown`. A source that does not populate
-  the field would otherwise make a funded wallet report `InsufficientFunds { available: 0 }`.
-- A record whose `coin.puzzle_hash` is not the wallet's own MUST be refused with
-  `TransferError::UnexpectedCoinPuzzleHash`. Native-XCH-only is ENFORCED, not merely implied by the
-  query: a CAT coin lives at `CatArgs::curry_tree_hash(asset_id, p2)`, and a chain source that indexes
-  by HINT rather than by puzzle hash would return coins this wallet can discover but not unlock —
-  counted as XCH mojos in `available` and spent with a standard-layer reveal.
+  absent, so the coin MUST be excluded rather than treated as unspendable — but its id MUST be
+  remembered.
+- A SPENT record MUST be skipped BEFORE its height is considered. `include_spent: false` is a request
+  and not a guarantee, and a spent coin is unspendable whatever else is unknown about it; judging the
+  height first lets an unknown height on an already-irrelevant coin decide the whole build.
+
+`TransferError::SpendabilityUnknown`, naming an excluded coin, MUST be raised if and only if excluding
+the unjudgeable coins is what makes the transfer fall short. Reporting a shortfall while having
+silently dropped coins that might have covered it states a balance as fact when it is only a lower
+bound; refusing when the wallet can plainly afford the transfer hands a hostile source a way to block
+every send.
+
+Exclusion is the pattern the crate already uses for an unusable record: §6A's mint selection filters
+its candidates (`confirmed_height.is_some() && !record.is_spent()`) rather than refusing on one.
 
 The spendable total MUST be summed with CHECKED arithmetic, and a total that does not fit in a `u64`
 MUST be refused with `TransferError::BalanceUnjudgeable` rather than clamped. A saturating sum pinned
@@ -897,12 +913,19 @@ do NOT conflict, may both sit in the mempool, and may BOTH be included — payin
 under two different payment coin ids.
 
 `build_transfer_replacing` MUST refuse by name rather than as a shortfall when the new fee does not
-exceed the fee it replaces (`ReplacementFeeNotHigher`), and when any input is no longer
+exceed the fee it replaces (`ReplacementFeeNotHigher`) — a NECESSARY condition only, since whether a
+higher-fee bundle actually displaces the one in the mempool is a property of the mempool
+implementation that this specification does not state and no test in this repository establishes, and when any input is no longer
 confirmed-and-unspent (`SourcesNoLongerSpendable`) — that second case usually means the ORIGINAL has
 already been included, so a replacement would be a second payment. It MUST NOT select a substitute
 input: the higher fee comes out of the change, so a transfer whose inputs were consumed exactly cannot
 be fee-bumped at all. That shortfall MUST be refused as `ReplacementInputsInsufficient`,
-reporting `reused_total`, and MUST NOT reuse `InsufficientFunds` — that variant's `available` is the
+reporting `reused_total`. The largest fee a replacement can carry is therefore the original's
+`fee_mojos + change_mojos`, which `PendingTransfer` MUST expose so a caller can bound a fee-bump
+control rather than discover the ceiling by triggering the error; when that ceiling equals the current
+fee, no replacement is possible at all. No refusal reachable from `build_transfer_replacing` may
+instruct the user to build or send another transfer, because that is the FORBIDDEN rebuild above and
+these messages are rendered to users verbatim. It MUST NOT reuse `InsufficientFunds` — that variant's `available` is the
 WALLET'S spendable balance wherever else it is produced, so a surface rendering the two alike would
 report a balance the user does not hold.
 

@@ -19,13 +19,13 @@ use std::sync::Arc;
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
 use chia_wallet_sdk::types::Conditions;
+use chia_wallet_sdk::utils::Address;
 use dig_account::{
     transfer_status, AutoSendPolicy, CustodyPolicy, FixedClock, HotWallet, MoneySigner,
     OpClassLimits, PayableDestination, PolicyAuthorizer, ProfileIx, SpendOpClass, SpendPublisher,
     SpendRuling, TransferError, TransferPlan, TransferRequest, TransferStatus, UnlockedAccount,
     WalletOps, MIN_CONFIRMATION_DEPTH,
 };
-use dig_chainsource_interface::ChainSource;
 use dig_wallet_backend::types::Network;
 
 mod common;
@@ -82,7 +82,15 @@ fn authorize_and_sign(account: &UnlockedAccount, plan: &TransferPlan) -> SpendBu
     }
 }
 
-/// Build → gate → sign → push, returning what to watch and the peak read BEFORE the push.
+/// Build → gate → sign → push, returning what to watch.
+///
+/// Anchors through `pushed_now`, which is the path callers are told to use — a suite that exercised
+/// only the demoted `pushed_at` would leave the documented one covered by nothing but its own unit
+/// tests, and the anchor is what makes a back-dated confirmation contradict something the chain
+/// said earlier.
+///
+/// The anchor is taken BEFORE the push, which is the whole point of reading it here rather than
+/// afterwards.
 fn send(
     account: &UnlockedAccount,
     chain: &SimulatorChain,
@@ -92,14 +100,9 @@ fn send(
     let plan = ops.build_transfer(chain, &hot(), request)?;
     let bundle = authorize_and_sign(account, &plan);
 
-    // The peak BEFORE the push, which is what later makes a back-dated confirmation contradict
-    // something the chain said earlier.
-    let peak = chain
-        .peak_height()
-        .map_err(anyhow::Error::msg)?
-        .expect("the simulator has a peak");
+    let pending = plan.pushed_now(chain)?;
     chain.push(&bundle).map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(plan.pushed_at(peak))
+    Ok(pending)
 }
 
 /// What the recipient holds, according to the simulator.
@@ -631,5 +634,98 @@ fn a_replacement_refuses_rather_than_reaching_for_another_coin() -> anyhow::Resu
         600_000,
         "the original still settles, exactly once, and no replacement was ever built"
     );
+    Ok(())
+}
+
+/// **The production destination constructor, proven through the whole chain.**
+///
+/// Every other simulator test builds its destination with `PayableDestination::from_derived`, which
+/// is the constructor that SKIPS the prefix check — so the path an application actually takes for a
+/// user-supplied address had no end-to-end coverage at all, while the bypass carried the entire
+/// suite. This runs `from_address` through build → gate → sign → push → farm and checks the
+/// recipient is paid.
+///
+/// # Why an `xch` address is correct here despite a testnet-constants harness
+///
+/// Address encoding is bech32m over a puzzle hash. It is independent of the `AggSigConstants` the
+/// signer uses, which is why an `xch1…` string works against a simulator signing with testnet
+/// constants — the two are unrelated concerns, and nothing in the bundle carries the human-readable
+/// part.
+///
+/// **The prefix check is deliberately NOT parameterised by network.** Adding a network switch so
+/// that `txch` were accepted in tests would weaken the exact rule that stops funds being burned, for
+/// the convenience of a harness that does not need it. The ecosystem is mainnet-only by contract, so
+/// refusing `txch` is correct everywhere, including here.
+#[test]
+fn a_transfer_to_a_checked_xch_address_is_paid_end_to_end() -> anyhow::Result<()> {
+    let account = unlocked_account();
+    let chain = SimulatorChain::new();
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
+    chain.bury(1);
+
+    let address = Address::new(RECIPIENT, "xch".to_string())
+        .encode()
+        .expect("a 32-byte puzzle hash encodes as an xch address");
+    let destination = PayableDestination::from_address(&address)
+        .expect("an xch address is the one thing this constructor accepts");
+    assert_eq!(
+        destination.puzzle_hash(),
+        RECIPIENT,
+        "the decoded destination must be the puzzle hash the address names"
+    );
+
+    let pending = send(
+        &account,
+        &chain,
+        &TransferRequest::new(destination, AMOUNT).with_fee(FEE),
+    )?;
+    chain.farm()?;
+
+    assert_eq!(
+        recipient_balance(&chain),
+        AMOUNT,
+        "the address the user pasted must be the address that gets paid"
+    );
+    assert!(transfer_status(&pending, &chain)?.confirmed().is_some());
+    Ok(())
+}
+
+/// The refusal reaches the same end-to-end path: a well-formed address under any other prefix is
+/// rejected before a spend exists, so nothing is built, gated, signed or pushed.
+///
+/// `txch` is the case most likely to be argued for as a convenience in a testnet harness, which is
+/// exactly why it is pinned here.
+#[test]
+fn a_transfer_to_a_non_xch_address_never_reaches_a_spend() -> anyhow::Result<()> {
+    let account = unlocked_account();
+    let chain = SimulatorChain::new();
+    chain.fund(wallet_puzzle_hash(&account), 1_000_000);
+    chain.bury(1);
+
+    for prefix in ["txch", "nft", "did:chia"] {
+        let encoded = Address::new(RECIPIENT, prefix.to_string())
+            .encode()
+            .expect("a 32-byte payload encodes under any prefix");
+
+        // The control: the string really does decode, so the refusal is the prefix rule and not a
+        // parse failure.
+        assert_eq!(
+            Address::decode(&encoded)?.puzzle_hash,
+            RECIPIENT,
+            "{prefix} must decode, or this case proves nothing"
+        );
+
+        assert!(
+            PayableDestination::from_address(&encoded).is_err(),
+            "{prefix} must be refused: paying the puzzle hash inside one burns the funds"
+        );
+    }
+
+    assert_eq!(
+        chain.pushed_bundles(),
+        0,
+        "no refused destination may have produced a bundle"
+    );
+    assert_eq!(recipient_balance(&chain), 0);
     Ok(())
 }
