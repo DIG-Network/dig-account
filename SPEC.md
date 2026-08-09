@@ -98,6 +98,20 @@ from a `ProfileAnchor`, and a `ProfileAnchor` only from BOTH halves of a confirm
 (§6A) and a `ConfirmedStore`, each of which requires an on-chain confirmation buried at least
 `MIN_CONFIRMATION_DEPTH` blocks. No path MAY record a profile from a key, or from a push being accepted.
 
+**The two halves MUST be halves of the SAME mint.** Each evidence proves only that its OWN coin
+confirmed; neither proves the relationship between them. A profile is a DID and the store launched FROM
+that DID's coin, so `ProfileAnchor::from_confirmed` MUST refuse (`MismatchedMintHalves`, yielding no
+anchor) unless the `ConfirmedStore` records the DID coin its launch spent and that coin is the
+`MintedDid`'s own. `ConfirmedStore` therefore MUST carry the `did_coin_id` of the launch it proves.
+
+A `ProfileAnchor`'s `did` string MUST re-derive from its own `launcher_id`, and a registry holding an
+anchor where they disagree MUST NOT load. This closes a string spoof on the DESERIALIZE path — wherever
+an anchor is CONSTRUCTED the string is derived, never accepted — and is not evidence of the mint.
+
+A journalled mint's disclosed `store_fee` MUST NOT exceed `MAX_MINT_FEE_MOJOS`, enforced both when the
+mint is journalled and on load: it is the amount a resumed phase B may spend, with no phase-A context
+left to validate it against.
+
 Deserializing an anchor is a CACHE OF A VERDICT, not a verdict: it asserts only that this host recorded
 live evidence earlier and wrote it down. Re-verification against a trusted `ChainSource` is deferred to
 profile discovery.

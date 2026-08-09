@@ -8,7 +8,9 @@ a DID + dig-store + SMT-of-profile-info (dig-social-profile `IdentityProfile`), 
 with the account seed's key at that profile index.
 
 This crate owns the object model, unlock policy + keystore crypto, the in-process identity+money
-signer, per-profile key/DEK derivation, the DID+dig-store mint, and all wallet ops. It never draws
+signer, per-profile key/DEK derivation, the on-chain **DID mint**, and all wallet ops. The store half
+of a profile mint is not implemented yet: its evidence types exist, and the launch that produces them
+lands with phase B (dig_ecosystem#2342). It never draws
 UI — the host harness (dig-app) injects a UI/auth provider that this crate calls back through.
 
 `PolicyAuthorizer` is the custody gate for the **money path**, and on that path **it is not optional.**

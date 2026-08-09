@@ -8,8 +8,9 @@
 //! minted and signed with the account seed's key at that profile index.
 //!
 //! This crate owns the object model, the unlock policy + keystore crypto, the in-process
-//! identity+money signer, per-profile key/DEK derivation, the DID+dig-store mint, and all wallet
-//! ops. It NEVER draws UI or drives an OS auth ceremony — the host harness (dig-app) injects a
+//! identity+money signer, per-profile key/DEK derivation, the on-chain **DID mint**, and all wallet
+//! ops. The STORE half of a profile mint is not implemented yet — its evidence types exist, and the
+//! launch that produces them lands with phase B (dig_ecosystem#2342). It NEVER draws UI or drives an OS auth ceremony — the host harness (dig-app) injects a
 //! UI/auth provider that this crate calls back through for unlock and spend-confirm ceremonies.
 //!
 //! ## Custody split (the harness seam)
