@@ -131,6 +131,24 @@ impl PendingMint {
     pub fn pending_did_string(&self) -> String {
         dig_did::did_string_from_launcher_id(self.launcher_id)
     }
+
+    /// Every field of this pending mint, in declaration order. See
+    /// [`MintedDid::every_field`] for why it destructures exhaustively.
+    #[cfg(test)]
+    pub(crate) fn every_field(&self) -> (Bytes32, Bytes32, Bytes32, u32) {
+        let Self {
+            launcher_id,
+            did_coin_id,
+            source_coin_id,
+            pushed_at_height,
+        } = self;
+        (
+            *launcher_id,
+            *did_coin_id,
+            *source_coin_id,
+            *pushed_at_height,
+        )
+    }
 }
 
 /// A DID that EXISTS on chain, and the evidence that it does.
@@ -214,6 +232,24 @@ impl MintedDid {
     /// The block height at which the DID coin was confirmed.
     pub fn confirmed_height(&self) -> u32 {
         self.confirmed_height
+    }
+
+    /// Every field of this evidence, in declaration order, for the mirror test in
+    /// [`MintedDidRecord`](crate::registry::MintedDidRecord).
+    ///
+    /// The destructuring is exhaustive and deliberately `..`-free: a field added to [`MintedDid`]
+    /// fails to compile HERE, so the mirror and its test cannot stay behind it. A hand-maintained
+    /// list of assertions cannot offer that, which is how a sibling mirror silently dropped the one
+    /// field its pairing rule depends on.
+    #[cfg(test)]
+    pub(crate) fn every_field(&self) -> (&str, Bytes32, Bytes32, u32) {
+        let Self {
+            did,
+            launcher_id,
+            coin_id,
+            confirmed_height,
+        } = self;
+        (did, *launcher_id, *coin_id, *confirmed_height)
     }
 }
 

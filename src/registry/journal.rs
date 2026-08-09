@@ -128,6 +128,14 @@ pub struct ConfirmedStoreRecord {
     pub coin_id: Bytes32,
     /// The height the store coin confirmed at.
     pub confirmed_height: u32,
+    /// The DID coin this store was launched FROM — the field that makes the record attributable.
+    ///
+    /// A confirmed store coin on its own says a store exists somewhere; only this says WHOSE, and
+    /// [`ProfileAnchor::from_confirmed`](crate::ProfileAnchor::from_confirmed) pairs the two halves
+    /// of a mint by comparing it against the DID's own coin id. A mirror that dropped it would
+    /// reload a store with no owner, leaving any surface that rendered "this store belongs to
+    /// profile X" asserting something the file cannot back.
+    pub did_coin_id: Bytes32,
     /// The root the launch spend committed to.
     pub committed_root: [u8; 32],
 }
@@ -138,6 +146,7 @@ impl From<&ConfirmedStore> for ConfirmedStoreRecord {
             launcher_id: store.launcher_id(),
             coin_id: store.coin_id(),
             confirmed_height: store.confirmed_height(),
+            did_coin_id: store.did_coin_id(),
             committed_root: store.committed_root(),
         }
     }
@@ -307,45 +316,83 @@ mod tests {
         // There is deliberately no `MintedDid::from(record)`; see the module docs.
     }
 
-    /// Each mirror copies every field of its evidence, asserted field-by-field against its own
-    /// source so a swapped or dropped field fails rather than merely producing a plausible record.
+    /// Each mirror copies EVERY field of its evidence — and the suite can no longer be wrong about
+    /// what "every" means.
+    ///
+    /// Both sides are destructured exhaustively, with no `..`: the record here, and its evidence
+    /// inside `every_field`. So a field added to either the evidence or the mirror is a COMPILE
+    /// ERROR rather than a silently unasserted one. The previous version of this test carried the
+    /// same exhaustive-sounding name over a hand-maintained list of four assertions, which is why
+    /// `ConfirmedStore::did_coin_id` — the field `ProfileAnchor` pairs the two mint halves by —
+    /// could be missing from `ConfirmedStoreRecord` entirely and stay invisible.
+    ///
+    /// Every fixture gives each field its own byte pattern, so a conversion that transposed two ids
+    /// fails here too rather than producing a plausible record.
     #[test]
     fn each_record_mirrors_every_field_of_its_evidence() {
         use crate::mint::fixtures::{confirmed_store, pending_mint, pending_store_launch};
 
         let minted = minted_did(2);
-        let did_record = MintedDidRecord::from(&minted);
-        assert_eq!(did_record.did, minted.did());
-        assert_eq!(did_record.launcher_id, minted.launcher_id());
-        assert_eq!(did_record.coin_id, minted.coin_id());
-        assert_eq!(did_record.confirmed_height, minted.confirmed_height());
+        let MintedDidRecord {
+            did,
+            launcher_id,
+            coin_id,
+            confirmed_height,
+        } = MintedDidRecord::from(&minted);
+        assert_eq!(
+            (did.as_str(), launcher_id, coin_id, confirmed_height),
+            minted.every_field()
+        );
 
         let store = confirmed_store(2);
-        let store_record = ConfirmedStoreRecord::from(&store);
-        assert_eq!(store_record.launcher_id, store.launcher_id());
-        assert_eq!(store_record.coin_id, store.coin_id());
-        assert_eq!(store_record.confirmed_height, store.confirmed_height());
-        assert_eq!(store_record.committed_root, store.committed_root());
+        let ConfirmedStoreRecord {
+            launcher_id,
+            coin_id,
+            confirmed_height,
+            did_coin_id,
+            committed_root,
+        } = ConfirmedStoreRecord::from(&store);
+        assert_eq!(
+            (
+                launcher_id,
+                coin_id,
+                confirmed_height,
+                did_coin_id,
+                committed_root
+            ),
+            store.every_field()
+        );
 
-        // The two pending mirrors are built from distinct byte patterns per field, so a
-        // constructor that transposed two ids would be visible here.
         let pending_mint = pending_mint();
-        let mint_record = PendingMintRecord::from(&pending_mint);
-        assert_eq!(mint_record.launcher_id, pending_mint.launcher_id());
-        assert_eq!(mint_record.did_coin_id, pending_mint.did_coin_id());
-        assert_eq!(mint_record.source_coin_id, pending_mint.source_coin_id());
-        assert_eq!(mint_record.pushed_at_height, 77);
+        let PendingMintRecord {
+            launcher_id,
+            did_coin_id,
+            source_coin_id,
+            pushed_at_height,
+        } = PendingMintRecord::from(&pending_mint);
+        assert_eq!(
+            (launcher_id, did_coin_id, source_coin_id, pushed_at_height),
+            pending_mint.every_field()
+        );
 
         let pending_launch = pending_store_launch();
-        let launch_record = PendingStoreLaunchRecord::from(&pending_launch);
-        assert_eq!(launch_record.launcher_id, pending_launch.launcher_id());
-        assert_eq!(launch_record.store_coin_id, pending_launch.store_coin_id());
-        assert_eq!(launch_record.did_coin_id, pending_launch.did_coin_id());
+        let PendingStoreLaunchRecord {
+            launcher_id,
+            store_coin_id,
+            did_coin_id,
+            committed_root,
+            pushed_at_height,
+        } = PendingStoreLaunchRecord::from(&pending_launch);
         assert_eq!(
-            launch_record.committed_root,
-            pending_launch.committed_root()
+            (
+                launcher_id,
+                store_coin_id,
+                did_coin_id,
+                committed_root,
+                pushed_at_height
+            ),
+            pending_launch.every_field()
         );
-        assert_eq!(launch_record.pushed_at_height, 88);
     }
 
     /// No stage's label may assert that a profile exists — at every stage that would be false, and

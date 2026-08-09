@@ -214,6 +214,54 @@ impl ConfirmedStore {
     pub fn committed_root(&self) -> [u8; 32] {
         self.committed_root
     }
+
+    /// Every field of this evidence, in declaration order, for the mirror test in
+    /// [`ConfirmedStoreRecord`](crate::registry::ConfirmedStoreRecord).
+    ///
+    /// The destructuring is exhaustive and deliberately `..`-free: a field added to
+    /// [`ConfirmedStore`] fails to compile HERE, which is what forces the mirror and its test to
+    /// grow with it. A hand-maintained list of assertions cannot do that — which is exactly how
+    /// `did_coin_id`, the field that makes a store attributable, came to be mirrored nowhere and
+    /// asserted nowhere.
+    #[cfg(test)]
+    pub(crate) fn every_field(&self) -> (Bytes32, Bytes32, u32, Bytes32, [u8; 32]) {
+        let Self {
+            launcher_id,
+            coin_id,
+            confirmed_height,
+            did_coin_id,
+            committed_root,
+        } = self;
+        (
+            *launcher_id,
+            *coin_id,
+            *confirmed_height,
+            *did_coin_id,
+            *committed_root,
+        )
+    }
+}
+
+impl PendingStoreLaunch {
+    /// Every field of this pending launch, in declaration order. See
+    /// [`ConfirmedStore::every_field`] for why it destructures exhaustively.
+    #[cfg(test)]
+    pub(crate) fn every_field(&self) -> (Bytes32, Bytes32, Bytes32, [u8; 32], u32) {
+        let Self {
+            launcher_id,
+            store_coin_id,
+            did_coin_id,
+            committed_root,
+            pushed_at_height,
+        } = self;
+        (
+            *launcher_id,
+            *store_coin_id,
+            *did_coin_id,
+            *committed_root,
+            *pushed_at_height,
+        )
+    }
 }
 
 #[cfg(test)]
