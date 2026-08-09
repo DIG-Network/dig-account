@@ -851,7 +851,11 @@ mod tests {
         #[test]
         fn a_did_string_that_does_not_belong_to_its_launcher_id_is_rejected() {
             let spoof = "did:chia:1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqvictim";
-            assert_ne!(spoof, honest_did(), "the spoof must differ, or this proves nothing");
+            assert_ne!(
+                spoof,
+                honest_did(),
+                "the spoof must differ, or this proves nothing"
+            );
 
             assert_rejected(
                 format!(

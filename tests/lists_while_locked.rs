@@ -19,7 +19,7 @@ const ON_DISK: &str = r#"{
     {
       "ix": 0,
       "anchor": {
-        "did": "did:chia:zero",
+        "did": "did:chia:1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqscdhf6s",
         "launcher_id": "0x0101010101010101010101010101010101010101010101010101010101010101",
         "did_coin_id": "0x0202020202020202020202020202020202020202020202020202020202020202",
         "did_confirmed_height": 4200000,
@@ -32,7 +32,7 @@ const ON_DISK: &str = r#"{
     {
       "ix": 4,
       "anchor": {
-        "did": "did:chia:four",
+        "did": "did:chia:1qszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqp982aa",
         "launcher_id": "0x0404040404040404040404040404040404040404040404040404040404040404",
         "did_coin_id": "0x0505050505050505050505050505050505050505050505050505050505050505",
         "did_confirmed_height": 4200010,
@@ -84,7 +84,10 @@ fn a_locked_host_can_list_filter_and_read_the_active_profile() {
         .expect("the fixture has an active profile");
     assert_eq!(ActiveProfile::ix(active), ProfileIx(0));
     assert_eq!(active.entry().label(), Some("personal"));
-    assert_eq!(active.entry().anchor().did(), "did:chia:zero");
+    assert_eq!(
+        active.entry().anchor().did(),
+        "did:chia:1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqscdhf6s"
+    );
 }
 
 /// A half-finished mint is visible to a locked host too — it is what the host renders instead of
