@@ -134,6 +134,31 @@ NOT load: `from_json` returns `RegistryInvariant` and yields no registry at all,
    NOT reuse a gap: an index that looks free locally may already hold an undiscovered profile, and an
    in-progress index names a DID that is already paid for.
 
+#### 2.4.1a The evidence rules re-asserted on load (normative)
+
+The four invariants above are STRUCTURAL. Separately, the deserialize path MUST re-assert the evidence
+rules that the evidence constructors enforce, because `Deserialize` reaches the fields directly and
+never passes through those constructors. These apply to a `ProfileAnchor` AND to every journalled
+record, held to the SAME rules — the journal is not a lesser record, it is the SPEND-PATH input a phase-B
+resume parents its store launch from.
+
+1. **A DID string MUST re-derive from its own launcher id.** `check` MUST recompute it with the SAME
+   derivation `MintedDid::from_confirmed` uses, never a second implementation, so the check and the
+   constructor cannot drift. This closes a DID-string SPOOF and NOTHING more: an attacker who computes
+   the correct string for a launcher id still loads a fabricated anchor. Deserialization remains a cache
+   of a verdict (§2.4).
+2. **A confirmed height MUST NOT be zero.** No coin is created in block 0, so a zero is fabricated by
+   construction — `MintedDid::from_confirmed` and `ConfirmedStore::from_confirmed` both refuse it, and a
+   file MUST NOT be able to smuggle it past them. Applies to both halves of an anchor and to journalled
+   records.
+3. **A journalled `store_fee` MUST NOT exceed `MAX_MINT_FEE_MOJOS`**, on construction and on load. A
+   resumed phase B spends the journalled fee with no phase-A context to re-validate against, so the file
+   — not an argument — is the path that would otherwise hand an unbounded fee to a farmer.
+
+A host MUST NOT map a `RegistryInvariant` load failure to an empty registry. That fallback silently
+re-arms the double-mint the journal exists to prevent: the file is the only record that stops an
+amnesiac restart re-minting a DID the user has already paid for.
+
 #### 2.4.2 Visibility
 
 `ProfileVisibility` is a LOCAL VIEW PREFERENCE with no on-chain effect. Hiding a profile MUST NOT stop
