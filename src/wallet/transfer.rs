@@ -205,7 +205,7 @@ pub enum TransferError {
     #[error(
         "this transfer cannot be sped up: its own input coins total {reused_total} mojos, which \
          cannot cover the {required} a fee this high would need. Wait for it to confirm or fail on \
-         its own — do NOT build another transfer to the same recipient, which can pay them twice"
+         its own — a second payment to the same recipient risks paying them twice"
     )]
     ReplacementInputsInsufficient {
         /// The amount plus the raised fee.
@@ -3061,15 +3061,8 @@ mod tests {
         for refusal in refusals {
             let error = refusal.expect_err("each fixture must actually refuse");
             let rendered = error.to_string().to_lowercase();
-            for forbidden in [
-                "build another transfer",
-                "build a new transfer",
-                "send it again",
-                "try again",
-                "a fresh transfer",
-            ] {
-                assert!(
-                    !rendered.contains(forbidden),
+            if let Some(forbidden) = forbidden_advice_in(&rendered) {
+                panic!(
                     "{error:?} tells the user to {forbidden:?}, which is the action that pays the \
                      recipient twice: {rendered}"
                 );
@@ -3077,12 +3070,59 @@ mod tests {
         }
     }
 
-    /// The control for the test above: it can actually SEE the forbidden phrasing. Without this, a
-    /// typo in the needle list would leave the invariant asserting nothing at all.
+    /// Instructions to rebuild a transfer, in the forms a refusal might plausibly use.
+    ///
+    /// Shared by the invariant and its control so the control proves the list that is ACTUALLY
+    /// applied. A control checking its own private copy would stay green through a typo in the real
+    /// one, which is the failure it exists to prevent.
+    const REBUILD_INSTRUCTIONS: [&str; 6] = [
+        "build another transfer",
+        "build a new transfer",
+        "send another transfer",
+        "send it again",
+        "try again",
+        "a fresh transfer",
+    ];
+
+    /// The first rebuild instruction `rendered` contains, if any.
+    fn forbidden_advice_in(rendered: &str) -> Option<&'static str> {
+        REBUILD_INSTRUCTIONS
+            .into_iter()
+            .find(|forbidden| rendered.contains(forbidden))
+    }
+
+    /// The control: the check can actually SEE forbidden advice, through the same function and the
+    /// same list the invariant uses. Without it, a needle list that matched nothing would leave the
+    /// invariant asserting nothing at all — the vacuous-green shape this whole suite exists to avoid.
     #[test]
-    fn the_forbidden_advice_check_can_detect_forbidden_advice() {
-        let rendered = "wait for it to confirm, or build a new transfer".to_lowercase();
-        assert!(rendered.contains("build a new transfer"));
+    fn the_forbidden_advice_check_detects_every_instruction_it_screens_for() {
+        for instruction in REBUILD_INSTRUCTIONS {
+            let rendered = format!("this transfer cannot be sped up; {instruction} instead");
+            assert_eq!(
+                forbidden_advice_in(&rendered),
+                Some(instruction),
+                "the screen must catch {instruction:?}, or the invariant is measuring nothing"
+            );
+        }
+    }
+
+    /// And it does not fire on the sentence the crate actually renders — a warning ABOUT a second
+    /// payment is not an instruction to make one. This is what separates the invariant from a rule
+    /// that would ban discussing the hazard at all.
+    #[test]
+    fn the_forbidden_advice_check_does_not_fire_on_a_warning() {
+        let rendered = TransferError::ReplacementInputsInsufficient {
+            required: 1_100,
+            reused_total: 1_000,
+        }
+        .to_string()
+        .to_lowercase();
+
+        assert_eq!(forbidden_advice_in(&rendered), None, "{rendered}");
+        assert!(
+            rendered.contains("wait for it to confirm"),
+            "the refusal must still give the one always-correct instruction: {rendered}"
+        );
     }
 
     /// `max_replacement_fee_mojos` is the ceiling a bump control must respect, and it equals the
