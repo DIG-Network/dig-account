@@ -267,9 +267,9 @@ where
 /// Picks the smallest confirmed, unspent coin that can fund the mint on its own.
 ///
 /// Smallest-sufficient keeps the wallet's larger coins intact and the change small. A coin that is
-/// unconfirmed or already spent is not spendable, so it is not a candidate — and it is not counted
-/// toward `available` either, or [`MintError::InsufficientFunds`] would report a balance the user
-/// cannot actually spend.
+/// unconfirmed, already spent, or locked by a puzzle this wallet cannot unlock is not spendable, so
+/// it is not a candidate — and it is not counted toward `available` either, or
+/// [`MintError::InsufficientFunds`] would report a balance the user cannot actually spend.
 fn select_funding_coin<C>(
     chain: &C,
     puzzle_hash: Bytes32,
@@ -282,9 +282,17 @@ where
         .coin_records_by_puzzle_hash(puzzle_hash, false)
         .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
 
-    let spendable = records
-        .iter()
-        .filter(|record: &&CoinRecord| record.confirmed_height.is_some() && !record.is_spent());
+    // A by-puzzle-hash query is answered by a hint-indexing source, so the records include coins the
+    // caller did not ask for: a $DIG holder's CAT is hinted at this wallet while its own puzzle hash
+    // is the CAT's outer puzzle, which the standard-layer spend built below cannot unlock. Such a
+    // record is EXCLUDED rather than refused. A hint is memo data anybody may write, so refusing on
+    // one would hand a stranger a kill switch — dust the address and the mint is bricked — whereas
+    // exclusion reaches the same end: only an own-puzzle-hash coin can be selected or counted.
+    let spendable = records.iter().filter(|record: &&CoinRecord| {
+        record.coin.puzzle_hash == puzzle_hash
+            && record.confirmed_height.is_some()
+            && !record.is_spent()
+    });
 
     let required = options.required_coin_amount();
     let mut best: Option<Coin> = None;
@@ -642,6 +650,54 @@ mod tests {
         );
     }
 
+    /// A $DIG holder's CAT coin must not be mistaken for spendable XCH. A hint-indexing chain source
+    /// answers a by-puzzle-hash query with coins whose OWN puzzle hash differs — a CAT's outer puzzle
+    /// hash, hinted to this wallet — and the standard-layer spend the mint builds cannot unlock one,
+    /// so selecting it produces a bundle that fails validation and the holder cannot mint at all.
+    ///
+    /// The foreign coin here is both sufficient AND smaller than the honest one, so a selection blind
+    /// to the puzzle hash prefers it under the smallest-sufficient rule. The honest coin is the
+    /// control: it must still be chosen, which is also the proof that a foreign record is merely
+    /// ignored rather than fatal.
+    #[test]
+    fn a_foreign_puzzle_hash_coin_is_never_selected_and_never_bricks_the_mint() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let parent = Bytes32::new([1; 32]);
+        let chain = HintedChain::returning(vec![
+            Coin::new(parent, CAT_PUZZLE_HASH, 200),
+            Coin::new(parent, wallet.puzzle_hash(), 900),
+        ]);
+
+        let chosen = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
+            .expect("the wallet's own coin covers the mint, so a foreign record is not fatal");
+        assert_eq!(
+            chosen.puzzle_hash,
+            wallet.puzzle_hash(),
+            "the mint may only fund itself from a coin its own standard layer can unlock"
+        );
+        assert_eq!(chosen.amount, 900);
+    }
+
+    /// The `available` figure is user-facing, so it must count only mojos the wallet can actually
+    /// spend. Counting the CAT coin would tell a holder short of XCH that they hold 50_000 mojos and
+    /// leave them no way to explain why the mint refuses.
+    #[test]
+    fn a_foreign_puzzle_hash_coin_is_not_counted_as_available_balance() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let parent = Bytes32::new([1; 32]);
+        let chain = HintedChain::returning(vec![
+            Coin::new(parent, CAT_PUZZLE_HASH, 50_000),
+            Coin::new(parent, wallet.puzzle_hash(), 50),
+        ]);
+
+        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
+            .expect_err("50 mojos cannot cover a 101-mojo mint");
+        assert!(
+            matches!(error, MintError::InsufficientFunds { available: 50, .. }),
+            "{error}"
+        );
+    }
+
     /// **The production constructor, asserted directly.** Every other test in this crate drives
     /// `from_constants(TESTNET11)`, so a `mainnet()` that returned the wrong chain's constants would
     /// be an unkillable mutant: nothing would fail, and the only line a real user executes would
@@ -761,6 +817,10 @@ mod tests {
         );
     }
 
+    /// Stands in for the outer puzzle hash of a CAT — the $DIG coin whose inner puzzle is hinted at
+    /// this wallet. Its only property that matters is being a puzzle hash no wallet key derives.
+    const CAT_PUZZLE_HASH: Bytes32 = Bytes32::new([0xCA; 32]);
+
     /// A chain source over a fixed set of coin records — enough to exercise selection without a
     /// simulator.
     struct FixedChain {
@@ -829,6 +889,64 @@ mod tests {
 
         fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
             Ok(None)
+        }
+    }
+
+    /// A chain source that models **hint indexing**: a by-puzzle-hash query is answered with every
+    /// record it holds, including coins locked by a puzzle hash the caller did not ask for.
+    ///
+    /// This is what a real source does. [`FixedChain`] filters by puzzle hash on the way IN, so a
+    /// fixture built on it can never hand selection a foreign coin and is structurally incapable of
+    /// observing whether selection checks the puzzle hash at all.
+    struct HintedChain {
+        inner: FixedChain,
+    }
+
+    impl HintedChain {
+        /// A source that answers every by-puzzle-hash query with `coins`, confirmed and unspent.
+        fn returning(coins: Vec<Coin>) -> Self {
+            Self {
+                inner: FixedChain::new(coins),
+            }
+        }
+    }
+
+    impl ChainSource for HintedChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+            self.inner.coin_record(coin_id)
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(self.inner.records.clone())
+        }
+
+        fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+            self.inner.coin_records_by_parent(parent)
+        }
+
+        fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+            self.inner.coin_spend(coin_id)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            launcher_id: Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            self.inner.resolve_singleton_lineage(launcher_id)
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            self.inner.peak_height()
+        }
+
+        fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+            self.inner.block_timestamp(height)
         }
     }
 }
