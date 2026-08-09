@@ -758,11 +758,20 @@ that is zero. Chia treats unspent input value as fee silently, so a change figur
 does not fail — it donates the difference to a farmer, and the only place it surfaces is the user's
 balance.
 
-Every secondary input MUST assert a coin announcement created by the lead. A secondary spend creates
-nothing, so unbound it is value handed to whoever includes it: a node could take the secondaries, drop
-the lead, and burn the coins into fees. The binding runs in ONE direction only, and MUST NOT be
-duplicated in reverse — the lead alone is already un-includable, because without the secondaries its
-outputs plus fee exceed its input and consensus refuses a spend that creates value.
+Every secondary input MUST assert a coin announcement created by the lead, so a spend that creates
+nothing is invalid on its own terms rather than only in company.
+
+What that binding does NOT defend against MUST NOT be overstated: a third party cannot take a signed
+bundle, drop the lead and submit the remainder, because the aggregate `AGG_SIG_ME` signature does not
+verify against a subset of the spends. That attack is stopped by BLS, not by this condition. The
+binding is defence in depth for shapes where the aggregate is not the protection — a partially-signed
+or multi-signer bundle, or any assembly step that can recombine spends. A test of this binding MUST
+re-sign the orphaned subset; a test that resubmits the original signature measures the signature
+failure and would pass with the binding removed entirely.
+
+The binding runs in ONE direction only, and MUST NOT be duplicated in reverse — the lead alone is
+already un-includable, because without the secondaries its outputs plus fee exceed its input and
+consensus refuses a spend that creates value.
 
 No two coins a bundle creates may share `(parent, puzzle_hash, amount)`; consensus rejects a duplicate
 coin id deterministically, and since re-selection is deterministic the wallet would wedge on that amount
@@ -803,6 +812,32 @@ fabricating source would have to contradict is one it also supplied.
 A chain that cannot answer — including one that cannot report a peak — MUST fail closed with
 `TransferError::ChainUnreachable`. The state is then UNKNOWN, never an absence, and a caller MUST NOT
 record a result from it.
+
+#### 6.7.5 Atomicity across reads
+
+`transfer_status` asks the chain three separate questions — the peak, the payment coin, then each input
+— and they are answered at three separate moments. Bundle atomicity is a property of the CHAIN, not of
+a sequence of RPCs, and the aggregating chain source §6.7.4 recommends is precisely the deployment
+where the answers come from different nodes at different heights.
+
+Before returning `Failed`, an implementation MUST RE-READ the payment coin and declare death only if it
+is still absent. Otherwise a node behind the inclusion (payment absent) paired with a node ahead of it
+(input spent) reads as a proof of death for a transfer that has already paid the recipient — and since
+`Failed` directs the caller to build a new transfer, that would spend the user's money a second time. A
+test of this property MUST use a source that answers INCONSISTENTLY across successive reads; a single
+consistent snapshot cannot exhibit it.
+
+#### 6.7.6 `payment_coin_id` is not a bundle identity
+
+`payment_coin_id` identifies the PAYMENT, not the bundle that produced it: it is determined by
+`(lead input, recipient, amount)` and commits to neither the fee nor the change. Because selection is
+deterministic, a fee-bumped retry of the same transfer re-selects the same lead and shares the id, so
+watching the original `PendingTransfer` will report the retry's confirmation as its own, and the two
+`ConfirmedTransfer` values compare equal.
+
+At most one such bundle can ever be included, because they spend the same lead coin — the recipient is
+paid exactly once, and this is NOT a double payment. It is an accounting hazard, and a caller MUST
+dedupe on `payment_coin_id` rather than counting confirmations.
 
 ## 6A. The on-chain DID mint
 

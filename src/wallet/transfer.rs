@@ -315,6 +315,20 @@ impl TransferPlan {
 /// unwrap optimistically. The only question this type can answer is "what should I watch, and since
 /// when" — everything else must come from [`transfer_status`] and the chain. Making the wrong call
 /// unexpressible is stronger than documenting that it is wrong.
+///
+/// # Not a bundle identity
+///
+/// [`payment_coin_id`](Self::payment_coin_id) identifies the PAYMENT, not the bundle that produced
+/// it. It is the id of a coin determined by `(lead input, recipient, amount)` and commits to neither
+/// the fee nor the change — and because selection is deterministic, a fee-bumped retry of the same
+/// transfer re-selects the same lead and yields the SAME id. Watching the original pending record
+/// will therefore report the retry's confirmation as its own.
+///
+/// Be precise about what that is and is not. Both bundles spend the same lead coin, so at most one
+/// can ever be included and the recipient is paid exactly once — this is not a double payment. It is
+/// an ACCOUNTING hazard: a ledger that counts confirmations rather than deduping on
+/// `payment_coin_id` will record two settled payments where one occurred. Callers MUST dedupe on the
+/// id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTransfer {
     payment_coin_id: Bytes32,
@@ -362,6 +376,11 @@ impl PendingTransfer {
 /// source that lies deliberately can satisfy every arithmetic check here. What the checks buy is
 /// reorg safety against an honest source, and the exclusion of degenerate fabrications. Pass a
 /// trusted or aggregating [`ChainSource`], never the same unvetted node the bundle was pushed to.
+///
+/// It identifies a PAYMENT and not the bundle that produced it — see
+/// [`PendingTransfer`]'s "Not a bundle identity", which applies unchanged here: two
+/// `ConfirmedTransfer`s for a transfer and its fee-bumped retry compare EQUAL, because they describe
+/// the same coin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedTransfer {
     payment_coin_id: Bytes32,
@@ -546,32 +565,64 @@ where
         return Ok(TransferStatus::Confirmed(settled));
     }
 
-    // The bundle is atomic: had it been included, every source would be spent AND the payment coin
-    // would exist. A spent source with no payment coin can therefore only be a DIFFERENT spend,
-    // which makes this bundle permanently un-includable. The payment record is checked for EXISTENCE
-    // (not confirmation) here on purpose — a payment coin observed in the mempool, or confirmed but
-    // not yet buried, is this bundle succeeding, and calling that a failure would be a worse lie than
-    // calling it slow.
     if payment.is_none() {
-        for source_id in &pending.source_coin_ids {
-            let source = chain
-                .coin_record(*source_id)
-                .map_err(|e| TransferError::ChainUnreachable(e.to_string()))?;
-            if source.as_ref().is_some_and(CoinRecord::is_spent) {
-                return Ok(TransferStatus::Failed {
-                    reason: format!(
-                        "input coin {} was spent by a different spend; this transfer can never \
-                         confirm",
-                        hex::encode(source_id)
-                    ),
-                });
-            }
+        if let Some(reason) = proof_of_death(pending, chain)? {
+            return Ok(TransferStatus::Failed { reason });
         }
     }
 
     Ok(TransferStatus::Awaiting {
         blocks_since_push: peak.saturating_sub(pending.pushed_at_height),
     })
+}
+
+/// Why this transfer can never confirm, if the chain can actually prove that.
+///
+/// The bundle is atomic ON CHAIN: had it been included, every source would be spent AND the payment
+/// coin would exist. So a spent source alongside an absent payment coin can only be a DIFFERENT
+/// spend, which makes this bundle permanently un-includable.
+///
+/// # Atomicity is a property of the chain, not of three RPCs
+///
+/// [`transfer_status`] reads the peak, then the payment coin, then each source — three separate
+/// questions, answered at three separate moments. [`ConfirmedTransfer`] itself recommends an
+/// AGGREGATING chain source, which is exactly the deployment where those answers come from different
+/// nodes at different heights: a node behind the inclusion says the payment coin does not exist, a
+/// node ahead of it says the source is spent, and the pair reads as a proof of death for a transfer
+/// that has already paid the recipient. Since [`TransferStatus::Failed`] tells the caller to build a
+/// new transfer, that inconsistency spends the user's money a second time.
+///
+/// The payment coin is therefore RE-READ after a spent source is observed, and death is declared only
+/// if it is still absent. That does not make the two reads simultaneous — nothing here can — but it
+/// does mean the conclusion rests on an observation taken AFTER the evidence that would contradict
+/// it, so a source that ever reports the payment coin cannot be read as never having produced one.
+///
+/// The payment record is checked for EXISTENCE rather than confirmation throughout: a payment coin
+/// seen in the mempool, or confirmed but not yet buried, is this bundle succeeding, and calling that
+/// dead would be a worse error than calling it slow.
+fn proof_of_death<C>(pending: &PendingTransfer, chain: &C) -> TransferResult<Option<String>>
+where
+    C: ChainSource + ?Sized,
+{
+    let read = |coin_id: Bytes32| {
+        chain
+            .coin_record(coin_id)
+            .map_err(|e| TransferError::ChainUnreachable(e.to_string()))
+    };
+
+    for source_id in &pending.source_coin_ids {
+        if !read(*source_id)?.as_ref().is_some_and(CoinRecord::is_spent) {
+            continue;
+        }
+        if read(pending.payment_coin_id)?.is_some() {
+            return Ok(None);
+        }
+        return Ok(Some(format!(
+            "input coin {} was spent by a different spend; this transfer can never confirm",
+            hex::encode(source_id)
+        )));
+    }
+    Ok(None)
 }
 
 /// Reads the chain's peak, failing closed when it cannot be established.
@@ -685,12 +736,26 @@ where
 ///
 /// # Why the secondary inputs are bound to the lead
 ///
-/// A secondary spend creates nothing, so on its own it is pure value handed to whoever includes it.
-/// Left unbound, a node could take the secondaries, drop the lead, and burn the user's coins into
-/// fees. Each secondary therefore asserts a coin announcement made by the lead, which makes it
-/// un-includable without it. The binding needs to run in only that direction: the lead alone cannot
-/// be included either, because without the secondaries its outputs plus fee exceed its input and
-/// consensus refuses a spend that creates value.
+/// A secondary spend creates nothing, so in isolation it is pure value handed to whoever includes
+/// it. Each secondary therefore asserts a coin announcement made by the lead, which makes it
+/// un-includable without it.
+///
+/// **What that does NOT defend against, stated plainly:** a third party cannot take this bundle,
+/// drop the lead and submit the rest. The signature is an aggregate over every input's
+/// `AGG_SIG_ME`, and a subset of the spends does not verify against it — so a stranger splitting the
+/// bundle is stopped by BLS, not by this condition. Any rationale claiming otherwise is wrong, and
+/// the test that proves this binding must re-sign the orphaned subset or it is measuring the
+/// signature failure instead.
+///
+/// What it genuinely buys is defence in depth against shapes where the aggregate is not the
+/// protection: a partially-signed or multi-signer bundle, a future builder that signs inputs
+/// independently, or any assembly step that can recombine spends. It costs one condition per input,
+/// and it makes the "secondaries alone" bundle invalid on its own terms rather than only by virtue of
+/// a signature it happens to be paired with.
+///
+/// The binding runs in ONE direction only. The lead alone is already un-includable: without the
+/// secondaries its outputs plus fee exceed its input, and consensus refuses a spend that creates
+/// value. A reverse assertion would be a condition that can never do any work.
 ///
 /// # There is no duplicate-coin-id case left to handle
 ///
@@ -777,6 +842,7 @@ mod tests {
     use clvmr::Allocator;
     use dig_keystore::{BackendKey, MemoryBackend};
     use dig_session::{Password, Session, UnlockedMasterSeed, ENTROPY_LEN};
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -1492,6 +1558,105 @@ mod tests {
         assert!(!asserting.contains(&lead_id));
     }
 
+    /// **The binding, proven against the real consensus validator, with the signature removed as a
+    /// confounder.**
+    ///
+    /// The obvious version of this test — drop the lead spend and resubmit the rest with the ORIGINAL
+    /// aggregate signature — proves nothing: an aggregate over four `AGG_SIG_ME` messages cannot
+    /// verify against three spends, so the validator refuses it for a signature failure and never
+    /// evaluates the unsatisfied `ASSERT_COIN_ANNOUNCEMENT`. Deleting the binding entirely would leave
+    /// that test green.
+    ///
+    /// So the orphaned subset is RE-SIGNED here, correctly, for exactly the spends it contains. The
+    /// only remaining reason for the validator to refuse it is the announcement the lead never made.
+    /// The full bundle is then submitted to the SAME simulator and accepted, which proves the refusal
+    /// was about the missing lead and not about the coins, the keys or the fixture.
+    ///
+    /// This lives in the crate rather than the integration suite because re-signing needs the wallet's
+    /// secret key, which dig-account deliberately does not expose.
+    #[test]
+    fn an_orphaned_secondary_input_is_refused_by_consensus_even_when_correctly_signed() {
+        use chia_bls::Signature;
+        use chia_sdk_test::Simulator;
+        use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+        use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
+
+        /// Sign exactly `coin_spends` with `wallet`'s key, under the simulator's consensus constants.
+        fn sign(wallet: &WalletKey, coin_spends: &[CoinSpend]) -> Signature {
+            let constants = AggSigConstants::from(&*TESTNET11_CONSTANTS);
+            let mut allocator = Allocator::new();
+            let required =
+                RequiredSignature::from_coin_spends(&mut allocator, coin_spends, &constants)
+                    .expect("required signatures");
+            let mut aggregate = Signature::default();
+            for requirement in required {
+                let RequiredSignature::Bls(bls) = requirement else {
+                    panic!("a standard-layer send never requires a secp signature");
+                };
+                aggregate += &chia_bls::sign(wallet.secret_key(), bls.message());
+            }
+            aggregate
+        }
+
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let mut sim = Simulator::new();
+        let coins: Vec<Coin> = (0..4)
+            .map(|_| sim.new_coin(wallet.puzzle_hash(), 200_000))
+            .collect();
+        sim.create_block();
+
+        let chain =
+            FixedChain::with_records(coins.iter().copied().map(confirmed).collect::<Vec<_>>());
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::to_puzzle_hash(RECIPIENT, 700_000).with_fee(1_000),
+            )
+            .expect("builds");
+        assert!(
+            plan.coin_spends().len() > 1,
+            "the fixture must actually exercise secondary inputs"
+        );
+
+        // The lead is the spend whose child is the payment coin; the rest are the orphans.
+        let lead_id = plan
+            .coin_spends()
+            .iter()
+            .find(|spend| {
+                Coin::new(spend.coin.coin_id(), RECIPIENT, 700_000).coin_id()
+                    == plan.payment_coin_id()
+            })
+            .map(|spend| spend.coin.coin_id())
+            .expect("one spend creates the payment coin");
+        let orphans: Vec<CoinSpend> = plan
+            .coin_spends()
+            .iter()
+            .filter(|spend| spend.coin.coin_id() != lead_id)
+            .cloned()
+            .collect();
+        assert!(!orphans.is_empty());
+
+        let orphan_signature = sign(&wallet, &orphans);
+        let refused = sim.new_transaction(chia_protocol::SpendBundle::new(
+            orphans.clone(),
+            orphan_signature.clone(),
+        ));
+        assert!(
+            refused.is_err(),
+            "a correctly-signed secondary input must still be un-includable without its lead"
+        );
+
+        // The control: the SAME coins, the SAME keys, the SAME simulator — with the lead restored.
+        let whole = plan.coin_spends().to_vec();
+        let signature = sign(&wallet, &whole);
+        sim.new_transaction(chia_protocol::SpendBundle::new(whole, signature))
+            .expect(
+                "the complete bundle is valid, so the refusal above was about the missing lead",
+            );
+    }
+
     /// A single-input transfer carries no binding at all: there is no secondary to orphan, and an
     /// unnecessary announcement is block space the user pays for.
     #[test]
@@ -1634,23 +1799,127 @@ mod tests {
         );
     }
 
-    /// The control that stops the test above from being satisfied by a status that calls everything
-    /// dead: the SAME spent input, WITH the payment coin present, is this very bundle succeeding.
+    /// **The control that makes the failure test load-bearing, and it must be an INCONSISTENT one.**
+    ///
+    /// A control built from one consistent snapshot — a spent input and a present payment coin,
+    /// answered identically on every read — proves only that the two facts are weighed in the right
+    /// order WITHIN a snapshot. The hazard is across reads: `transfer_status` asks three separate
+    /// questions, and the aggregating chain source it recommends answers them from different nodes at
+    /// different heights.
+    ///
+    /// So this double answers `coin_record(payment)` as ABSENT the first time and PRESENT afterwards,
+    /// which is exactly what a node behind the inclusion followed by a node ahead of it looks like.
+    /// The source is reported spent throughout. Without the re-read, that pair is a proof of death for
+    /// a transfer that has already paid the recipient — and `Failed` tells the caller to send again.
     #[test]
-    fn a_spent_input_with_the_payment_coin_present_is_not_a_failure() {
+    fn a_payment_coin_absent_on_the_first_read_and_present_on_the_second_is_not_a_failure() {
         let ops = ops();
         let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
         let (pending, payment) = pending_and_payment(&ops, &source);
 
-        let chain = FixedChain::with_records(vec![
-            spent(source.records[0].coin),
-            record(payment, Some(PEAK + 1), None),
-        ]);
+        let chain = FlickeringChain {
+            payment: record(payment, Some(PEAK + 1), None),
+            other: vec![spent(source.records[0].coin)],
+            payment_reads: Cell::new(0),
+            peak: PEAK + 1,
+        };
+
+        let status = transfer_status(&pending, &chain).expect("readable");
+        assert!(
+            !matches!(status, TransferStatus::Failed { .. }),
+            "a payment coin that ANY read reports must not be called never-includable: {status:?}"
+        );
+        assert!(
+            chain.payment_reads.get() >= 2,
+            "the conclusion must rest on a read taken after the spent-source observation"
+        );
+    }
+
+    /// The truthful control for the flickering double: when the payment coin is absent on EVERY read,
+    /// the same fixture still reports the death. Without this, the test above would pass against an
+    /// implementation that had simply stopped reporting `Failed` at all.
+    #[test]
+    fn a_payment_coin_absent_on_every_read_is_still_a_failure() {
+        let ops = ops();
+        let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let (pending, payment) = pending_and_payment(&ops, &source);
+
+        let chain = FlickeringChain {
+            // Never returned: `payment_reads` only ever reaches the absent branch below.
+            payment: record(payment, Some(PEAK + 1), None),
+            other: vec![spent(source.records[0].coin)],
+            payment_reads: Cell::new(usize::MAX),
+            peak: PEAK + 1,
+        };
 
         assert!(matches!(
             transfer_status(&pending, &chain).expect("readable"),
-            TransferStatus::Awaiting { .. }
+            TransferStatus::Failed { .. }
         ));
+    }
+
+    /// A chain source whose answer about the payment coin CHANGES between reads.
+    ///
+    /// `payment_reads` counts calls for the payment coin: the first is answered absent, later ones
+    /// present. Setting it to `usize::MAX` makes every read absent, which is how the same double
+    /// serves as its own control.
+    struct FlickeringChain {
+        payment: CoinRecord,
+        other: Vec<CoinRecord>,
+        payment_reads: Cell<usize>,
+        peak: u32,
+    }
+
+    impl ChainSource for FlickeringChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> std::result::Result<Option<CoinRecord>, String> {
+            if coin_id == self.payment.coin.coin_id() {
+                let seen = self.payment_reads.get();
+                self.payment_reads.set(seen.saturating_add(1));
+                return Ok((seen > 0 && seen != usize::MAX).then(|| self.payment.clone()));
+            }
+            Ok(self
+                .other
+                .iter()
+                .find(|record| record.coin.coin_id() == coin_id)
+                .cloned())
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            Ok(Vec::new())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent: Bytes32,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(&self, _coin_id: Bytes32) -> std::result::Result<Option<CoinSpend>, String> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> std::result::Result<Option<dig_chainsource_interface::SingletonLineage>, String>
+        {
+            Err("not supported by this test double".to_string())
+        }
+
+        fn peak_height(&self) -> std::result::Result<Option<u32>, String> {
+            Ok(Some(self.peak))
+        }
+
+        fn block_timestamp(&self, _height: u32) -> std::result::Result<Option<u64>, String> {
+            Ok(None)
+        }
     }
 
     /// An unreachable chain fails CLOSED: the status is unknown, never "not confirmed".
@@ -1685,13 +1954,18 @@ mod tests {
     }
 
     /// Blocks-since-push is a real elapsed measure a caller can time out on, not a spinner.
+    ///
+    /// The fixture is a genuine in-flight transfer — the input still present and UNSPENT, the payment
+    /// coin not yet created — rather than an empty record set, which would have exercised the
+    /// subtraction while saying nothing about the predicate that chooses `Awaiting`.
     #[test]
-    fn awaiting_reports_the_blocks_elapsed_since_the_push() {
+    fn a_transfer_still_in_flight_reports_the_blocks_elapsed_since_the_push() {
         let ops = ops();
         let source = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
         let (pending, _) = pending_and_payment(&ops, &source);
 
-        let chain = FixedChain::with_records(Vec::new()).at_peak(PEAK + 9);
+        let chain =
+            FixedChain::with_records(vec![confirmed(source.records[0].coin)]).at_peak(PEAK + 9);
         assert_eq!(
             transfer_status(&pending, &chain).expect("readable"),
             TransferStatus::Awaiting {

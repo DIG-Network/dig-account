@@ -156,9 +156,12 @@ fn a_transfer_is_accepted_by_consensus_and_pays_the_recipient_exactly() -> anyho
     Ok(())
 }
 
-/// A MULTI-COIN transfer likewise. The secondary inputs create nothing and only contribute value, so
-/// this is the case where value conservation is computed across coin spends rather than within one —
-/// and the case an announcement binding has to survive.
+/// A MULTI-COIN transfer likewise: the secondary inputs create nothing and only contribute value, so
+/// this is the case where value conservation is computed ACROSS coin spends rather than within one.
+///
+/// It says nothing about the announcement binding — this bundle would confirm without it. The binding
+/// is proven in the crate's own `an_orphaned_secondary_input_is_refused_by_consensus_even_when_correctly_signed`,
+/// which re-signs the orphaned subset so the announcement is the only remaining failure cause.
 #[test]
 fn a_multi_coin_transfer_is_accepted_by_consensus() -> anyhow::Result<()> {
     let account = unlocked_account();
@@ -338,12 +341,17 @@ fn the_gates_summary_names_the_recipient_and_the_exact_amount() -> anyhow::Resul
 /// **The signer refuses a change output that is off by one mojo.**
 ///
 /// This is the adversarial half of the change assertion. Chia treats unspent input value as fee
-/// silently, so a builder that under-computed change would produce a bundle consensus happily accepts
-/// while the difference vanishes to a farmer. The fail-closed signer is what catches it, and this
-/// test proves the signer is genuinely holding that line rather than the builder merely happening to
-/// be right.
+/// silently, so a builder that under-computed change would produce a bundle consensus happily
+/// accepts while the difference vanishes to a farmer. Consensus therefore cannot be the witness
+/// here, and neither can the builder's own arithmetic.
+///
+/// The guard that actually holds this line is VALUE CONSERVATION at summary-derivation time —
+/// `analyze`'s `xch_in == xch_out + fee` check, reached through `DerivedSpend::derive` inside
+/// `authorize_op`. It is named here deliberately: a test whose comment credits the wrong component
+/// invites someone to delete the real one and still see green. The mutated spend is refused BEFORE
+/// an approval is minted, so the signer is never consulted about it at all.
 #[test]
-fn the_signer_refuses_a_transfer_whose_change_is_off_by_one() -> anyhow::Result<()> {
+fn a_transfer_whose_change_is_off_by_one_is_refused_before_any_signature() -> anyhow::Result<()> {
     let account = unlocked_account();
     let chain = SimulatorChain::new();
     let wallet_ph = wallet_puzzle_hash(&account);
@@ -363,28 +371,49 @@ fn the_signer_refuses_a_transfer_whose_change_is_off_by_one() -> anyhow::Result<
     let short_by_one = build_send_by_hand(&ops, source, AMOUNT, FEE, |change| change - 1);
     let honest = build_send_by_hand(&ops, source, AMOUNT, FEE, |change| change);
 
-    // The control must reach APPROVED specifically. `is_ok()` would also be satisfied by
-    // `RequiresConfirmation`, and if this fixture's amount ever drifted above the auto-send
-    // allowance BOTH spends would escalate — the honest one and the mutated one alike — and the test
-    // would pass having compared nothing.
-    assert!(
-        matches!(
-            gate(&ops).authorize_op(&honest, SpendOpClass::SmallSend),
-            Ok(SpendRuling::Approved(_))
-        ),
-        "the control must be auto-approved, or the refusal below proves nothing"
-    );
-
-    let signed_anyway = match gate(&ops).authorize_op(&short_by_one, SpendOpClass::SmallSend) {
-        // Refused outright, or escalated instead of auto-approved: either way no signature exists.
-        Err(_) | Ok(SpendRuling::RequiresConfirmation(_)) => None,
-        Ok(SpendRuling::Approved(approval)) => {
-            Some(ops.money_signer(Network::Testnet).sign_approved(approval))
-        }
+    // CONTROL, both halves. The refusal below is only evidence if the identical-but-honest spend
+    // travels the WHOLE path the mutated one is being denied — approval AND signature.
+    //
+    // Approval alone is not enough of a control. If `sign_approved` were broken, or refused
+    // unconditionally, or the fixture's network/derivation were mismatched, then "no signature
+    // exists" would be true of every spend this test can build, and the assertion below would hold
+    // while proving nothing about the missing mojo. Signing the control is what rules that out.
+    //
+    // `Approved` is asserted specifically rather than `is_ok()`: `RequiresConfirmation` is also
+    // `Ok`, and if this fixture's amount ever drifted above the auto-send allowance BOTH spends
+    // would escalate — the honest one and the mutated one alike — and the test would pass having
+    // compared nothing.
+    let Ok(SpendRuling::Approved(control)) =
+        gate(&ops).authorize_op(&honest, SpendOpClass::SmallSend)
+    else {
+        panic!("the control must be auto-approved, or the refusal below proves nothing");
     };
     assert!(
-        signed_anyway.is_none_or(|result| result.is_err()),
-        "a spend that leaves a mojo of the user's money unaccounted for must not reach a signature"
+        ops.money_signer(Network::Testnet)
+            .sign_approved(control)
+            .is_ok(),
+        "the control must also SIGN, or 'no signature exists' says nothing about the missing mojo"
+    );
+
+    // The mutated spend differs from the control by exactly one mojo of change, so any difference in
+    // outcome is attributable to that mojo and nothing else.
+    let ruling = gate(&ops).authorize_op(&short_by_one, SpendOpClass::SmallSend);
+
+    // REFUSED, not merely escalated. `RequiresConfirmation` would mean the user is shown a spend
+    // that silently loses their money and asked to approve it — a worse outcome than a hard error,
+    // and one an `Err(_) | Ok(RequiresConfirmation(_))` catch-all could not tell apart from a real
+    // refusal. Pinning the arm is what keeps a future softening of this guard visible.
+    let Err(refusal) = ruling else {
+        panic!("a spend that leaves a mojo unaccounted for must be refused outright, not offered");
+    };
+
+    // The refusal must be the value-conservation guard specifically. Any other error — a decode
+    // failure, a policy quirk, an unusable clock — would refuse this spend for a reason that has
+    // nothing to do with the defect, and the test would be green for the wrong cause.
+    let reason = refusal.to_string();
+    assert!(
+        reason.contains("value not conserved"),
+        "the refusal must come from value conservation, not an unrelated failure; got: {reason}"
     );
     Ok(())
 }
@@ -412,52 +441,4 @@ fn build_send_by_hand(
         )
         .expect("a hand-built send");
     ctx.take()
-}
-
-/// **A secondary input cannot be included without the lead.** A secondary spend creates nothing, so
-/// on its own it hands the user's coin to whoever includes it. The announcement binding is what makes
-/// that impossible, and consensus — not an assertion about conditions — is what proves it here.
-#[test]
-fn an_orphaned_secondary_input_is_rejected_by_consensus() -> anyhow::Result<()> {
-    let account = unlocked_account();
-    let chain = SimulatorChain::new();
-    for _ in 0..4 {
-        chain.fund(wallet_puzzle_hash(&account), 200_000);
-    }
-
-    let ops = account.wallet_ops();
-    let plan = ops.build_transfer(
-        &chain,
-        &hot(),
-        &TransferRequest::to_puzzle_hash(RECIPIENT, 700_000).with_fee(FEE),
-    )?;
-    let bundle = authorize_and_sign(&account, &plan);
-
-    // The lead is the spend that creates the payment coin; everything else is a secondary. Keeping
-    // only the secondaries is exactly the attack: their value would be swallowed as fee.
-    let payment_parent = plan
-        .coin_spends()
-        .iter()
-        .find(|spend| {
-            Coin::new(spend.coin.coin_id(), RECIPIENT, 700_000).coin_id() == plan.payment_coin_id()
-        })
-        .map(|spend| spend.coin.coin_id())
-        .expect("one spend creates the payment coin");
-    let orphans: Vec<CoinSpend> = bundle
-        .coin_spends
-        .iter()
-        .filter(|spend| spend.coin.coin_id() != payment_parent)
-        .cloned()
-        .collect();
-    assert!(!orphans.is_empty(), "the fixture must have secondaries");
-
-    let rejected = chain
-        .sim
-        .borrow_mut()
-        .new_transaction(SpendBundle::new(orphans, bundle.aggregated_signature));
-    assert!(
-        rejected.is_err(),
-        "a secondary input must be un-includable without the lead that binds it"
-    );
-    Ok(())
 }
