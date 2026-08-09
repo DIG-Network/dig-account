@@ -2184,12 +2184,22 @@ mod tests {
         );
     }
 
-    /// The fix: a replacement re-spends EXACTLY the original inputs, so the lead — and therefore the
-    /// payment coin id — is unchanged, and the two bundles conflict rather than coexist.
+    /// The identity contract: a replacement keeps the SAME inputs, lead, recipient, amount and
+    /// payment coin id, and takes the extra fee out of the CHANGE rather than out of the amount.
     ///
-    /// The wallet holds a coin with HEADROOM over the amount, because the extra fee has to come from
-    /// somewhere: reusing the same inputs means the bump is paid out of the change, never out of the
-    /// recipient's amount. The exact-cover case is a legitimate refusal and is pinned separately.
+    /// # What this test does NOT prove, stated because it looks like it does
+    ///
+    /// It does not distinguish reuse from re-selection, and no fixture in which the replacement
+    /// SUCCEEDS can. Selection takes the smallest single coin covering `required`, else accumulates
+    /// largest-first; both rules are monotone in `required`, so if the original inputs still cover
+    /// the raised total, re-running selection picks exactly the same coins. Replacing the reuse with
+    /// a fresh `select_input_coins` call leaves this test green — verified by mutation.
+    ///
+    /// The reuse earns its keep in the REFUSAL cases, which is also where the money is lost:
+    /// `a_replacement_the_reused_inputs_cannot_cover_is_refused_with_their_total` and
+    /// `a_replacement_over_a_spent_input_is_refused_by_name` both go red under that mutation, because
+    /// re-selection quietly reaches for a DIFFERENT coin and builds a bundle that does not conflict
+    /// with the original. Those two are the falsifiers; this one pins the contract they operate under.
     #[test]
     fn a_replacement_reuses_the_exact_inputs_and_keeps_the_payment_coin_id() {
         let ops = ops();

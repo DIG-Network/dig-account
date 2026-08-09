@@ -459,6 +459,11 @@ fn build_send_by_hand(
 /// The refusal is asserted against the simulator directly rather than through `farm`, because the
 /// helper applies bundles one at a time and surfaces the rejection as an error; the point here is
 /// that the rejection HAPPENS and is a double spend, which is a claim about consensus.
+///
+/// What this proves is the CONFLICT, not the reuse. Because selection is monotone in `required`, a
+/// replacement that succeeds would have re-selected the same coins anyway, so no successful-path
+/// fixture can tell the two apart. The case where they diverge is the one below, where the original
+/// inputs cannot fund the bump.
 #[test]
 fn a_fee_bumped_replacement_conflicts_and_pays_the_recipient_once() -> anyhow::Result<()> {
     let account = unlocked_account();
@@ -560,6 +565,55 @@ fn a_naive_fee_bumped_rebuild_pays_the_recipient_twice() -> anyhow::Result<()> {
         recipient_balance(&chain),
         1_200_000,
         "both bundles are includable, so the naive rebuild really does pay twice"
+    );
+    Ok(())
+}
+
+/// **The case where reuse and re-selection diverge, and where the money is lost.**
+///
+/// The original consumes its lead EXACTLY, so there is no change to raise a fee from. A replacement
+/// must therefore refuse — and refusing is the whole safety property, because the wallet is holding
+/// a second coin that a re-selecting implementation would happily reach for, producing a bundle that
+/// does NOT conflict with the original and pays the recipient a second time.
+///
+/// This is the end-to-end companion to the unit refusal test: it proves the refusal happens against
+/// a real gate and a real chain, and that the second coin really was available to be misused. Pair it
+/// with `a_naive_fee_bumped_rebuild_pays_the_recipient_twice`, which shows what taking that coin does.
+#[test]
+fn a_replacement_refuses_rather_than_reaching_for_another_coin() -> anyhow::Result<()> {
+    let account = unlocked_account();
+    let chain = SimulatorChain::new();
+    // The lead is consumed exactly; the second coin is the one a re-selection would grab.
+    chain.fund(wallet_puzzle_hash(&account), 600_000);
+    chain.fund(wallet_puzzle_hash(&account), 900_000);
+    chain.bury(1);
+
+    let ops = account.wallet_ops();
+    let pending = send(
+        &account,
+        &chain,
+        &TransferRequest::to_puzzle_hash(RECIPIENT, 600_000),
+    )?;
+
+    let refused = ops
+        .build_transfer_replacing(&chain, &hot(), &pending, 5_000)
+        .expect_err("an exactly-consumed input cannot fund a higher fee");
+    match refused {
+        TransferError::InsufficientFunds {
+            required: 605_000,
+            available: 600_000,
+        } => {}
+        other => panic!(
+            "the refusal must name the REUSED inputs' total, proving no substitute was taken: \
+             {other}"
+        ),
+    }
+
+    chain.farm()?;
+    assert_eq!(
+        recipient_balance(&chain),
+        600_000,
+        "the original still settles, exactly once, and no replacement was ever built"
     );
     Ok(())
 }
