@@ -43,7 +43,11 @@ impl From<&str> for AccountId {
 /// Identity keys derive at the hardened path `m/12381'/8444'/9'/{ix}'`; wallet keys derive at the
 /// canonical unhardened path at the same index. `ProfileIx::ROOT` (0) is the initial default
 /// profile of every account.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Persisted as the bare number (a serde newtype is transparent), so the profile registry's
+/// on-disk form reads as `"ix": 3` rather than a wrapper object.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct ProfileIx(pub u32);
 
 impl ProfileIx {

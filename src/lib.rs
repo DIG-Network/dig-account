@@ -43,6 +43,7 @@ pub mod keys;
 pub mod mint;
 pub mod model;
 pub mod profile_mint;
+pub mod registry;
 pub mod session;
 pub mod session_residency;
 pub mod signer;
@@ -65,6 +66,11 @@ pub use mint::{
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;
+pub use registry::{
+    ActiveProfile, ActiveSwitch, ConfirmedStoreRecord, MintStage, MintedDidRecord,
+    PendingMintRecord, PendingStoreLaunchRecord, ProfileAnchor, ProfileEntry, ProfileMintInProgress,
+    ProfileRegistry, ProfileVisibility,
+};
 pub use session::AccountSession;
 pub use session_residency::Residency;
 pub use signer::ProfileSigner;

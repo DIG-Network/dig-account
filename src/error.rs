@@ -24,6 +24,41 @@ pub enum AccountError {
     #[error("default-profile invariant violated: {0}")]
     DefaultProfileInvariant(String),
 
+    /// A profile is already recorded at this index.
+    ///
+    /// An anchor is evidence of ONE specific on-chain mint, so re-recording an index would replace
+    /// a proof with a different proof. The existing entry is left untouched.
+    #[error("a profile is already registered at index {0}")]
+    ProfileAlreadyRegistered(ProfileIx),
+
+    /// The ACTIVE profile cannot be hidden from the host's lists.
+    ///
+    /// A hidden active profile is a trap: the UI lists nothing while the wallet keeps deriving and
+    /// receiving at that index. Switch away first, then hide.
+    #[error("the active profile {0} cannot be hidden from lists")]
+    ActiveProfileCannotBeHidden(ProfileIx),
+
+    /// A mint is already journalled at this index.
+    ///
+    /// Beginning a second one would re-mint a DID that may already be paid for, orphaning the
+    /// first (dig_ecosystem#2377). Resume the journalled mint instead.
+    #[error("a profile mint is already in progress at index {0}")]
+    MintAlreadyInProgress(ProfileIx),
+
+    /// A profile registry violated one of its four invariants — usually an edited or corrupt file.
+    ///
+    /// Fail-closed: the registry is not partially loaded, so a host never acts on a half-valid
+    /// profile list.
+    #[error("profile registry invariant violated: {0}")]
+    RegistryInvariant(String),
+
+    /// The account has no active profile, because it has no confirmed profile at all.
+    ///
+    /// This is the pre-mint state of every new account, not a fault: the host's answer is to run
+    /// the first-run mint, never to invent an index.
+    #[error("the account has no active profile")]
+    NoActiveProfile,
+
     /// An underlying keystore operation failed.
     #[error("keystore error: {0}")]
     Keystore(String),
