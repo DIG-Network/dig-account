@@ -13,6 +13,7 @@
 pub mod approval;
 pub mod authorizer;
 pub mod autosend;
+pub mod cat_transfer;
 pub mod clock;
 pub mod enforcer;
 pub mod money_signer;

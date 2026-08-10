@@ -41,6 +41,7 @@ use chia_wallet_sdk::types::Conditions;
 use dig_chainsource_interface::{ChainSource, CoinRecord};
 use dig_did::types::Owner;
 
+use crate::chain_confirm::{confirm_spendable_by_name, UnconfirmedInput};
 use crate::id::ProfileIx;
 use crate::keys::wallet_key::WalletKey;
 use crate::mint::chain::{PushOutcome, SpendPublisher};
@@ -344,50 +345,18 @@ where
         required,
         available,
     })?;
-    confirm_spendable_by_name(chain, chosen)?;
+    confirm_spendable_by_name(chain, chosen).map_err(unknown_state)?;
     Ok(chosen)
 }
 
-/// Re-reads the chosen coin BY NAME and refuses unless that answer also calls it confirmed and
-/// unspent.
+/// Translates the crate-wide by-name guard's neutral verdict into the mint's own error surface.
 ///
-/// A by-puzzle-hash listing is a different question, often answered by a different node: this
-/// crate's mainnet source routes each read to a peer it picks per call, and the very same listing
-/// has been observed returning the wallet's coins on one call and an empty set on the next. A
-/// listing that is stale by one spend offers a coin the network already considers gone, and nothing
-/// downstream can notice — the bundle builds, passes the signing gate, and is broadcast, at which
-/// point Chia's mempool answers `DOUBLE_SPEND`, because a removal whose coin record says spent is
-/// the only condition that produces that verdict.
-///
-/// So the choice is confirmed against the question the MEMPOOL asks — one coin, by name — before a
-/// single mojo of the user's XCH is committed to a bundle. Two answers that cannot both be true
-/// make the coin's state UNKNOWN, which is [`MintError::ChainUnreachable`] and never a shortfall or
-/// a refusal: the wallet may be perfectly funded and the next read may be answered by a node that
-/// is caught up.
-fn confirm_spendable_by_name<C>(chain: &C, coin: Coin) -> MintResult<()>
-where
-    C: ChainSource + ?Sized,
-{
-    let record = chain
-        .coin_record(coin.coin_id())
-        .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
-
-    match record {
-        Some(record) if record.confirmed_height.is_some() && !record.is_spent() => Ok(()),
-        Some(record) => Err(MintError::ChainUnreachable(format!(
-            "the chain listed coin {} as spendable and then, read by name, called it \
-             confirmed={:?} spent={:?} — refusing to build a spend on a coin the network may \
-             already have consumed",
-            coin.coin_id(),
-            record.confirmed_height,
-            record.spent_height,
-        ))),
-        None => Err(MintError::ChainUnreachable(format!(
-            "the chain listed coin {} as spendable and then could not find it by name — the two \
-             answers cannot both be true, so the coin's state is unknown",
-            coin.coin_id(),
-        ))),
-    }
+/// Every [`UnconfirmedInput`] variant means one thing — the coin's state is UNKNOWN — so every one
+/// of them maps onto [`MintError::ChainUnreachable`]. It is deliberately never
+/// [`MintError::InsufficientFunds`] and never a refusal: the wallet may be perfectly funded and the
+/// next read may be answered by a node that is caught up.
+fn unknown_state(unconfirmed: UnconfirmedInput) -> MintError {
+    MintError::ChainUnreachable(unconfirmed.to_string())
 }
 
 /// Builds the unsigned mint bundle: the wallet-coin split, then `dig-did`'s create.

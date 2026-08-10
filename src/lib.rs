@@ -42,6 +42,7 @@
 //! [`ProfileMinter::profile_mint_status`].
 
 pub mod auth;
+pub mod chain_confirm;
 pub mod constants;
 pub mod error;
 pub mod id;
@@ -61,6 +62,9 @@ pub use auth::factors::AuthFactors;
 pub use auth::policy::{AllOf, AuthPolicy, PasswordOnlyPolicy, UnlockError, UnlockGate};
 pub use auth::provider::{AuthProvider, SpendConfirmRequest, SpendDecision, UnlockRequest};
 pub use auth::second_factor::SecondFactor;
+pub use chain_confirm::{
+    confirm_all_spendable_by_name, confirm_spendable_by_name, UnconfirmedInput,
+};
 pub use constants::MAINNET_ADDRESS_PREFIX;
 pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};
@@ -90,6 +94,11 @@ pub use unlocked::UnlockedAccount;
 pub use wallet::approval::{PendingApproval, SpendApproval, SpendRuling};
 pub use wallet::authorizer::WalletOps;
 pub use wallet::autosend::{AutoSendPolicy, OpClassLimits, SpendOpClass, DEFAULT_PERIOD_SECONDS};
+pub use wallet::cat_transfer::{
+    amount_in_dig, cat_curried_puzzle_hash, dig_curried_puzzle_hash, CatTransferError,
+    CatTransferPlan, CatTransferRequest, CatTransferResult, DIG_BASE_UNITS_PER_TOKEN,
+    MAX_CAT_TRANSFER_INPUT_COINS,
+};
 pub use wallet::clock::{Clock, FixedClock, SystemClock};
 pub use wallet::enforcer::PolicyAuthorizer;
 pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};
