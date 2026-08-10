@@ -92,6 +92,11 @@ pub use unlocked::UnlockedAccount;
 pub use wallet::approval::{PendingApproval, SpendApproval, SpendRuling};
 pub use wallet::authorizer::WalletOps;
 pub use wallet::autosend::{AutoSendPolicy, OpClassLimits, SpendOpClass, DEFAULT_PERIOD_SECONDS};
+pub use wallet::cat_transfer::{
+    amount_in_dig, cat_curried_puzzle_hash, dig_curried_puzzle_hash, CatTransferError,
+    CatTransferPlan, CatTransferRequest, CatTransferResult, DIG_BASE_UNITS_PER_TOKEN,
+    MAX_CAT_TRANSFER_INPUT_COINS,
+};
 pub use wallet::clock::{Clock, FixedClock, SystemClock};
 pub use wallet::enforcer::PolicyAuthorizer;
 pub use wallet::money_signer::{LocalMoneySigner, MoneySigner};

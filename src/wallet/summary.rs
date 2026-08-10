@@ -285,6 +285,32 @@ impl SpendSummary {
             .ok_or_else(|| Self::unsummable("the native recipient amounts plus the fee"))
     }
 
+    /// Whether this spend pays out any asset that is not native XCH.
+    ///
+    /// # Why the tier consults this EXPLICITLY
+    ///
+    /// [`checked_native_total_mojos`](Self::checked_native_total_mojos) counts only XCH, so a CAT
+    /// payment of any size totals to just its fee. A $DIG send of one base unit and a send of a
+    /// million therefore weigh the same against a mojo-denominated allowance — the allowance is not
+    /// merely generous about CAT amounts, it cannot see them at all.
+    ///
+    /// A CAT spend was already never auto-approved before this method existed, but only
+    /// INCIDENTALLY: the enforcer's `reject_amounts_no_mojo_limit_can_bound` fires part-way through
+    /// the auto-send ruling, after several early returns, so the property held as a consequence of
+    /// where one filter happened to sit. A correctness property that holds by accident is one
+    /// refactor away from not holding, and the refactor would not look dangerous.
+    ///
+    /// Classifying the spend [`Confirm`](SpendTier::Confirm) up front states the rule instead of
+    /// arriving at it, and it is also the difference between a $DIG send that reaches the user's
+    /// confirmation ceremony and one that returns
+    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) — a hard error the caller cannot
+    /// act on. See `SPEC.md` §6.4.
+    pub fn moves_non_native_assets(&self) -> bool {
+        self.recipients
+            .iter()
+            .any(|recipient| recipient.asset_id.is_some())
+    }
+
     fn unsummable(what: &str) -> AccountError {
         AccountError::PolicyIndeterminate(format!(
             "{what} overflow u64, so this spend has no native total to weigh against a limit"
@@ -500,6 +526,9 @@ impl DerivedSpend {
         let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm);
         let native_total_mojos = summary.checked_native_total_mojos()?;
         summary.tier = SpendTier::classify(policy, native_total_mojos);
+        if summary.tier == SpendTier::AutoSend && summary.moves_non_native_assets() {
+            summary.tier = SpendTier::Confirm;
+        }
         Ok(Self {
             summary,
             native_total_mojos,

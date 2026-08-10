@@ -18,5 +18,6 @@ pub mod enforcer;
 pub mod money_signer;
 pub mod policy;
 pub mod summary;
+pub mod cat_transfer;
 pub mod transfer;
 pub mod vault_move;
