@@ -1215,6 +1215,49 @@ Unchanged from §6A.6 and absolute: signing happens in-process against the unloc
 wallet key, residency is re-checked before every derivation, and the `SpendPublisher` seam takes an
 ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never enters it.
 
+## 6C. `CoinsetPublisher` — the optional coinset.org broadcast seam
+
+An OPTIONAL `SpendPublisher` over a Chia `push_tx` HTTP endpoint, provided so a host with no node of its
+own can still broadcast. It holds no key material: `push` takes an ALREADY-SIGNED bundle (§6B.5).
+
+### 6C.1 Layering (normative)
+
+The response MAPPING MUST be independent of any HTTP client. `PushTransport` is the seam:
+`post_json(url, body) -> Result<HttpAnswer, String>`, where `Err` means the request could not be COMPLETED
+and `Ok` carries whatever the server said, at whatever status code. The blocking client behind
+`BlockingHttpTransport` is gated on the `coinset-push` feature and MUST remain off by default.
+
+`push` MUST make exactly ONE transport attempt. It MUST NOT retry: a retry is a second broadcast of a
+bundle whose first answer was never seen.
+
+### 6C.2 The request (normative)
+
+The body is `{"spend_bundle": <bundle>}` in the standard Chia JSON encoding — `aggregated_signature` and
+`coin_spends[]`, each with `coin { parent_coin_info, puzzle_hash, amount }`, `puzzle_reveal` and
+`solution`, hex strings `0x`-prefixed.
+
+### 6C.3 Interpreting the answer (normative)
+
+The BODY is authoritative and MUST be consulted before the HTTP status code: a Chia RPC states its refusal
+in the body and serves it with a non-2xx code, so the code alone cannot distinguish a refusal from an
+outage.
+
+| Answer | Result |
+|---|---|
+| `status: "SUCCESS"` | `PushOutcome::Accepted` |
+| an error naming `ALREADY_INCLUDING_TRANSACTION` | `PushOutcome::AlreadyInMempool` (a success) |
+| `status: "FAILED"`, or an error carrying `Failed to include transaction` | `PushOutcome::Rejected { reason }` |
+| `status: "PENDING"`, or an error naming `ASSERT_{HEIGHT,SECONDS}_{ABSOLUTE,RELATIVE}_FAILED` | `Err(ChainUnavailable)` |
+| a non-JSON body, an unrecognised error, or a body stating neither `status` nor `error` | `Err(ChainUnavailable)` |
+
+`PENDING` MUST NOT be reported as `Rejected`. A node answering `PENDING` RETAINS the bundle and may still
+include it, so the outcome is unsettled. Any answer that is not recognisably the mempool's own decision
+MUST likewise resolve to `ChainUnavailable`, because the two mistakes are not symmetric: reporting
+"unknown" for a refusal stalls a mint recoverably, while reporting "refused" for an unknown outcome rewinds
+the journal and pushes a SECOND bundle that can land alongside the first.
+
+Server-controlled text MUST be length-bounded before it reaches an error message.
+
 ## 7. The injected UI/auth-provider seam (host boundary)
 
 The host harness implements `AuthProvider`: `collect_factors(UnlockRequest) -> AuthFactors` (the unlock

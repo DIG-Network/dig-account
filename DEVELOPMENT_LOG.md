@@ -2,6 +2,28 @@
 
 Durable realizations, with the context that makes them actionable. Not a change diary.
 
+## `PENDING` from a Chia `push_tx` is "not yet", and calling it a rejection double-spends
+
+`MempoolInclusionStatus.PENDING` means the node failed one of `ASSERT_HEIGHT_ABSOLUTE`,
+`ASSERT_HEIGHT_RELATIVE`, `ASSERT_SECONDS_ABSOLUTE` or `ASSERT_SECONDS_RELATIVE` and RETAINED the
+bundle in its pending cache — it may still be included. Only those four are `PENDING`; every other
+failure is `FAILED`.
+
+That matters because the two mistakes are not symmetric. `advance_profile_mint` treats
+`MintError::Rejected` as a definitive no: it rewinds the store half to
+`DidConfirmedStoreNotLaunched`, and the next call pushes a SECOND store-launch bundle. If the first
+then lands, both spend from the same DID coin. `ChainUnreachable` does the opposite — it leaves the
+journal exactly where it was and the next call re-reads chain.
+
+So a publisher must resolve every answer it cannot recognise as the mempool's own decision to
+`ChainUnavailable`, never to `Rejected`. Stalling is recoverable by an operator; a second push of a
+bundle that may still land is not. `CoinsetPublisher` is built on that asymmetry (`SPEC.md` §6C.3).
+
+Two related shapes: a Chia RPC states its refusal in the response BODY and serves it with a non-2xx
+code, so an HTTP status alone cannot tell a refusal from an outage; and a node that already holds the
+exact bundle answers `{"status": "SUCCESS"}`, so `ALREADY_INCLUDING_TRANSACTION` surfaces only while
+the node is mid-processing.
+
 ## A singleton cannot launch a singleton directly — the intermediate is load-bearing
 
 A DID coin cannot create a 1-mojo store launcher. A singleton may emit exactly ONE odd-amount

@@ -66,10 +66,14 @@ pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;
 pub use keys::wallet_key::WalletKey;
+#[cfg(feature = "coinset-push")]
+pub use mint::BlockingHttpTransport;
 pub use mint::{
-    ChainUnavailable, ConfirmedStore, MintError, MintNetwork, MintOptions, MintResult, MintStatus,
+    interpret_push_answer, push_tx_request_json, ChainUnavailable, CoinsetPublisher,
+    ConfirmedStore, HttpAnswer, MintError, MintNetwork, MintOptions, MintResult, MintStatus,
     MintedDid, PendingMint, PendingStoreLaunch, ProfileMintStatus, ProfileSeed, PushOutcome,
-    SpendPublisher, MAX_MINT_FEE_MOJOS, MIN_CONFIRMATION_DEPTH,
+    PushTransport, SpendPublisher, COINSET_MAINNET_PUSH_URL, MAX_MINT_FEE_MOJOS,
+    MIN_CONFIRMATION_DEPTH,
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;

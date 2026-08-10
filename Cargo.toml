@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -24,6 +24,13 @@ include = [
     "README.md",
     "LICENSE*",
 ]
+
+[features]
+default = []
+# The blocking HTTPS transport behind `CoinsetPublisher` (the mainnet broadcast seam). OFF by
+# default: a consumer that already has a node — dig-app pushes over its own node's RPC — must not be
+# made to carry an HTTP client. The mainnet mint harness turns it on.
+coinset-push = ["dep:ureq"]
 
 [dependencies]
 # The canonical money signer + independent spend verification live in dig-wallet-backend's `client`
@@ -72,6 +79,10 @@ serde = { version = "1", features = ["derive"] }
 # a runtime dependency, not a test-only one.
 serde_json = "1"
 zeroize = "1"
+# OPTIONAL, `coinset-push` only: the blocking HTTPS client behind `BlockingHttpTransport`. The
+# response MAPPING is deliberately independent of it, so the mempool-verdict logic is unit-tested
+# through the `PushTransport` seam with no client and no network at all.
+ureq = { version = "2", optional = true }
 
 [dev-dependencies]
 # Test-only: the INDEPENDENT BIP-39 expansion used as the reference for the account root, so a
@@ -79,7 +90,13 @@ zeroize = "1"
 bip39 = "2.0"
 anyhow = "1"
 hex = "0.4"
-tokio = { version = "1", features = ["macros", "rt"] }
+# `rt-multi-thread` is not decoration: chia-query's synchronous ChainSource facade fails CLOSED on a
+# current-thread runtime, and reports that as a transport error which reads exactly like a network
+# problem (chia-query SPEC §7).
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# Test-only: the ONLY published ChainSource impl that serves `resolve_singleton_lineage`, which the
+# store half needs via `dig_did::walk_did_lineage_to_tip`. Used by the ignored mainnet harness.
+chia-query = "0.7"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
