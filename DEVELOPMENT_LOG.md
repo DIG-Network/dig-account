@@ -79,13 +79,31 @@ This is decided, not accidental (dig_ecosystem#2463). Lineage is the trust predi
 proves the store descends from the DID's coin — and memos are only an index. The memo-writing direct
 shape is not available here at all, for the odd-amount reason above.
 
-## `dig-social-profile` is a SCHEMA dependency, and a chia-family boundary
+## `dig-social-profile` is a SCHEMA dependency
 
-`dig-social-profile` 0.2 is on the chia 0.26 family while this crate is on 0.36.1, so depending on it
-brings a second chia subtree. That is accepted ONLY because no chia type crosses the boundary in use:
-slots go in, and a plain `[u8; 32]` root comes out (`ProfileSeed`). Re-implementing the slot schema
-here is forbidden — it is a byte-compatibility contract with golden vectors, and a second
-implementation is a future drift bug.
+Re-implementing the slot schema here is forbidden — it is a byte-compatibility contract with golden
+vectors, and a second implementation is a future drift bug. Only the schema surface is used: slots go
+in, and a plain `[u8; 32]` root comes out (`ProfileSeed`), so no chia type crosses the boundary.
+
+That narrow boundary used to be load-bearing for a second reason. Until 0.4, this crate pinned
+`dig-social-profile` 0.2, which sat on the chia 0.26 family and pinned `dig-did ^0.4` / `dig-store
+^0.5` — dragging a whole SECOND chia subtree (chia-wallet-sdk 0.30) in behind it. 0.4 moved onto
+chia 0.36.1 / chia-wallet-sdk 0.34, so the subtree is gone and the pin MUST NOT go back: dropping to
+0.2 re-splits every chia type in this custody binary.
+
+## A dependency pin that looks stale can be the one holding the tree together
+
+`Cargo.lock` once resolved THREE chia-wallet-sdk versions here while `Cargo.toml` already said
+`"0.34"` — the other two arrived transitively, so the manifest read as correct and only the lock
+disagreed. **A manifest diff is never evidence that a version unified.** Prove it from the lock, or
+from `cargo tree -d` reading ONLY column-0 lines (indented lines are dependent paths, not duplicate
+roots, so a clean tree looks alarming if you grep naively).
+
+The counter-intuitive half: `dig-merkle` is deliberately held at `^0.6` even though 0.7.0 exists.
+`dig-store` 0.7.1 — reached through `dig-social-profile` 0.4 — requires `dig-merkle ^0.6`, and `^0.6`
+EXCLUDES 0.7.0. Asking for `^0.7` here does not upgrade that edge; it resolves a SECOND dig-merkle
+line beside it. Both already build on chia-wallet-sdk 0.34, so `^0.6` costs nothing. Bumping a pin
+"to keep current" can create the duplicate you were trying to remove.
 
 Do NOT reach for `IdentityProfile::mint_from_did` from that crate. It delegates to
 `dig_store::create_store`, which cannot mint a DID-rooted store; the `StoreOwner::Custom` route it
