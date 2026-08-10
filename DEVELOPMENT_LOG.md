@@ -100,9 +100,11 @@ neither is a dig-account defect:
 - **Inside chia-wallet-sdk 0.34.0 itself.** It reaches `chia-bls` 0.42.1 through `chialisp` 0.4.6 and
   `chia-bls` 0.36.1 through `chia-consensus` 0.36.1. A single sdk version is internally split, so no
   pin in this crate can collapse it. Upstream.
-- **Through `dig-session` 0.5.1 -> `dig-constants` 0.7.0**, which sits on the chia 0.26 family
-  (`chia-protocol` 0.26.0, `chia-consensus` 0.26.0, `chia-sdk-utils` 0.30.0). Fixable only by
-  releasing those crates onto 0.36, in their own repos, release-first.
+- **Through `dig-session` 0.5.1's two older edges.** `dig-identity` 0.5.0 brings
+  `chia-sdk-utils` 0.30.0, `chia-protocol` 0.26.0 and `chia-bls` 0.26.0; separately,
+  `dig-constants` 0.7.0 brings `chia-protocol` 0.26.0 and `chia-consensus` 0.26.0 only.
+  `dig-constants` is already on the modern family at 0.10.0, so the release-first fix lives in
+  `dig-identity` / `dig-session`, not here.
 
 Both are tolerable for the same reason the schema dependency is: **no chia type crosses either
 boundary in use.** `dig-session` hands this crate `Password`, `UnlockedMasterSeed`, `Session`,
