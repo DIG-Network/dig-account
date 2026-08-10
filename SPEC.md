@@ -1238,9 +1238,11 @@ The body is `{"spend_bundle": <bundle>}` in the standard Chia JSON encoding — 
 
 ### 6C.3 Interpreting the answer (normative)
 
-The BODY is authoritative and MUST be consulted before the HTTP status code: a Chia RPC states its refusal
-in the body and serves it with a non-2xx code, so the code alone cannot distinguish a refusal from an
-outage.
+The BODY is authoritative and the HTTP status code MUST NOT be consulted at all. A Chia RPC states its
+refusal in the body at whatever status it likes: `api.coinset.org/push_tx` serves a mempool refusal as
+**HTTP 200** with `"success": false` and an `error` field, while other deployments serve the same refusal
+at a 4xx or 5xx. An implementation MUST NOT treat a 2xx as acceptance, and MUST NOT treat a non-2xx as
+refusal; the status may appear in diagnostics only.
 
 | Answer | Result |
 |---|---|

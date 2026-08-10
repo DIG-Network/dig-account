@@ -144,8 +144,11 @@ pub fn push_tx_request_json(bundle: &SpendBundle) -> Result<String, serde_json::
 
 /// Turn a raw HTTP answer into the mempool's verdict, or into "the outcome is unknown".
 ///
-/// The body is consulted BEFORE the status code, because a Chia RPC states its refusal in the body
-/// and serves it with a non-2xx code: the code alone cannot tell a refusal from an outage.
+/// The status code is not consulted at all: the BODY is the verdict. `api.coinset.org/push_tx` — a
+/// patched full node — serves a mempool refusal as **HTTP 200** carrying `"success": false` and an
+/// `error` naming the failure (observed live). Other deployments state the same refusal at a 4xx or
+/// 5xx. So a 2xx cannot be read as acceptance and a non-2xx cannot be read as refusal; only the body
+/// distinguishes a refusal from an outage.
 ///
 /// # Errors
 ///
@@ -275,7 +278,9 @@ mod blocking {
                 .set("Content-Type", "application/json")
                 .send_string(body);
 
-            // A non-2xx is an ANSWER: a Chia RPC states its refusal in a 4xx/5xx body.
+            // Every status is passed through, because the status does not carry the verdict:
+            // coinset.org answers a mempool refusal with HTTP 200, and other nodes answer the same
+            // refusal with a 4xx/5xx. `interpret_push_answer` reads the body and only the body.
             let (status, reader) = match response {
                 Ok(ok) => (ok.status(), ok),
                 Err(ureq::Error::Status(status, raised)) => (status, raised),
@@ -373,6 +378,38 @@ mod tests {
             panic!("a stated mempool refusal must be Rejected");
         };
         assert!(reason.contains("DOUBLE_SPEND"), "reason was {reason:?}");
+    }
+
+    /// The verbatim shape `https://api.coinset.org/push_tx` was observed answering with — a refusal
+    /// at **HTTP 200**, not at a 4xx. A mapping that gated on the status code would call this an
+    /// acceptance, and a mint would then wait forever for a coin that will never exist.
+    #[test]
+    fn coinset_states_a_refusal_at_http_200() {
+        let outcome = push_through(StubTransport::answering(
+            200,
+            r#"{"error":"Failed to include transaction 0xdead, error INVALID_SPEND_BUNDLE","structuredError":{"code":"TRANSACTION_FAILED","data":{"error":"INVALID_SPEND_BUNDLE","spend_name":"0xdead"}},"success":false,"traceback":"Traceback (most recent call last): ...","tx_id":"0xdead"}"#,
+        ));
+        let PushOutcome::Rejected { reason } =
+            outcome.expect("a refusal is an answer, whatever status carried it")
+        else {
+            panic!("a 200-carried mempool refusal must still be Rejected");
+        };
+        assert!(
+            reason.contains("INVALID_SPEND_BUNDLE"),
+            "reason was {reason:?}"
+        );
+    }
+
+    /// The other half of the same fact: a 200 does not make an answer settled either. This body
+    /// carries `"success": false` exactly like the refusal above, but names no mempool decision — so
+    /// it MUST stay unknown. Reading it as a refusal would rewind the journal and push again.
+    #[test]
+    fn a_two_hundred_carrying_an_unrecognised_error_is_still_unsettled() {
+        let outcome = push_through(StubTransport::answering(
+            200,
+            r#"{"error":"upstream request timed out","success":false}"#,
+        ));
+        outcome.expect_err("an unrecognised error is unknown, never a refusal");
     }
 
     #[test]

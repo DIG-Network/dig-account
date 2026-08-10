@@ -24,6 +24,7 @@
 //! | `DIG_MINT_TIMEOUT_SECS` | `1800` | Bounded wait before the harness reports resume state and stops. |
 //! | `DIG_MINT_POLL_SECS` | `20` | Seconds between chain reads. |
 //! | `DIG_MINT_LABEL` | `mainnet-harness` | The profile label recorded on success. |
+//! | `DIG_MINT_NEW` | unset | Set to `1` to authorise ANOTHER paid mint over a journal that already records one. |
 //!
 //! # The secret
 //!
@@ -37,6 +38,12 @@
 //! It calls [`advance_profile_mint`], which reads chain first and launches the store from the
 //! EXISTING DID coin. Re-minting the DID would spend a second time and orphan the identity the user
 //! already owns (dig_ecosystem#2377), and there is no code path here that can do it.
+//!
+//! Two things make that promise hold across processes, and both live in [`mint_journal`]:
+//! the journal is written on EVERY outcome of the opening call, including a push whose answer never
+//! arrived; and a brand-new mint over a journal that already records a profile is REFUSED unless
+//! `DIG_MINT_NEW=1` says otherwise. Rerunning after a success is not a resume — it is a second
+//! purchase — and it now has to be asked for by name.
 //!
 //! # Funding
 //!
@@ -68,6 +75,13 @@ use dig_account::{
 use dig_chainsource_interface::ChainSource;
 use dig_keystore::MemoryBackend;
 use dig_session::Password;
+
+mod mint_journal;
+
+use mint_journal::{
+    begin_new_mint, load_registry, save_registry, target_index, BeginNewMintError,
+    NewMintPermission,
+};
 
 /// The env var carrying the funded wallet's 24-word recovery phrase. Runtime only.
 const MNEMONIC_VAR: &str = "DIG_TEST_MNEMONIC";
@@ -125,13 +139,6 @@ fn a_whole_profile_mints_on_mainnet() {
     println!("journal       : {}", settings.registry_path.display());
     println!("confirmations : {MIN_CONFIRMATION_DEPTH} blocks per half");
 
-    if registry.contains(ix) {
-        panic!(
-            "profile {ix} is already recorded in {} — nothing to mint",
-            settings.registry_path.display()
-        );
-    }
-
     let resuming = registry.in_progress().iter().any(|mint| mint.ix() == ix);
     if resuming {
         // The DID may already exist and be paid for. `advance_profile_mint` is the ONLY thing
@@ -152,21 +159,35 @@ fn a_whole_profile_mints_on_mainnet() {
             .with_bio("the first profile minted end-to-end on mainnet")
             .with_xch_address(address.clone());
 
-        let began = minter
-            .begin_profile_mint(
-                &mut registry,
-                ix,
-                &seed,
-                &chain,
-                &publisher,
-                &network,
-                &options,
-            )
-            .expect("begin_profile_mint");
-        // The journal must reach disk before anything else can go wrong: a pushed DID that no file
-        // names is the loss state this whole harness is shaped around.
-        save_registry(&settings.registry_path, &registry);
-        report(&began);
+        // `begin_new_mint` owns the two orderings that keep money safe: the opt-in is checked before
+        // anything is built, and the journal is written on EVERY outcome — so an unanswered push
+        // still leaves a file naming the DID it may already have paid for.
+        let outcome = begin_new_mint(
+            &minter,
+            &mut registry,
+            &settings.registry_path,
+            ix,
+            &seed,
+            &chain,
+            &publisher,
+            &network,
+            &options,
+            NewMintPermission::from_env(),
+        );
+
+        match outcome {
+            Ok(began) => report(&began),
+            // Nothing was pushed and nothing was spent, so the resume banner would be a lie.
+            Err(refusal @ BeginNewMintError::WouldSpendAgain { .. }) => panic!(
+                "\n== REFUSED: {refusal} ==\n\
+                 journal file  : {}\n\
+                 next index    : {ix}\n",
+                settings.registry_path.display()
+            ),
+            Err(BeginNewMintError::Mint(error)) => {
+                panic_with_resume_state(&registry, ix, &settings, &format!("{error}"))
+            }
+        }
     }
 
     let (did, store) = drive_to_confirmed(
@@ -390,32 +411,6 @@ fn mainnet_chain_source() -> ChiaQueryProvider {
             trustless: false,
         },
     )
-}
-
-/// Which index to mint at: the one already in progress, else the next free one.
-///
-/// `next_free_ix` never fills a gap — a gap is not evidence an index is unused (dig_ecosystem#2392).
-fn target_index(registry: &ProfileRegistry) -> ProfileIx {
-    registry
-        .in_progress()
-        .first()
-        .map_or_else(|| registry.next_free_ix(), |mint| mint.ix())
-}
-
-fn load_registry(path: &PathBuf) -> ProfileRegistry {
-    match std::fs::read_to_string(path) {
-        Ok(json) => ProfileRegistry::from_json(&json)
-            .unwrap_or_else(|why| panic!("{} is not a valid registry: {why}", path.display())),
-        Err(_) => ProfileRegistry::empty(),
-    }
-}
-
-/// Write the journal, or stop — an unwritten journal is exactly the failure this harness exists to
-/// avoid, so it is never a warning.
-fn save_registry(path: &PathBuf, registry: &ProfileRegistry) {
-    let json = registry.to_json().expect("the registry serialises");
-    std::fs::write(path, json)
-        .unwrap_or_else(|why| panic!("could not write the journal to {}: {why}", path.display()));
 }
 
 /// A one-line, public-data-only rendering of a stage.
