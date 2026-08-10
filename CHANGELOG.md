@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-08-10
+
+### Features
+- **wallet:** By-name input confirmation, coin dedupe, and the $DIG (CAT) transfer builder (#16)
+
 ## [0.11.3] - 2026-08-10
 
 ### Bug Fixes
