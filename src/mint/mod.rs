@@ -18,6 +18,7 @@
 //! [`ProfileMinter::mint_status`]: crate::profile_mint::ProfileMinter::mint_status
 
 pub mod chain;
+pub mod coinset_push;
 pub mod did;
 pub mod error;
 pub mod evidence;
@@ -39,6 +40,12 @@ mod store_launch;
 pub(crate) mod fixtures;
 
 pub use chain::{ChainUnavailable, PushOutcome, SpendPublisher};
+#[cfg(feature = "coinset-push")]
+pub use coinset_push::BlockingHttpTransport;
+pub use coinset_push::{
+    interpret_push_answer, push_tx_request_json, CoinsetPublisher, HttpAnswer, PushTransport,
+    COINSET_MAINNET_PUSH_URL,
+};
 pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};

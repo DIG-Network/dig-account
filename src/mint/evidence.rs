@@ -110,6 +110,13 @@ impl PendingMint {
     ///
     /// A caller builds its own timeout from this: `peak - pushed_at_height` is how many blocks the
     /// mint has been waiting, which is a real elapsed measure rather than a spinner.
+    ///
+    /// It is a FLOOR on any believable confirmation height, and it is recorded when the bundle is
+    /// BUILT — deliberately, and before the outcome of the push is known. It therefore does not
+    /// assert that a push reached the network: a bundle that was built, pushed, and answered with
+    /// "the outcome is unknown" still carries this height, because the floor is exactly what a
+    /// later reconciliation needs if that push did in fact land. Recording it only on acceptance
+    /// would drop it in the one case that cannot be recovered.
     pub fn pushed_at_height(&self) -> u32 {
         self.pushed_at_height
     }

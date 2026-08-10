@@ -340,10 +340,54 @@ where
         }
     }
 
-    best.ok_or(MintError::InsufficientFunds {
+    let chosen = best.ok_or(MintError::InsufficientFunds {
         required,
         available,
-    })
+    })?;
+    confirm_spendable_by_name(chain, chosen)?;
+    Ok(chosen)
+}
+
+/// Re-reads the chosen coin BY NAME and refuses unless that answer also calls it confirmed and
+/// unspent.
+///
+/// A by-puzzle-hash listing is a different question, often answered by a different node: this
+/// crate's mainnet source routes each read to a peer it picks per call, and the very same listing
+/// has been observed returning the wallet's coins on one call and an empty set on the next. A
+/// listing that is stale by one spend offers a coin the network already considers gone, and nothing
+/// downstream can notice — the bundle builds, passes the signing gate, and is broadcast, at which
+/// point Chia's mempool answers `DOUBLE_SPEND`, because a removal whose coin record says spent is
+/// the only condition that produces that verdict.
+///
+/// So the choice is confirmed against the question the MEMPOOL asks — one coin, by name — before a
+/// single mojo of the user's XCH is committed to a bundle. Two answers that cannot both be true
+/// make the coin's state UNKNOWN, which is [`MintError::ChainUnreachable`] and never a shortfall or
+/// a refusal: the wallet may be perfectly funded and the next read may be answered by a node that
+/// is caught up.
+fn confirm_spendable_by_name<C>(chain: &C, coin: Coin) -> MintResult<()>
+where
+    C: ChainSource + ?Sized,
+{
+    let record = chain
+        .coin_record(coin.coin_id())
+        .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+
+    match record {
+        Some(record) if record.confirmed_height.is_some() && !record.is_spent() => Ok(()),
+        Some(record) => Err(MintError::ChainUnreachable(format!(
+            "the chain listed coin {} as spendable and then, read by name, called it \
+             confirmed={:?} spent={:?} — refusing to build a spend on a coin the network may \
+             already have consumed",
+            coin.coin_id(),
+            record.confirmed_height,
+            record.spent_height,
+        ))),
+        None => Err(MintError::ChainUnreachable(format!(
+            "the chain listed coin {} as spendable and then could not find it by name — the two \
+             answers cannot both be true, so the coin's state is unknown",
+            coin.coin_id(),
+        ))),
+    }
 }
 
 /// Builds the unsigned mint bundle: the wallet-coin split, then `dig-did`'s create.
@@ -732,6 +776,58 @@ mod tests {
         );
     }
 
+    /// **The mainnet DOUBLE_SPEND regression.** A by-puzzle-hash listing that offers a coin as
+    /// spendable is one node's answer, and this crate's own mainnet reads have been observed
+    /// disagreeing with themselves between calls. A listing that is stale by even one spend offers a
+    /// coin the mempool already knows is spent, and the mint then builds, SIGNS and BROADCASTS a
+    /// bundle whose only chain input is dead — which is the sole path by which Chia's mempool
+    /// answers `DOUBLE_SPEND` (`mempool_manager.check_removals`). Selection must therefore confirm
+    /// its choice by NAME, which is the same question the mempool asks, and refuse on disagreement.
+    #[test]
+    fn a_coin_the_listing_calls_spendable_and_the_by_name_read_calls_spent_is_refused() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
+        let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Spent);
+
+        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
+            .expect_err("a coin the chain also calls spent must never fund a spend");
+        assert!(
+            matches!(error, MintError::ChainUnreachable(_)),
+            "the two reads disagree, so the coin's state is UNKNOWN, never a refusal or a shortfall: {error}"
+        );
+        assert!(
+            error.to_string().contains(&coin.coin_id().to_string()),
+            "the refusal must name the coin an operator has to go look at: {error}"
+        );
+    }
+
+    /// The same disagreement in its other shape: the listing offers a coin the chain cannot find by
+    /// name at all. Read as "no such coin" it would be silently unspendable; read honestly it means
+    /// the two answers cannot both be true.
+    #[test]
+    fn a_coin_the_listing_calls_spendable_and_the_chain_cannot_find_by_name_is_refused() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
+        let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Absent);
+
+        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
+            .expect_err("a coin the chain does not know by name must never fund a spend");
+        assert!(matches!(error, MintError::ChainUnreachable(_)), "{error}");
+    }
+
+    /// The positive control. Without it a confirmation that refused EVERY coin would look identical
+    /// to one that refuses only a disagreement, and the mint would be bricked rather than guarded.
+    #[test]
+    fn a_coin_both_reads_call_spendable_still_funds_the_mint() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
+        let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Spendable);
+
+        let chosen = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
+            .expect("two agreeing reads are the ordinary case");
+        assert_eq!(chosen, coin);
+    }
+
     /// **The production constructor, asserted directly.** Every other test in this crate drives
     /// `from_constants(TESTNET11)`, so a `mainnet()` that returned the wrong chain's constants would
     /// be an unkillable mutant: nothing would fail, and the only line a real user executes would
@@ -932,6 +1028,86 @@ mod tests {
     /// This is what a real source does. [`FixedChain`] filters by puzzle hash on the way IN, so a
     /// fixture built on it can never hand selection a foreign coin and is structurally incapable of
     /// observing whether selection checks the puzzle hash at all.
+    /// What a by-name read says about a coin the LISTING already offered as spendable.
+    #[derive(Clone, Copy)]
+    enum ByNameAnswer {
+        Spendable,
+        Spent,
+        Absent,
+    }
+
+    /// A chain whose two reads can disagree — the shape a peer-routed light client really has, where
+    /// each call may be answered by a different node.
+    struct DisagreeingChain {
+        listed: Coin,
+        by_name: ByNameAnswer,
+    }
+
+    impl DisagreeingChain {
+        fn listing_says_spendable(coin: Coin, by_name: ByNameAnswer) -> Self {
+            Self {
+                listed: coin,
+                by_name,
+            }
+        }
+
+        fn record(&self, spent_height: Option<u32>) -> CoinRecord {
+            CoinRecord {
+                coin: self.listed,
+                confirmed_height: Some(1),
+                spent_height,
+                timestamp: None,
+                coinbase: false,
+            }
+        }
+    }
+
+    impl ChainSource for DisagreeingChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+            if coin_id != self.listed.coin_id() {
+                return Ok(None);
+            }
+            Ok(match self.by_name {
+                ByNameAnswer::Spendable => Some(self.record(None)),
+                ByNameAnswer::Spent => Some(self.record(Some(2))),
+                ByNameAnswer::Absent => None,
+            })
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(vec![self.record(None)])
+        }
+
+        fn coin_records_by_parent(&self, _parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(&self, _coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            Err("not supported by this test double".to_string())
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            Ok(Some(1))
+        }
+
+        fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+            Ok(None)
+        }
+    }
+
     struct HintedChain {
         inner: FixedChain,
     }

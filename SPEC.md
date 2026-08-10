@@ -1088,6 +1088,14 @@ The funding coin is the SMALLEST confirmed, unspent coin whose amount is at leas
 and spent coins are neither selected nor counted toward the `available` amount reported by
 `InsufficientFunds`.
 
+The selected coin MUST then be re-read BY NAME, and the mint MUST refuse unless that answer also
+reports it confirmed and unspent. A by-puzzle-hash listing and a by-name read are different questions
+and may be answered by different nodes, so a listing that is stale by one spend offers a coin the
+network already considers consumed; building on one produces a bundle whose only chain input is dead,
+which Chia's mempool refuses with `DOUBLE_SPEND` after the push. Two answers that cannot both be true
+mean the coin's state is UNKNOWN, so the refusal MUST be `ChainUnreachable` — never `InsufficientFunds`
+and never `Rejected` — and MUST name the coin.
+
 A change output of exactly 1 mojo MUST NOT be created: it would share `(parent, puzzle_hash, amount)` with
 the funding coin — the same coin id twice in one spend — which consensus rejects as a duplicate output.
 Because the build is deterministic, that rejection would recur on every retry and a wallet holding exactly
@@ -1214,6 +1222,51 @@ match the DID half, over a DID already paid for.
 Unchanged from §6A.6 and absolute: signing happens in-process against the unlocked account's own
 wallet key, residency is re-checked before every derivation, and the `SpendPublisher` seam takes an
 ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never enters it.
+
+## 6C. `CoinsetPublisher` — the optional coinset.org broadcast seam
+
+An OPTIONAL `SpendPublisher` over a Chia `push_tx` HTTP endpoint, provided so a host with no node of its
+own can still broadcast. It holds no key material: `push` takes an ALREADY-SIGNED bundle (§6B.5).
+
+### 6C.1 Layering (normative)
+
+The response MAPPING MUST be independent of any HTTP client. `PushTransport` is the seam:
+`post_json(url, body) -> Result<HttpAnswer, String>`, where `Err` means the request could not be COMPLETED
+and `Ok` carries whatever the server said, at whatever status code. The blocking client behind
+`BlockingHttpTransport` is gated on the `coinset-push` feature and MUST remain off by default.
+
+`push` MUST make exactly ONE transport attempt. It MUST NOT retry: a retry is a second broadcast of a
+bundle whose first answer was never seen.
+
+### 6C.2 The request (normative)
+
+The body is `{"spend_bundle": <bundle>}` in the standard Chia JSON encoding — `aggregated_signature` and
+`coin_spends[]`, each with `coin { parent_coin_info, puzzle_hash, amount }`, `puzzle_reveal` and
+`solution`, hex strings `0x`-prefixed.
+
+### 6C.3 Interpreting the answer (normative)
+
+The BODY is authoritative and the HTTP status code MUST NOT be consulted at all. A Chia RPC states its
+refusal in the body at whatever status it likes: `api.coinset.org/push_tx` serves a mempool refusal as
+**HTTP 200** with `"success": false` and an `error` field, while other deployments serve the same refusal
+at a 4xx or 5xx. An implementation MUST NOT treat a 2xx as acceptance, and MUST NOT treat a non-2xx as
+refusal; the status may appear in diagnostics only.
+
+| Answer | Result |
+|---|---|
+| `status: "SUCCESS"` | `PushOutcome::Accepted` |
+| an error naming `ALREADY_INCLUDING_TRANSACTION` | `PushOutcome::AlreadyInMempool` (a success) |
+| `status: "FAILED"`, or an error carrying `Failed to include transaction` | `PushOutcome::Rejected { reason }` |
+| `status: "PENDING"`, or an error naming `ASSERT_{HEIGHT,SECONDS}_{ABSOLUTE,RELATIVE}_FAILED` | `Err(ChainUnavailable)` |
+| a non-JSON body, an unrecognised error, or a body stating neither `status` nor `error` | `Err(ChainUnavailable)` |
+
+`PENDING` MUST NOT be reported as `Rejected`. A node answering `PENDING` RETAINS the bundle and may still
+include it, so the outcome is unsettled. Any answer that is not recognisably the mempool's own decision
+MUST likewise resolve to `ChainUnavailable`, because the two mistakes are not symmetric: reporting
+"unknown" for a refusal stalls a mint recoverably, while reporting "refused" for an unknown outcome rewinds
+the journal and pushes a SECOND bundle that can land alongside the first.
+
+Server-controlled text MUST be length-bounded before it reaches an error message.
 
 ## 7. The injected UI/auth-provider seam (host boundary)
 

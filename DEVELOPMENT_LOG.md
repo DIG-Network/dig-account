@@ -2,6 +2,28 @@
 
 Durable realizations, with the context that makes them actionable. Not a change diary.
 
+## `PENDING` from a Chia `push_tx` is "not yet", and calling it a rejection double-spends
+
+`MempoolInclusionStatus.PENDING` means the node failed one of `ASSERT_HEIGHT_ABSOLUTE`,
+`ASSERT_HEIGHT_RELATIVE`, `ASSERT_SECONDS_ABSOLUTE` or `ASSERT_SECONDS_RELATIVE` and RETAINED the
+bundle in its pending cache — it may still be included. Only those four are `PENDING`; every other
+failure is `FAILED`.
+
+That matters because the two mistakes are not symmetric. `advance_profile_mint` treats
+`MintError::Rejected` as a definitive no: it rewinds the store half to
+`DidConfirmedStoreNotLaunched`, and the next call pushes a SECOND store-launch bundle. If the first
+then lands, both spend from the same DID coin. `ChainUnreachable` does the opposite — it leaves the
+journal exactly where it was and the next call re-reads chain.
+
+So a publisher must resolve every answer it cannot recognise as the mempool's own decision to
+`ChainUnavailable`, never to `Rejected`. Stalling is recoverable by an operator; a second push of a
+bundle that may still land is not. `CoinsetPublisher` is built on that asymmetry (`SPEC.md` §6C.3).
+
+Two related shapes: a Chia RPC states its refusal in the response BODY and serves it with a non-2xx
+code, so an HTTP status alone cannot tell a refusal from an outage; and a node that already holds the
+exact bundle answers `{"status": "SUCCESS"}`, so `ALREADY_INCLUDING_TRANSACTION` surfaces only while
+the node is mid-processing.
+
 ## A singleton cannot launch a singleton directly — the intermediate is load-bearing
 
 A DID coin cannot create a 1-mojo store launcher. A singleton may emit exactly ONE odd-amount
@@ -80,3 +102,36 @@ consensus validator, which runs the same CLVM and the same BLS verification a fu
 The simulator holds every test key, so "it validated" does not prove the bundle carries the right
 signatures. `the_bundle_carries_exactly_the_signatures_it_requires` re-derives the requirement from
 the drained coin spends and checks the aggregate against precisely that list.
+
+## `DOUBLE_SPEND` from the mempool means one thing, and it is not a duplicate in your bundle
+
+A mainnet DID mint was refused with `DOUBLE_SPEND` while its funding coin was demonstrably unspent,
+nothing was in the mempool, and no derived coin existed on chain. The intuitive reading — the bundle
+spends the same coin twice, or creates the same coin twice — was WRONG, and checking it cost a day.
+
+Chia's `mempool_manager.validate_spend_bundle` reaches that verdict from exactly ONE place:
+`check_removals`, `if removals[coin_id].spent`. Every other outcome has its own code
+(`UNKNOWN_UNSPENT`, `MEMPOOL_CONFLICT`, `INVALID_SPEND_BUNDLE`). Ephemeral coins cannot trigger it:
+a removal created inside the same bundle is looked up in `additions_dict` FIRST and given a synthetic
+unspent record, whatever the coin store holds. Duplicate removals no longer produce it either — the
+current code raises out of `spend_conditions.pop(coin_id)` instead. So:
+
+**`DOUBLE_SPEND` == one of your bundle's PRE-EXISTING removals is spent, as far as the node that
+answered is concerned.** For a mint that is one coin: the one selection chose. Start there, not at
+the bundle's shape.
+
+## A by-puzzle-hash listing is a weaker claim than a by-name read
+
+The mint's chain source (`chia-query`'s `ChiaQueryProvider`) routes each read to a peer it picks per
+call — `peer_then_coinset`, two different random peers before the coinset fallback. Polled twelve
+times against one funded mainnet address, the SAME `coin_records_by_puzzle_hash` query returned the
+wallet's two coins ten times and an EMPTY set twice. Nothing in the answer marks it as degraded.
+
+An empty answer is survivable (it reads as insufficient funds). A STALE one is not: a peer behind by
+one spend lists a coin the network has already consumed, the mint builds and signs on it, and the
+money question is only asked after the broadcast. Confirm a selected coin by NAME — the same question
+the mempool asks — before committing a spend to it, and treat a disagreement as UNKNOWN rather than
+as a refusal, because the wallet may be perfectly funded and the next peer caught up.
+
+The same gap is still open in `wallet::transfer::select_input_coins`, which selects from the listing
+alone (dig_ecosystem: the ordinary-transfer spend builder).
