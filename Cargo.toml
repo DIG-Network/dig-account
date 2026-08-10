@@ -37,9 +37,9 @@ coinset-push = ["dep:ureq"]
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
 dig-wallet-backend = { version = "0.27", default-features = false, features = ["client"] }
-dig-session = "0.5"
+dig-session = "0.6"
 dig-identity = "0.6"
-dig-keystore = "0.4.1"
+dig-keystore = "0.8"
 dig-constants = "0.10"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
