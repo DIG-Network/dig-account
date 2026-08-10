@@ -135,11 +135,47 @@ impl<T: PushTransport> SpendPublisher for CoinsetPublisher<T> {
 
 /// Encode `bundle` as a Chia `push_tx` request body: `{"spend_bundle": {...}}`.
 ///
+/// # Why this is not just `serde_json::to_string`
+///
+/// A Chia node's `SpendBundle.from_json_dict` requires EVERY hex byte-string to carry an explicit
+/// `0x`, and raises `bytes object is expected to start with 0x` before it parses anything if one
+/// does not. `chia-protocol`'s own serde does not meet that contract: `chia_serde::ser_bytes` is
+/// called with `include_0x = true` for `BytesImpl<N>` (so `parent_coin_info` and `puzzle_hash` are
+/// prefixed) and with `include_0x = false` for `Bytes` — and `Program`, which is what
+/// `puzzle_reveal` and `solution` are, is a newtype over `Bytes`. So the canonical encoder emits
+/// two bare fields, and a real mainnet mint was refused at the RPC layer for exactly that.
+///
+/// The mismatch is invisible to a round-trip test because the matching DEserialiser accepts the
+/// prefix as OPTIONAL. Only the node enforces it, so the prefix is applied here.
+///
 /// # Errors
 ///
 /// [`serde_json::Error`] if the bundle cannot be serialised.
 pub fn push_tx_request_json(bundle: &SpendBundle) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&serde_json::json!({ "spend_bundle": bundle }))
+    let mut request = serde_json::json!({ "spend_bundle": bundle });
+    prefix_every_byte_string(&mut request);
+    serde_json::to_string(&request)
+}
+
+/// Give every string in `value` the `0x` prefix the node requires, leaving prefixed ones alone.
+///
+/// Applied to the whole tree rather than to the two known-bare field names on purpose: every string
+/// leaf in a `push_tx` body IS a hex byte-string (`amount`, the only other leaf, is a number), so
+/// this states the actual wire contract and keeps holding for any field a later `chia-protocol`
+/// adds — where a name list would silently go stale.
+fn prefix_every_byte_string(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(hex) => {
+            if !hex.starts_with("0x") {
+                hex.insert_str(0, "0x");
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(prefix_every_byte_string),
+        serde_json::Value::Object(fields) => fields
+            .iter_mut()
+            .for_each(|(_, field)| prefix_every_byte_string(field)),
+        _ => {}
+    }
 }
 
 /// Turn a raw HTTP answer into the mempool's verdict, or into "the outcome is unknown".
@@ -511,6 +547,175 @@ mod tests {
             "body was {body:#}"
         );
         assert_eq!(spend["coin"]["amount"], serde_json::json!(3));
+    }
+
+    /// Walk `value` and hand every string it contains to `visit`, with its dotted path.
+    fn each_string(value: &serde_json::Value, path: &str, visit: &mut impl FnMut(&str, &str)) {
+        match value {
+            serde_json::Value::String(text) => visit(path, text),
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    each_string(item, &format!("{path}[{index}]"), visit);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for (name, field) in fields {
+                    each_string(field, &format!("{path}.{name}"), visit);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The wire contract, pinned against the node that enforces it rather than against our own
+    /// decoder.
+    ///
+    /// This is deliberately NOT a round-trip. `chia_serde::de_bytes` accepts hex with the `0x`
+    /// prefix OPTIONAL, so any encoder/decoder symmetry test passes with bare hex on both sides —
+    /// which is exactly the state that reached mainnet and was refused with
+    /// `bytes object is expected to start with 0x`. The node's `from_json_dict` requires the prefix
+    /// on EVERY byte-string, so that is what is asserted here.
+    ///
+    /// Every string in a `push_tx` body is a byte-string; the only non-string leaf is `amount`. So
+    /// "every string starts with `0x`" is the whole contract, and it keeps holding for any field a
+    /// future `chia-protocol` adds.
+    #[test]
+    fn every_hex_field_in_the_request_carries_the_0x_prefix_the_node_requires() {
+        let encoded = push_tx_request_json(&a_bundle()).expect("encodable");
+        let body: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
+
+        let mut bare = Vec::new();
+        each_string(&body, "$", &mut |path, text| {
+            if !text.starts_with("0x") {
+                bare.push(format!("{path} = {text:?}"));
+            }
+        });
+
+        assert!(
+            bare.is_empty(),
+            "the node rejects a bare hex byte-string; these lack the 0x prefix: {bare:#?}\nbody was {encoded}"
+        );
+    }
+
+    /// The prefix is added, never doubled — a field `chia-protocol` already encodes correctly
+    /// (`Bytes32`, `G2Element`) must come through untouched.
+    #[test]
+    fn an_already_prefixed_field_is_not_prefixed_twice() {
+        let encoded = push_tx_request_json(&a_bundle()).expect("encodable");
+        assert!(
+            !encoded.contains("0x0x"),
+            "a prefix was applied twice: {encoded}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&encoded).expect("valid JSON");
+        assert_eq!(
+            body["spend_bundle"]["coin_spends"][0]["coin"]["parent_coin_info"],
+            serde_json::json!("0x0101010101010101010101010101010101010101010101010101010101010101")
+        );
+    }
+
+    /// The exact body the fixed encoder produces for [`a_bundle`], verbatim. This bundle was POSTed
+    /// to `https://api.coinset.org/push_tx` and the node's answer changed from
+    /// `bytes object is expected to start with 0x` (never parsed) to
+    /// `Failed to include transaction …, error WRONG_PUZZLE_HASH` (parsed, then refused on merit) —
+    /// so this string is the encoding a real Chia node is known to accept as well-formed.
+    #[test]
+    fn the_encoding_matches_the_body_mainnet_was_observed_to_parse() {
+        let encoded = push_tx_request_json(&a_bundle()).expect("encodable");
+        assert_eq!(
+            encoded,
+            r#"{"spend_bundle":{"aggregated_signature":"0xc00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000","coin_spends":[{"coin":{"amount":3,"parent_coin_info":"0x0101010101010101010101010101010101010101010101010101010101010101","puzzle_hash":"0x0202020202020202020202020202020202020202020202020202020202020202"},"puzzle_reveal":"0x80","solution":"0x80"}]}}"#
+        );
+    }
+
+    /// The verbatim body mainnet answered the BARE-hex encoding with. It is a REQUEST error — the
+    /// node never parsed a bundle and never reached the mempool — so it must stay unknown. It is
+    /// deliberately NOT a refusal marker: reading a deserialisation complaint as "the mempool said
+    /// no" would rewind the journal and push again.
+    #[test]
+    fn the_deserialisation_complaint_is_unknown_never_a_refusal() {
+        let outcome = interpret_push_answer(&HttpAnswer::new(
+            200,
+            r#"{"error":"bytes object is expected to start with 0x","structuredError":{"code":"UNKNOWN","data":{},"message":"bytes object is expected to start with 0x"},"success":false,"traceback":"Traceback (most recent call last):\n  File \"/chia-blockchain/chia/rpc/util.py\", line 81, in inner\n    res_object = await f(request_data)\n","tx_id":"0xdd6b873dd"}"#,
+        ));
+        outcome.expect_err("a request-level parse error settles nothing about the mempool");
+    }
+
+    /// The verbatim body mainnet answered the FIXED encoding with. The node parsed the bundle and
+    /// then refused it on merit, which is a real mempool decision and must map to `Rejected`.
+    #[test]
+    fn the_answer_to_a_parsed_bundle_is_a_refusal() {
+        let outcome = interpret_push_answer(&HttpAnswer::new(
+            200,
+            r#"{"error":"Failed to include transaction dd6b873dd4965065ec31eb8e2f03ec8cb4bdc25b5ab590b722cdfa9d569030e8, error WRONG_PUZZLE_HASH","structuredError":{"code":"TRANSACTION_FAILED","data":{"error":"WRONG_PUZZLE_HASH","spend_name":"dd6b873dd4965065ec31eb8e2f03ec8cb4bdc25b5ab590b722cdfa9d569030e8"},"message":"Failed to include transaction"},"success":false}"#,
+        ));
+        let PushOutcome::Rejected { reason } = outcome.expect("the mempool answered") else {
+            panic!("a parsed-then-refused bundle must be Rejected");
+        };
+        assert!(
+            reason.contains("WRONG_PUZZLE_HASH"),
+            "reason was {reason:?}"
+        );
+    }
+
+    /// Post the fixture bundle to real mainnet and prove the node PARSES it.
+    ///
+    /// `#[ignore]`: it needs the network. It is non-destructive — the bundle references a coin that
+    /// does not exist (`0101…`/`0202…`, 3 mojos) and carries an empty signature, so it cannot spend
+    /// anything; the node refuses it on merit. That refusal is the point. The pass condition is the
+    /// TRANSITION: the encoding this crate produces must no longer be rejected at the RPC
+    /// deserialiser, which is the only place the `0x` contract is actually enforced.
+    ///
+    /// The amount is a nonce so each run is a DIFFERENT bundle. Without it the node remembers the
+    /// previous run's bundle and answers `ALREADY_INCLUDING_TRANSACTION` from its pending cache —
+    /// still a parsed answer, but a cached one, which is weaker evidence than a fresh decision.
+    ///
+    /// Run with `cargo test --features coinset-push -- --ignored the_live_node_parses`.
+    #[cfg(feature = "coinset-push")]
+    #[test]
+    #[ignore = "posts to real mainnet"]
+    fn the_live_node_parses_our_encoding() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_nanos() as u64;
+        let coin = Coin::new(
+            Bytes32::new([1; 32]),
+            Bytes32::new([2; 32]),
+            nonce % 1_000_000,
+        );
+        let spend = CoinSpend::new(coin, Program::from(vec![0x80]), Program::from(vec![0x80]));
+        let bundle = SpendBundle::new(vec![spend], Signature::default());
+
+        let answer = BlockingHttpTransport::new()
+            .post_json(
+                COINSET_MAINNET_PUSH_URL,
+                &push_tx_request_json(&bundle).expect("encodable"),
+            )
+            .expect("mainnet answered");
+
+        println!("HTTP {}: {}", answer.status, answer.body);
+        assert!(
+            !answer.body.contains("expected to start with 0x"),
+            "the node still refused our encoding at the deserialiser: {}",
+            answer.body
+        );
+        assert!(
+            answer.body.contains("Failed to include transaction"),
+            "expected a mempool decision, proving the bundle parsed: {}",
+            answer.body
+        );
+        // A refusal on merit, or the node reporting it is already holding this exact bundle. Both
+        // are the mempool's own decision on a bundle it PARSED, which is what is being proved; the
+        // one thing that must not happen is `ChainUnavailable`, which is what the bare-hex encoding
+        // produced every time.
+        assert!(
+            matches!(
+                interpret_push_answer(&answer),
+                Ok(PushOutcome::Rejected { .. } | PushOutcome::AlreadyInMempool)
+            ),
+            "a parsed bundle must yield the mempool's decision, not an unknown: {}",
+            answer.body
+        );
     }
 
     #[test]
