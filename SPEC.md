@@ -1088,6 +1088,14 @@ The funding coin is the SMALLEST confirmed, unspent coin whose amount is at leas
 and spent coins are neither selected nor counted toward the `available` amount reported by
 `InsufficientFunds`.
 
+The selected coin MUST then be re-read BY NAME, and the mint MUST refuse unless that answer also
+reports it confirmed and unspent. A by-puzzle-hash listing and a by-name read are different questions
+and may be answered by different nodes, so a listing that is stale by one spend offers a coin the
+network already considers consumed; building on one produces a bundle whose only chain input is dead,
+which Chia's mempool refuses with `DOUBLE_SPEND` after the push. Two answers that cannot both be true
+mean the coin's state is UNKNOWN, so the refusal MUST be `ChainUnreachable` — never `InsufficientFunds`
+and never `Rejected` — and MUST name the coin.
+
 A change output of exactly 1 mojo MUST NOT be created: it would share `(parent, puzzle_hash, amount)` with
 the funding coin — the same coin id twice in one spend — which consensus rejects as a duplicate output.
 Because the build is deterministic, that rejection would recur on every retry and a wallet holding exactly

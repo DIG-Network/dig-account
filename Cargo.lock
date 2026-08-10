@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -323,13 +323,29 @@ fn require_funding<C: ChainSource>(
 
     // Only own-puzzle-hash coins count: a by-puzzle-hash query is hint-indexed, so a $DIG CAT hinted
     // at this address appears here and can never fund a standard-layer spend.
-    let largest = records
+    let spendable: Vec<_> = records
         .iter()
         .filter(|record| {
             record.coin.puzzle_hash == puzzle_hash
                 && record.confirmed_height.is_some()
                 && !record.is_spent()
         })
+        .collect();
+
+    // Every candidate by coin id, because a mempool refusal names a BUNDLE and never the coin that
+    // caused it. When a mainnet mint was refused with DOUBLE_SPEND, working out which coin the mint
+    // had picked took a chain investigation; this line makes the next one a lookup.
+    for record in &spendable {
+        println!(
+            "  spendable coin {} : {} mojos (confirmed at {:?})",
+            record.coin.coin_id(),
+            record.coin.amount,
+            record.confirmed_height
+        );
+    }
+
+    let largest = spendable
+        .iter()
         .map(|record| record.coin.amount)
         .max()
         .unwrap_or(0);
