@@ -4,10 +4,10 @@
 //!
 //! The slot schema is a BYTE-COMPATIBILITY contract with golden vectors, so it is consumed from
 //! `dig-social-profile` rather than re-implemented (a second implementation of a byte contract is a
-//! future drift bug). But that crate is still on the chia 0.26 family while this one is on 0.36.1,
-//! so its `Bytes32`, `Coin` and `DataStore` are DIFFERENT types from ours. Re-exporting anything of
-//! its would put a second chia family in this crate's public API, where a consumer could not tell
-//! the two apart.
+//! future drift bug). Both crates now sit on the same chia 0.36.1 / chia-wallet-sdk 0.34 family,
+//! but the wrapper still matters: re-exporting any `dig-social-profile` type here would pull that
+//! crate's release cadence into dig-account's public API and its SemVer. `with_utf8` already takes
+//! `SlotId`, and that single leak is why this release is 0.13.0.
 //!
 //! [`ProfileSeed`] is the boundary that stops that: slots go in, and the only thing that comes out
 //! is a plain `[u8; 32]` root, which belongs to no chia family at all.
