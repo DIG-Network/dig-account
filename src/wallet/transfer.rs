@@ -34,6 +34,8 @@
 //! same reason: a surface that reported "sent" from a successful push would be asserting something
 //! about the chain that had not happened.
 
+use std::collections::HashSet;
+
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
@@ -41,6 +43,7 @@ use chia_wallet_sdk::types::Conditions;
 use chia_wallet_sdk::utils::Address;
 use dig_chainsource_interface::{ChainSource, CoinRecord};
 
+use crate::chain_confirm::{confirm_all_spendable_by_name, UnconfirmedInput};
 use crate::keys::wallet_key::WalletKey;
 use crate::mint::MIN_CONFIRMATION_DEPTH;
 use crate::wallet::authorizer::WalletOps;
@@ -288,6 +291,19 @@ pub enum TransferError {
     /// Building the unsigned spend failed inside the SDK drivers.
     #[error("could not build the transfer spend: {0}")]
     Build(String),
+}
+
+/// A coin that could not be confirmed spendable by name is a chain the builder could not read.
+///
+/// Every [`UnconfirmedInput`] means the same thing — the coin's state is UNKNOWN — which is exactly
+/// what [`TransferError::ChainUnreachable`] already says. Mapping it to
+/// [`InsufficientFunds`](TransferError::InsufficientFunds) would blame the user's balance for the
+/// chain's disagreement, and there is no refusal here to report: the wallet may be perfectly funded
+/// and the next read may be answered by a node that is caught up.
+impl From<UnconfirmedInput> for TransferError {
+    fn from(error: UnconfirmedInput) -> Self {
+        TransferError::ChainUnreachable(error.to_string())
+    }
 }
 
 /// A destination this crate is willing to PAY: a puzzle hash plus the evidence it is payable.
@@ -1185,6 +1201,18 @@ where
     // actually changes the answer.
     let mut spendable: Vec<Coin> = Vec::with_capacity(records.len());
     let mut unjudgeable: Vec<Bytes32> = Vec::new();
+    // A coin may appear in the listing more than once. An aggregating source is several nodes
+    // stitched together — the same shape every other function in this module explicitly designs for
+    // — and two nodes reporting the same coin is not a fault, it is the normal case.
+    //
+    // Both halves of the damage are silent. A duplicate is counted TWICE in `available`, so the
+    // balance the user is shown, and the shortfall test that gates the whole build, are both
+    // inflated; and it can be SELECTED twice, emitting a bundle with two `CoinSpend`s of one coin —
+    // a self-double-spend that consensus rejects after the push rather than before it.
+    //
+    // So the set is made unique BEFORE the fold. Deduplicating after selection would fix only the
+    // bundle and leave the balance figure lying, which is the half that misleads.
+    let mut seen: HashSet<Bytes32> = HashSet::with_capacity(records.len());
     for record in &records {
         // SPENT is checked FIRST. `include_spent: false` is a request, not a guarantee, and a spent
         // coin is not spendable whatever else is unknown about it — judging its height first would
@@ -1205,6 +1233,9 @@ where
         // a balance the user does not have.
         if record.confirmed_height.is_none() {
             unjudgeable.push(record.coin.coin_id());
+            continue;
+        }
+        if !seen.insert(record.coin.coin_id()) {
             continue;
         }
         spendable.push(record.coin);
@@ -1240,25 +1271,31 @@ where
         });
     }
 
-    if let Some(single) = spendable.iter().find(|coin| coin.amount >= required) {
-        return Ok(vec![*single]);
-    }
-
-    let mut selected = Vec::new();
-    let mut total: u64 = 0;
-    for coin in spendable.iter().rev() {
-        total = total.saturating_add(coin.amount);
-        selected.push(*coin);
-        if total >= required {
-            break;
+    let selected = if let Some(single) = spendable.iter().find(|coin| coin.amount >= required) {
+        vec![*single]
+    } else {
+        let mut selected = Vec::new();
+        let mut total: u64 = 0;
+        for coin in spendable.iter().rev() {
+            total = total.saturating_add(coin.amount);
+            selected.push(*coin);
+            if total >= required {
+                break;
+            }
         }
-    }
-    if selected.len() > MAX_TRANSFER_INPUT_COINS {
-        return Err(TransferError::TooManyInputCoins {
-            needed: selected.len(),
-            cap: MAX_TRANSFER_INPUT_COINS,
-        });
-    }
+        if selected.len() > MAX_TRANSFER_INPUT_COINS {
+            return Err(TransferError::TooManyInputCoins {
+                needed: selected.len(),
+                cap: MAX_TRANSFER_INPUT_COINS,
+            });
+        }
+        selected
+    };
+
+    // The listing has now had its say. Every coin it offered is re-read BY NAME — the question
+    // consensus will ask — and the whole attempt is abandoned if any answer disagrees. See
+    // [`crate::chain_confirm`] for why a listing alone is not enough, and why this is all-or-nothing.
+    confirm_all_spendable_by_name(chain, &selected)?;
     Ok(selected)
 }
 
@@ -1436,6 +1473,15 @@ mod tests {
         /// other puzzles, CAT coins among them. A double that filters by the requested puzzle hash
         /// cannot answer that way, so it cannot exhibit the property the XCH-only guard is about.
         answers_puzzle_hash_query_with: Option<Vec<CoinRecord>>,
+        /// Records the BY-NAME read answers from, when it must disagree with the listing.
+        ///
+        /// The whole subject of the by-name confirmation is that the two questions are answered by
+        /// different indexes, and on mainnet often by different peers. A double whose `coin_record`
+        /// and `coin_records_by_puzzle_hash` are two views of ONE list cannot express a
+        /// disagreement, so it could not exhibit the property under test at all.
+        ///
+        /// A coin ABSENT from this list is answered `None` by name — the vanished case.
+        by_name: Option<Vec<CoinRecord>>,
     }
 
     impl FixedChain {
@@ -1457,6 +1503,7 @@ mod tests {
                 offline: false,
                 answers_with: None,
                 answers_puzzle_hash_query_with: None,
+                by_name: None,
             }
         }
 
@@ -1467,6 +1514,7 @@ mod tests {
                 offline: false,
                 answers_with: None,
                 answers_puzzle_hash_query_with: None,
+                by_name: None,
             }
         }
 
@@ -1482,6 +1530,7 @@ mod tests {
                 offline: true,
                 answers_with: None,
                 answers_puzzle_hash_query_with: None,
+                by_name: None,
             }
         }
 
@@ -1494,6 +1543,13 @@ mod tests {
         /// Answer `coin_records_by_puzzle_hash` with `records`, without filtering by puzzle hash.
         fn answering_puzzle_hash_query_with(mut self, records: Vec<CoinRecord>) -> Self {
             self.answers_puzzle_hash_query_with = Some(records);
+            self
+        }
+
+        /// Answer every BY-NAME read from `records` instead of from the listing, so the two indexes
+        /// can disagree the way mainnet's do.
+        fn answering_by_name_with(mut self, records: Vec<CoinRecord>) -> Self {
+            self.by_name = Some(records);
             self
         }
 
@@ -1539,9 +1595,20 @@ mod tests {
             if let Some(answer) = &self.answers_with {
                 return Ok(Some(answer.clone()));
             }
+            if let Some(by_name) = &self.by_name {
+                return Ok(by_name
+                    .iter()
+                    .find(|record| record.coin.coin_id() == coin_id)
+                    .cloned());
+            }
+            // A coherent source answers by name about every coin it also lists. Only `by_name` makes
+            // the two indexes disagree; without it, a coin supplied through the listing override is
+            // still a coin this double knows, and answering `None` for it would be the double
+            // contradicting itself rather than the behaviour under test.
             Ok(self
                 .records
                 .iter()
+                .chain(self.answers_puzzle_hash_query_with.iter().flatten())
                 .find(|record| record.coin.coin_id() == coin_id)
                 .cloned())
         }
@@ -2016,6 +2083,195 @@ mod tests {
             ),
             "a spent coin is not spendable whatever its height, so it must not become the story: \
              {error}"
+        );
+    }
+
+    // ----------------------------------------------- by-name confirmation of every input (#2556)
+
+    /// Two coins, both honestly spendable by both indexes, FUND the transfer.
+    ///
+    /// The positive control the refusal tests below need. A guard that refused every multi-input
+    /// build — or one wired to a source that can never agree with itself — would satisfy all three
+    /// refusals and none of them would notice.
+    #[test]
+    fn two_inputs_confirmed_by_name_fund_the_transfer() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let listing = vec![
+            confirmed(Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 600)),
+            confirmed(Coin::new(Bytes32::new([2; 32]), wallet.puzzle_hash(), 600)),
+        ];
+        let chain = FixedChain::with_records(listing.clone())
+            .answering_puzzle_hash_query_with(listing.clone())
+            .answering_by_name_with(listing);
+
+        let plan = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000))
+            .expect("both inputs agree, so the transfer must build");
+
+        assert_eq!(
+            inputs_of(&plan),
+            vec![600, 600],
+            "both coins must be spent when both indexes call them spendable"
+        );
+    }
+
+    /// ONE stale input out of two fails the WHOLE attempt — never a build on the survivor.
+    ///
+    /// Only the SECOND coin is varied; the first stays honestly spendable. That is what makes this
+    /// test see the guard: with every coin hostile, a builder that silently dropped the stale input
+    /// and rebuilt on what was left would also refuse (nothing would remain to build from), and the
+    /// all-or-nothing property would be invisible. Here the survivor alone still covers the
+    /// transfer, so a builder that proceeded on it would return `Ok` and be caught.
+    #[test]
+    fn one_input_spent_by_name_fails_the_whole_attempt() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let honest = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
+        let stale = Coin::new(Bytes32::new([2; 32]), wallet.puzzle_hash(), 900);
+        let listing = vec![confirmed(honest), confirmed(stale)];
+        let chain = FixedChain::with_records(listing.clone())
+            .answering_puzzle_hash_query_with(listing)
+            // The listing offered both; by name the network has already consumed one of them.
+            .answering_by_name_with(vec![confirmed(honest), spent(stale)]);
+
+        // 1_500 needs both coins, so selection takes both and the stale one is genuinely in the plan.
+        let error = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .expect_err("a selected input the network calls spent must abandon the attempt");
+
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "a coin whose two answers disagree is UNKNOWN, not a shortfall and not a refusal: \
+             {error}"
+        );
+    }
+
+    /// A coin the listing offered and the by-name read cannot find is UNKNOWN, not absent.
+    #[test]
+    fn an_input_the_by_name_read_cannot_find_fails_the_attempt() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let honest = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
+        let vanished = Coin::new(Bytes32::new([2; 32]), wallet.puzzle_hash(), 900);
+        let listing = vec![confirmed(honest), confirmed(vanished)];
+        let chain = FixedChain::with_records(listing.clone())
+            .answering_puzzle_hash_query_with(listing)
+            .answering_by_name_with(vec![confirmed(honest)]);
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .expect_err("an input the by-name read denies must abandon the attempt");
+
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "two answers that cannot both be true make the coin's state unknown: {error}"
+        );
+    }
+
+    /// The SINGLE-coin fast path is confirmed too.
+    ///
+    /// Selection has two exits — the smallest single covering coin, and largest-first accumulation —
+    /// and they are different `return`s. A guard placed on only one of them would leave the most
+    /// common transfer in the ecosystem, a one-coin send, entirely unguarded.
+    #[test]
+    fn the_single_covering_coin_is_confirmed_by_name_too() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let only = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 5_000);
+        let listing = vec![confirmed(only)];
+        let chain = FixedChain::with_records(listing.clone())
+            .answering_puzzle_hash_query_with(listing)
+            .answering_by_name_with(vec![spent(only)]);
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000))
+            .expect_err("the single-coin path must confirm its coin by name as well");
+
+        assert!(
+            matches!(error, TransferError::ChainUnreachable(_)),
+            "a single stale input is the exact shape that produced a mainnet DOUBLE_SPEND: {error}"
+        );
+    }
+
+    // -------------------------------------------------- duplicate records in the listing (#2494)
+
+    /// A coin the source reports TWICE is worth its amount ONCE, in the balance the user is told.
+    ///
+    /// The request is set above the coin's real value and below its doubled value, which is the only
+    /// band where the two behaviours differ: a builder that counted the duplicate would find itself
+    /// "funded" and go on to build. The assertion is on `available`, because that number is the one
+    /// a surface renders as the wallet's balance.
+    #[test]
+    fn a_duplicated_coin_is_counted_once_in_the_balance() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 1_000);
+        let doubled = vec![confirmed(coin), confirmed(coin)];
+        let chain = FixedChain::with_records(doubled.clone())
+            .answering_puzzle_hash_query_with(doubled.clone())
+            .answering_by_name_with(doubled);
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .expect_err("one 1000-mojo coin cannot fund 1500, however many times it is listed");
+
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds {
+                    required: 1_500,
+                    available: 1_000
+                }
+            ),
+            "the duplicate must not inflate the balance the user is shown: {error}"
+        );
+    }
+
+    /// A duplicated coin is never SELECTED twice.
+    ///
+    /// The fixture makes the duplicate genuinely reachable, which the balance test above cannot
+    /// show: `1_200` is covered by no single coin, so accumulation runs largest-first, and a list
+    /// still holding both copies of the `1_000` reaches the target from that coin alone — twice —
+    /// without ever looking at the `400`. The honest answer spends `1_000 + 400`, so the two
+    /// behaviours differ in the bundle rather than only in a refusal.
+    ///
+    /// Two `CoinSpend`s of one coin is a self-double-spend consensus rejects AFTER the push, which
+    /// is the most expensive place to learn it.
+    #[test]
+    fn a_duplicated_coin_is_never_selected_twice() {
+        let ops = ops();
+        let wallet = ops.wallet_key();
+        let big = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 1_000);
+        let small = Coin::new(Bytes32::new([2; 32]), wallet.puzzle_hash(), 400);
+        let listing = vec![confirmed(big), confirmed(big), confirmed(small)];
+        let chain = FixedChain::with_records(listing.clone())
+            .answering_puzzle_hash_query_with(listing.clone())
+            .answering_by_name_with(listing);
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_200),
+            )
+            .expect("1000 + 400 covers 1200, so the transfer must build");
+
+        let spent_ids: Vec<Bytes32> = plan
+            .coin_spends()
+            .iter()
+            .map(|spend| spend.coin.coin_id())
+            .collect();
+        let unique: HashSet<Bytes32> = spent_ids.iter().copied().collect();
+        assert_eq!(
+            spent_ids.len(),
+            unique.len(),
+            "no coin may appear twice among the bundle's inputs: {spent_ids:?}"
+        );
+        assert_eq!(
+            inputs_of(&plan),
+            vec![400, 1_000],
+            "the second copy of the 1000 coin is not a second coin, so the 400 must be reached for"
         );
     }
 
