@@ -6,8 +6,15 @@
 //! `dig-social-profile` rather than re-implemented (a second implementation of a byte contract is a
 //! future drift bug). Both crates now sit on the same chia 0.36.1 / chia-wallet-sdk 0.34 family,
 //! but the wrapper still matters: re-exporting any `dig-social-profile` type here would pull that
-//! crate's release cadence into dig-account's public API and its SemVer. `with_utf8` already takes
-//! `SlotId`, and that single leak is why this release is 0.13.0.
+//! crate's release cadence into dig-account's public API and its SemVer.
+//!
+//! The wrapper is not airtight, and it is worth naming what escapes it. [`Self::with_utf8`] takes a
+//! `SlotId`, so that one type IS public here — and it is not alone: `StoreError` carries
+//! `dig_session::SessionError` and `dig_keystore::KeystoreError` as `#[from]` variants. All three
+//! are why a dependency bump on those crates is a BREAKING change for consumers, and why 0.13.0 is
+//! the correct release: for a `0.x` crate Cargo treats the minor position as the major, so
+//! 0.12 -> 0.13 IS the breaking bump. Widening this surface makes that worse; narrowing it (an
+//! owned slot-id newtype, opaque error variants) is the direction of travel.
 //!
 //! [`ProfileSeed`] is the boundary that stops that: slots go in, and the only thing that comes out
 //! is a plain `[u8; 32]` root, which belongs to no chia family at all.
