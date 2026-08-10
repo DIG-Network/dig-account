@@ -53,17 +53,8 @@ pub struct PendingStoreLaunch {
 
 impl PendingStoreLaunch {
     /// Record what a pushed store launch is, and when. `pub(crate)`: only the mint flow constructs
-    /// one, and only from the bundle it actually built and pushed.
-    //
-    // Nothing in a NON-TEST build produces a store launch yet: the spend that does lands with phase
-    // B of the profile mint (dig_ecosystem#2342). Deliberately `allow` and not `expect`: the test
-    // build DOES construct these (via `mint::fixtures`), so an expectation would be fulfilled in the
-    // lib build and unfulfilled in the lib-test build, and `--all-targets` compiles both. `expect`
-    // fails the build here today — verified, not assumed.
-    #[allow(
-        dead_code,
-        reason = "constructed by the profile mint, which lands next"
-    )]
+    /// one, and only from the bundle it actually built and pushed
+    /// ([`store_launch`](super::store_launch)).
     pub(crate) fn new(
         launcher_id: Bytes32,
         store_coin_id: Bytes32,
@@ -151,11 +142,11 @@ impl ConfirmedStore {
     ///    silently undo a store already recorded as permanent. This also rejects a height in the
     ///    FUTURE — one past the source's own peak has a depth of 1.
     //
-    // Dead in a non-test build for the same reason as `PendingStoreLaunch::new`, and `allow` for the
-    // same reason too. Worth stating plainly, because it is the crate's own admission: this is the
-    // ONLY way to obtain a `ConfirmedStore`, and a `ConfirmedStore` is half of what a `ProfileAnchor`
-    // needs — so while this lint fires, NO production path can record a profile at all.
-    #[allow(dead_code, reason = "called by the profile mint, which lands next")]
+    // This is the ONLY way to obtain a `ConfirmedStore`, and a `ConfirmedStore` is half of what a
+    // `ProfileAnchor` needs. It stays `pub(crate)` deliberately: widening it would let a host
+    // fabricate store evidence with no chain read at all. A host reaches a `ConfirmedStore` as the
+    // OUTPUT of a real mint — `ProfileMintStatus::Confirmed` (dig_ecosystem#2511) — never by
+    // constructing one.
     pub(crate) fn from_confirmed(
         pending: &PendingStoreLaunch,
         record: &CoinRecord,

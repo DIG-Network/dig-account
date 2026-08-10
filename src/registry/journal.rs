@@ -225,6 +225,18 @@ pub struct ProfileMintInProgress {
     ix: ProfileIx,
     /// What has been proven so far.
     stage: MintStage,
+    /// The profile SMT root the store half will commit to, recorded at phase A.
+    ///
+    /// **Phase B needs it and cannot recompute it.** The root is a pure function of the seed slots
+    /// the user filled in during the wizard, which a restart forgets; without it, a resumed phase B
+    /// would either have to invent a seed — committing the store to bytes the user never chose — or
+    /// abandon a DID that is already paid for.
+    ///
+    /// `Option` because it is ADDITIVE: a registry written by 0.9.0 could journal a DID-only mint
+    /// (via `begin_did_mint`), which is not a profile mint and carries no seed. Phase B refuses such
+    /// an entry by name rather than substituting a default.
+    #[serde(default)]
+    seed_root: Option<[u8; 32]>,
     /// The fee, in mojos, disclosed for the STORE-LAUNCH bundle.
     ///
     /// A profile mint has two fees — one per bundle — and the user approves them together, as the
@@ -236,13 +248,38 @@ pub struct ProfileMintInProgress {
 }
 
 impl ProfileMintInProgress {
-    /// Record a mint in progress at `ix`.
+    /// Record a mint in progress at `ix`, with no profile seed — a DID-only mint.
     pub fn new(ix: ProfileIx, stage: MintStage, store_fee: u64) -> Self {
         Self {
             ix,
             stage,
+            seed_root: None,
             store_fee,
         }
+    }
+
+    /// Record a PROFILE mint in progress at `ix`, committed to `seed_root`.
+    ///
+    /// This is what [`begin_profile_mint`](crate::ProfileMinter::begin_profile_mint) journals: the
+    /// seed root is what lets phase B be resumed after a restart without asking the user to fill the
+    /// wizard in again, and without committing the store to bytes they never chose.
+    pub fn with_seed_root(
+        ix: ProfileIx,
+        stage: MintStage,
+        seed_root: [u8; 32],
+        store_fee: u64,
+    ) -> Self {
+        Self {
+            ix,
+            stage,
+            seed_root: Some(seed_root),
+            store_fee,
+        }
+    }
+
+    /// The profile SMT root this mint's store half commits to, or `None` for a DID-only mint.
+    pub fn seed_root(&self) -> Option<[u8; 32]> {
+        self.seed_root
     }
 
     /// The HD index this mint is for.
@@ -430,6 +467,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The profile seed root survives a restart, and its absence is representable.**
+    ///
+    /// A resumed phase B commits the store to this root. Losing it would leave the resume with two
+    /// bad options — invent a seed the user never chose, or abandon a DID already paid for — so it is
+    /// journalled, and `None` is a DID-only mint rather than a silent default.
+    #[test]
+    fn the_profile_seed_root_survives_a_restart() {
+        let seeded = ProfileMintInProgress::with_seed_root(
+            ProfileIx(1),
+            MintStage::DidConfirmedStoreNotLaunched { did: did_record() },
+            [0xA5; 32],
+            7,
+        );
+        let back: ProfileMintInProgress =
+            serde_json::from_str(&serde_json::to_string(&seeded).unwrap()).unwrap();
+        assert_eq!(back.seed_root(), Some([0xA5; 32]));
+
+        let did_only = ProfileMintInProgress::new(
+            ProfileIx(1),
+            MintStage::DidPushed {
+                pending: PendingMintRecord {
+                    launcher_id: Bytes32::new([1; 32]),
+                    did_coin_id: Bytes32::new([2; 32]),
+                    source_coin_id: Bytes32::new([3; 32]),
+                    pushed_at_height: 100,
+                },
+            },
+            7,
+        );
+        let back: ProfileMintInProgress =
+            serde_json::from_str(&serde_json::to_string(&did_only).unwrap()).unwrap();
+        assert_eq!(
+            back.seed_root(),
+            None,
+            "a DID-only mint has no seed, and no default may be substituted for one"
+        );
+    }
+
+    /// A registry written before the seed root existed still loads, with no seed. The field is
+    /// ADDITIVE, and an old file is not an invalid one.
+    #[test]
+    fn a_pre_seed_root_journal_entry_still_loads() {
+        let legacy = r#"{"ix":1,"stage":{"DidPushed":{"pending":{"launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101","did_coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202","source_coin_id":"0x0303030303030303030303030303030303030303030303030303030303030303","pushed_at_height":100}}},"store_fee":5}"#;
+        let back: ProfileMintInProgress = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.seed_root(), None);
+        assert_eq!(back.store_fee(), 5);
     }
 
     /// A `DidConfirmedStoreNotLaunched` mint MUST survive a restart with its `MintedDidRecord`

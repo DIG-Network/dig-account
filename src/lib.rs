@@ -9,8 +9,8 @@
 //!
 //! This crate owns the object model, the unlock policy + keystore crypto, the in-process
 //! identity+money signer, per-profile key/DEK derivation, the on-chain **DID mint**, and all wallet
-//! ops. The STORE half of a profile mint is not implemented yet — its evidence types exist, and the
-//! launch that produces them lands with phase B (dig_ecosystem#2342). It NEVER draws UI or drives an OS auth ceremony — the host harness (dig-app) injects a
+//! ops, including the STORE half of a profile mint — a dig-store singleton launched from the DID's
+//! own coin, committed to a seeded profile SMT. It NEVER draws UI or drives an OS auth ceremony — the host harness (dig-app) injects a
 //! UI/auth provider that this crate calls back through for unlock and spend-confirm ceremonies.
 //!
 //! ## Custody split (the harness seam)
@@ -23,25 +23,23 @@
 //!
 //! See `SPEC.md` for the normative contract.
 //!
-//! ## Phase 1 status
+//! ## What carries a real implementation
 //!
-//! This is the PUBLIC TYPE SURFACE cut: the object model, the **profile registry** ([`registry`] —
+//! Everything below is implemented and tested against a real consensus validator or real crypto —
+//! there are no stubbed bodies left. The object model, the **profile registry** ([`registry`] —
 //! which profiles exist, which is active, which mints are half-finished), keystore (`store`),
 //! unlock policy (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` —
 //! the canonical `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner)
 //! over `dig-wallet-backend`'s `LocalSigner`, with the structured
 //! [`SpendSummary`](wallet::summary::SpendSummary)) carry real, tested implementations, as does the
 //! **on-chain DID mint** ([`mint`] — build, sign, push, and prove a `did:chia:` against real chain
-//! evidence).
+//! evidence) and the **full profile mint** ([`mint::profile`] — the two-bundle ceremony that binds a
+//! DID to a dig-store launched from its coin, resumable across a restart).
 //!
-//! [`ProfileMinter::mint`] still has a `todo!()` body, and its CURRENT signature is **not** the
-//! final one: a full-profile mint is a two-phase on-chain ceremony — the DID singleton must confirm
-//! before the store launch parented from its coin can even be built — so it needs a `ChainSource`,
-//! a `SpendPublisher` and a `MintNetwork` that the present signature does not take. Its final shape
-//! lands with dig_ecosystem#2342.
-
-// Phase 1 stubs: several modules expose final signatures with `todo!()`/`unimplemented!()` bodies.
-#![allow(clippy::todo)]
+//! A profile mint is deliberately THREE calls rather than one, because it spans two on-chain
+//! confirmations with a minutes-wide window between them in which the DID is already paid for:
+//! [`ProfileMinter::begin_profile_mint`], [`ProfileMinter::advance_profile_mint`] and
+//! [`ProfileMinter::profile_mint_status`].
 
 pub mod auth;
 pub mod constants;
@@ -70,8 +68,8 @@ pub use keys::dek::profile_dek;
 pub use keys::wallet_key::WalletKey;
 pub use mint::{
     ChainUnavailable, ConfirmedStore, MintError, MintNetwork, MintOptions, MintResult, MintStatus,
-    MintedDid, PendingMint, PendingStoreLaunch, PushOutcome, SpendPublisher, MAX_MINT_FEE_MOJOS,
-    MIN_CONFIRMATION_DEPTH,
+    MintedDid, PendingMint, PendingStoreLaunch, ProfileMintStatus, ProfileSeed, PushOutcome,
+    SpendPublisher, MAX_MINT_FEE_MOJOS, MIN_CONFIRMATION_DEPTH,
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;

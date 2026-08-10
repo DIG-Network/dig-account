@@ -188,6 +188,32 @@ journalled as a `ProfileMintInProgress`, which is NOT a profile and MUST NOT be 
 - A resume from `DidConfirmedStoreNotLaunched` MUST launch the store from the existing DID coin, and
   MUST NOT re-mint the DID.
 - A `progress_label()` MUST NOT assert that a profile exists.
+- A journalled PROFILE mint MUST carry the `seed_root` its store half commits to. A restart cannot
+  recompute it — the seed is the user's wizard input — so without it a resume could only invent a
+  seed or abandon a DID that is already paid for. It is `Option` because the field is ADDITIVE: an
+  entry written before it existed is a DID-only mint, and phase B MUST refuse such an entry by name
+  rather than substituting a default.
+- Each half MUST be journalled at its pushed stage BEFORE its bundle is broadcast. A lost answer then
+  leaves a stage that re-reads chain, never one that re-spends.
+- A DEFINITIVE rejection of the DID bundle (the network answered "no") MUST release the reserved
+  index; an UNREACHABLE chain MUST NOT, because the outcome is unknown and the bundle may yet be
+  included.
+
+#### 2.4.4 Profile-store discovery: lineage, NOT launcher memos
+
+A profile store is resolved by LINEAGE — it descends from its DID's coin, which the chain proves
+directly. It is **NOT** memo-scannable.
+
+The store is launched through an even-amount INTERMEDIATE coin (§6B.1). That coin's puzzle is the
+SDK's fixed `NftIntermediateLauncherArgs`, which dig-merkle does not author and cannot add memos to,
+so `DatastoreLaunch::launcher_memos_written` is `false` and neither the two-memo owner hint nor the
+`StoreKind::DidProfile` discriminator is written on chain.
+
+This is a DECIDED trade-off, not a defect (dig_ecosystem#2463). Memos are an INDEX; lineage is the
+TRUST PREDICATE. The direct-launch shape that writes the memos is not available here at all, because
+it requires an odd-amount `CREATE_COIN` from the DID coin, which a singleton may not emit (§6B.1). A
+consumer MUST resolve a profile store from its DID, and MUST NOT rely on a launcher-memo scan finding
+one.
 
 ## 3. Key derivation (byte-contracts — additive, back-compatible forever)
 
@@ -1094,6 +1120,77 @@ Signing happens in-process against the unlocked account's own wallet key. The `S
 accepts an ALREADY-SIGNED bundle and has no other method, so a node implementing it can broadcast and can
 never receive key material. The chain-read seam is the canonical `dig_chainsource_interface::ChainSource`,
 which cannot broadcast by construction.
+
+## 6B. The profile mint (DID + DID-rooted dig-store)
+
+### 6B.1 Shape (normative)
+
+A profile is a DID singleton PLUS a dig-store launched from that DID's coin PLUS a seeded profile
+SMT. **A DID MUST NOT be minted alone** on the profile path.
+
+The store bundle is ONE spend bundle containing exactly these, all staged into ONE `SpendContext` and
+drained ONCE:
+
+1. an `IntermediateLauncher` (`mint_number = 0`, `mint_total = 1`) over the DID coin, creating an
+   **EVEN-amount (0)** intermediate coin;
+2. the intermediate's own fixed puzzle spend, creating the **1-mojo launcher**;
+3. `dig_merkle::mint_datastore_launch_with_kind(.., StoreKind::DidProfile, ..)` — the launcher spend
+   and the eve store, committed to the profile seed's SMT root, owned by the profile wallet's puzzle
+   hash;
+4. the DID's own spend, via `dig_did::spend_did_with_conditions`, emitting the launch's
+   `parent_conditions`; and
+5. a standard-layer spend of ONE pre-existing wallet coin supplying the launcher's mojo and the fee.
+
+The intermediate is REQUIRED, not stylistic: a singleton may emit exactly one odd-amount
+`CREATE_COIN` and its own recreation has already claimed it, so `spend_did_with_conditions` MUST
+refuse a direct 1-mojo launcher with `DidError::OddAmountCreateCoin`. The funding coin is REQUIRED
+because an amount-0 intermediate supplies no mojo and Chia balances a bundle in aggregate.
+
+The launch MUST be built in the SAME `SpendContext` as the DID spend: `parent_conditions` hold node
+pointers into that allocator.
+
+dig-account MUST NOT hand-roll any of this. Every DID coin spend comes from `dig-did`, every store
+spend from `dig-merkle`, and the SMT slot schema from `dig-social-profile` — a byte-compatibility
+contract that MUST NOT be re-implemented here.
+
+### 6B.2 The three calls (normative)
+
+- `begin_profile_mint(registry, ix, seed, chain, publisher, network, options)` — reserve `ix` in the
+  journal, then build, sign and push the DID bundle. Returns `DidPending`.
+- `advance_profile_mint(registry, ix, chain, publisher, network)` — drive the ceremony from what the
+  chain NOW says. It MUST read chain FIRST and MUST advance only on evidence, so repeated calls
+  against an unchanged chain push nothing. Each half is pushed AT MOST ONCE.
+- `profile_mint_status(registry, ix, chain)` — report only. It MUST NOT spend, push, or write the
+  journal.
+
+All three are SYNCHRONOUS and generic over `C: ChainSource` / `P: SpendPublisher`.
+
+### 6B.3 The minter does not record the profile (normative)
+
+`ProfileMintStatus::Confirmed` carries BOTH evidence halves, and the HOST calls
+`ProfileRegistry::record_minted` with them. The minter owns the JOURNAL; the host owns the ENTRIES —
+it chooses the label and whether to activate. `record_minted` clears the journal entry, which closes
+the cycle.
+
+`ConfirmedStore` MUST have no public constructor: a host obtains one only as the OUTPUT of a real
+mint (dig_ecosystem#2511). Widening any constructor would let a host fabricate store evidence with no
+chain read.
+
+### 6B.4 The signing gate for a store launch (normative)
+
+A store launch spends TWO pre-existing coins, so §6A.5's one-root rule does not apply and a separate
+gate is used. It MUST refuse unless:
+
+1. every required signature is `AGG_SIG_ME` under THIS profile's own wallet key (no `AGG_SIG_UNSAFE`,
+   no foreign key, no secp requirement); and
+2. exactly two pre-existing coins are spent — this profile's DID coin, identified BY COIN ID, and a
+   coin at this wallet's own puzzle hash — with every other spent coin created by the same bundle.
+
+### 6B.5 Custody boundary
+
+Unchanged from §6A.6 and absolute: signing happens in-process against the unlocked account's own
+wallet key, residency is re-checked before every derivation, and the `SpendPublisher` seam takes an
+ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never enters it.
 
 ## 7. The injected UI/auth-provider seam (host boundary)
 

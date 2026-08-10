@@ -1,4 +1,9 @@
-//! The on-chain DID mint: build, sign, push, and PROVE.
+//! The on-chain mint: build, sign, push, and PROVE.
+//!
+//! Two ceremonies live here. [`did`] mints a `did:chia:` singleton on its own; [`profile`] drives the
+//! WHOLE profile — that DID plus a dig-store launched from its coin, committed to a [`seed`]ed SMT —
+//! across the two confirmations it takes. **A DID is never minted alone in production**: a profile is
+//! the unit a host creates, and [`profile`] is the entry point.
 //!
 //! The mint is deliberately two calls, not one. [`ProfileMinter::begin_did_mint`] returns a
 //! [`PendingMint`] — a pushed bundle, which is not yet a DID — and only
@@ -16,8 +21,11 @@ pub mod chain;
 pub mod did;
 pub mod error;
 pub mod evidence;
+pub mod profile;
+pub mod seed;
 pub mod status;
 pub mod store_evidence;
+mod store_launch;
 
 /// Real evidence values for tests in OTHER modules of this crate.
 ///
@@ -34,5 +42,7 @@ pub use chain::{ChainUnavailable, PushOutcome, SpendPublisher};
 pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
+pub use profile::ProfileMintStatus;
+pub use seed::ProfileSeed;
 pub use status::MintStatus;
 pub use store_evidence::{ConfirmedStore, PendingStoreLaunch};

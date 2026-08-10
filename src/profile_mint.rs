@@ -1,24 +1,24 @@
 //! Minting a new profile: a DID + dig-store are launched on-chain and bound together into a
-//! [`ProfileAnchor`], signed with the account seed's key at the profile index.
+//! [`ProfileAnchor`](crate::registry::ProfileAnchor), signed with the account seed's key at the
+//! profile index.
 //!
-//! # What is implemented
+//! # Where the ceremony lives
 //!
-//! The **DID half is live**: [`ProfileMinter::begin_did_mint`](crate::mint) builds, signs and pushes
-//! a real `did:chia:` mint, and [`ProfileMinter::mint_status`](crate::mint) turns its on-chain
-//! confirmation into [`MintedDid`](crate::mint::MintedDid) evidence. See [`crate::mint`].
+//! This module holds the CAPABILITY — the seed, the residency it observes, and the derivations both
+//! halves need. The ceremony itself is split by half:
 //!
-//! [`mint`](ProfileMinter::mint) — the FULL profile (DID + dig-store + seeded SMT) — still awaits
-//! the dig-store half; it fixes the public shape only.
+//! - [`crate::mint::did`] — the `did:chia:` mint (build, sign, push, prove).
+//! - `crate::mint::store_launch` (crate-private) — the dig-store launched from that DID's coin.
+//! - [`crate::mint::profile`] — the three public calls that drive both to a
+//!   [`ProfileAnchor`](crate::ProfileAnchor): `begin_profile_mint`, `advance_profile_mint`,
+//!   `profile_mint_status`.
 
 use std::sync::Arc;
 
 use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
 use zeroize::Zeroizing;
 
-use crate::error::Result;
-use crate::id::ProfileIx;
 use crate::mint::error::{MintError, MintResult};
-use crate::registry::ProfileAnchor;
 use crate::session_residency::Residency;
 
 /// Mints new profiles for an unlocked account.
@@ -64,34 +64,6 @@ impl ProfileMinter {
         }
         Ok(self.seed.master_seed())
     }
-
-    /// **NOT YET IMPLEMENTED — calling this panics, and it is being REPLACED.** See `# Panics`.
-    ///
-    /// It was never implementable in this shape. A profile mint is a two-phase on-chain ceremony —
-    /// launch, then wait for burial, then launch the store against the confirmed DID coin — so it
-    /// needs a `ChainSource`, a `SpendPublisher` and a `MintNetwork`, none of which a
-    /// `&self`-plus-index signature can reach. A single call that returned a finished profile
-    /// would have to either block on the chain or invent a confirmation, and inventing one is the
-    /// specific lie [`ProfileAnchor`] exists to make unrepresentable.
-    ///
-    /// **The replacement lands in 0.10.0** as the same three-step shape the DID half already uses:
-    /// `begin_profile_mint` (build, sign, push), `advance_profile_mint` (drive the ceremony from
-    /// whatever the chain now says), and `profile_mint_status` (report it), resolving to a
-    /// [`ProfileAnchor`] only once BOTH halves are buried. Tracked as dig_ecosystem#2342.
-    ///
-    /// The DID half IS real today: [`crate::mint`] builds, signs and pushes a `did:chia:` mint and
-    /// turns its confirmation into [`MintedDid`](crate::mint::MintedDid) evidence.
-    ///
-    /// # Panics
-    ///
-    /// Unconditionally, on every call, with a `todo!()`. There is no argument that makes it
-    /// succeed, and nothing is derived, signed or pushed before it panics.
-    pub fn mint(&self, ix: ProfileIx) -> Result<ProfileAnchor> {
-        // Both parameters are unread only because the body does not exist yet; discarding them
-        // keeps the signature — which is part of this cut's public shape — warning-free.
-        let _ = (&self.seed, ix);
-        todo!("Phase 2 (0.10.0): begin_profile_mint / advance_profile_mint / profile_mint_status")
-    }
 }
 
 #[cfg(test)]
@@ -126,12 +98,5 @@ mod tests {
 
         residency.revoke();
         assert!(matches!(minter.live_master_seed(), Err(MintError::Locked)));
-    }
-
-    #[test]
-    #[should_panic(expected = "Phase 2")]
-    fn mint_is_not_yet_implemented() {
-        // Phase-1 guard: the mint path deliberately panics until the Phase-2 on-chain flow lands.
-        let _ = minter_scoped_to(&Arc::new(Residency::new())).mint(ProfileIx::ROOT);
     }
 }

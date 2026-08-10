@@ -261,20 +261,46 @@ impl ProfileRegistry {
     /// DID half already enforces; [`check`](Self::check) applies it again on load, so the bound
     /// cannot be side-stepped by editing the file.
     pub fn begin_mint(&mut self, ix: ProfileIx, stage: MintStage, store_fee: u64) -> Result<()> {
+        self.reserve(ProfileMintInProgress::new(ix, stage, store_fee))
+    }
+
+    /// Reserve `ix` for a PROFILE mint — a DID plus a store committed to `seed_root`.
+    ///
+    /// The same reservation as [`begin_mint`](Self::begin_mint), plus the seed root a resumed phase
+    /// B needs to commit the store to the bytes the user actually chose (see
+    /// [`ProfileMintInProgress::seed_root`]).
+    ///
+    /// # Errors
+    ///
+    /// Identical to [`begin_mint`](Self::begin_mint).
+    pub fn begin_seeded_mint(
+        &mut self,
+        ix: ProfileIx,
+        stage: MintStage,
+        seed_root: [u8; 32],
+        store_fee: u64,
+    ) -> Result<()> {
+        self.reserve(ProfileMintInProgress::with_seed_root(
+            ix, stage, seed_root, store_fee,
+        ))
+    }
+
+    /// Insert `mint` as the reservation of its index, after the checks both entry points share.
+    fn reserve(&mut self, mint: ProfileMintInProgress) -> Result<()> {
+        let ix = mint.ix();
         if self.contains(ix) {
             return Err(AccountError::ProfileAlreadyRegistered(ix));
         }
         if self.mint_position(ix).is_some() {
             return Err(AccountError::MintAlreadyInProgress(ix));
         }
-        if store_fee > MAX_MINT_FEE_MOJOS {
+        if mint.store_fee() > MAX_MINT_FEE_MOJOS {
             return Err(AccountError::MintFeeAboveCeiling {
-                fee: store_fee,
+                fee: mint.store_fee(),
                 ceiling: MAX_MINT_FEE_MOJOS,
             });
         }
 
-        let mint = ProfileMintInProgress::new(ix, stage, store_fee);
         let position = self.in_progress.partition_point(|m| m.ix() < ix);
         self.in_progress.insert(position, mint);
         self.expect_valid();

@@ -58,6 +58,14 @@ pub struct SimulatorChain {
     /// was returned": an implementation that pushed first and checked afterwards satisfies the second
     /// and spends the user's XCH. The mempool itself cannot answer it, because farming empties it.
     pub pushes: RefCell<u32>,
+    /// Every accepted bundle, retained for the lifetime of the double (see
+    /// [`accepted_bundles`](Self::accepted_bundles)).
+    pub accepted: RefCell<Vec<SpendBundle>>,
+    /// How many bundles this node was ASKED to accept, including the ones it could not deliver.
+    ///
+    /// Distinct from [`pushes`](Self::pushes) on purpose: an ordering bug shows up as a bundle
+    /// broadcast a SECOND time, and if the node never answers, an accept-only counter cannot see it.
+    pub push_attempts: RefCell<u32>,
 }
 
 impl SimulatorChain {
@@ -73,6 +81,8 @@ impl SimulatorChain {
             mempool_observed: RefCell::new(Vec::new()),
             spent_elsewhere: RefCell::new(Vec::new()),
             pushes: RefCell::new(0),
+            accepted: RefCell::new(Vec::new()),
+            push_attempts: RefCell::new(0),
         };
         // Leave genesis behind: a real coin is never created in block 0, and a fixture that
         // confirmed there would be indistinguishable from a fabricated height.
@@ -140,6 +150,29 @@ impl SimulatorChain {
     /// How many bundles this node has accepted, ever.
     pub fn pushed_bundles(&self) -> u32 {
         *self.pushes.borrow()
+    }
+
+    /// Every bundle this node has accepted, ever — retained past [`farm`](Self::farm), which drains
+    /// the mempool. A signature-set proof needs the exact bytes that were pushed, and the mempool
+    /// no longer holds them by the time the mint is confirmed.
+    pub fn accepted_bundles(&self) -> Vec<SpendBundle> {
+        self.accepted.borrow().clone()
+    }
+
+    /// How many bundles this node was asked to broadcast, delivered or not.
+    pub fn push_attempts(&self) -> u32 {
+        *self.push_attempts.borrow()
+    }
+
+    /// Stop delivering pushes; reads keep working. The shape of a node that is reachable enough to
+    /// answer questions while a broadcast still does not get through.
+    pub fn stop_delivering_pushes(&mut self) {
+        self.push_undeliverable = true;
+    }
+
+    /// Resume delivering pushes.
+    pub fn resume_delivering_pushes(&mut self) {
+        self.push_undeliverable = false;
     }
 
     pub fn unavailable<T>(&self) -> Result<T, String> {
@@ -216,12 +249,42 @@ impl ChainSource for SimulatorChain {
         Ok(self.sim.borrow().coin_spend(coin_id))
     }
 
+    /// A GENUINE forward walk from the launcher coin to the singleton's current tip.
+    ///
+    /// Deliberately not an echo of anything the caller supplied (`ChainSource` SPEC §4): each step
+    /// asks the simulator for the CHILDREN of the coin it is standing on and follows the odd-amount
+    /// one, which is the singleton's own recreation. A double that returned the caller's coin would
+    /// make every membership claim built on it vacuous — and the store launch resumes a mint by
+    /// walking this, so a vacuous walk would let a resumed launch spend a coin nobody proved was the
+    /// DID's.
     fn resolve_singleton_lineage(
         &self,
-        _launcher_id: Bytes32,
+        launcher_id: Bytes32,
     ) -> Result<Option<SingletonLineage>, Self::Error> {
-        // Honest refusal: the mint never walks a lineage, so this double does not pretend to.
-        Err("lineage resolution is not supported by the simulator double".to_string())
+        if self.offline {
+            return self.unavailable();
+        }
+        let sim = self.sim.borrow();
+        if sim.coin_state(launcher_id).is_none() {
+            return Ok(None);
+        }
+
+        let mut members = vec![launcher_id];
+        let mut tip = launcher_id;
+        // Bounded so a cycle in a buggy double fails the test rather than hanging it. A profile mint
+        // is two spends deep; anything near this bound is a defect.
+        for _ in 0..64 {
+            let Some(child) = sim
+                .children(tip)
+                .into_iter()
+                .find(|state| state.coin.amount % 2 == 1)
+            else {
+                break;
+            };
+            tip = child.coin.coin_id();
+            members.push(tip);
+        }
+        Ok(Some(SingletonLineage::new(tip, members)))
     }
 
     fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
@@ -241,6 +304,7 @@ impl ChainSource for SimulatorChain {
 
 impl SpendPublisher for SimulatorChain {
     fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome, ChainUnavailable> {
+        *self.push_attempts.borrow_mut() += 1;
         if self.offline || self.push_undeliverable {
             return Err(ChainUnavailable::new("simulated: no node answered"));
         }
@@ -250,6 +314,7 @@ impl SpendPublisher for SimulatorChain {
             });
         }
         self.mempool.borrow_mut().push(bundle.clone());
+        self.accepted.borrow_mut().push(bundle.clone());
         *self.pushes.borrow_mut() += 1;
         Ok(PushOutcome::Accepted)
     }

@@ -69,6 +69,14 @@ pub enum MintError {
         ceiling: u64,
     },
 
+    /// The profile registry refused this mint, or has nothing journalled to advance.
+    ///
+    /// Distinct from every chain-facing variant because nothing was spent and nothing was asked of
+    /// the network: the refusal is local bookkeeping — `ix` is already a profile, a mint is already
+    /// in progress there, or the entry names a DID-only mint that has no profile seed to resume.
+    #[error("the profile registry refused this mint: {0}")]
+    Journal(String),
+
     /// The mint's own pre-signing gate refused the spend it was about to sign.
     ///
     /// Fail-closed: the mint signs only signatures under its own wallet key, only `AGG_SIG_ME`, and

@@ -106,11 +106,19 @@ impl UnlockedAccount {
     /// the moment [`lock`](Self::lock) is called — it does not hold a snapshot that outlives the
     /// session.
     pub fn wallet_ops(&self) -> WalletOps {
-        WalletOps::new(
-            self.seed.clone(),
-            self.default_profile_ix,
-            self.residency.clone(),
-        )
+        self.wallet_ops_at(self.default_profile_ix)
+    }
+
+    /// The wallet-ops handle for the profile at `ix`.
+    ///
+    /// A profile switch must move the WALLET with it (dig_ecosystem#2496): each profile has its own
+    /// money key at its own HD index, so a host that switched the active profile while still holding
+    /// the DEFAULT profile's `WalletOps` would show one profile's identity beside another's balance
+    /// — and spend from the wrong one.
+    ///
+    /// Like [`wallet_ops`](Self::wallet_ops), the handle observes this unlock's [`Residency`].
+    pub fn wallet_ops_at(&self, ix: ProfileIx) -> WalletOps {
+        WalletOps::new(self.seed.clone(), ix, self.residency.clone())
     }
 
     /// The DID-mint handle for this account — the only way to obtain one.
