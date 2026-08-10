@@ -1599,11 +1599,27 @@ mod tests {
     }
 
     /// A CAT amount is invisible to `native_total_mojos`, so a CAT-paying spend totals to its fee
-    /// alone and would slip under any mojo limit. It must be INDETERMINATE — and specifically
-    /// indeterminate rather than merely not-approved: asserting only "not approved" would be satisfied
-    /// by an escalation, and an unbounded spend must not be confirmable away either.
+    /// alone and would slip under any mojo limit. It must therefore never AUTO-approve — and it does
+    /// not, whatever the allowance is set to.
+    ///
+    /// # This assertion changed deliberately in 0.12.0, and here is why
+    ///
+    /// It previously required `PolicyIndeterminate`, on the reasoning that "an unbounded spend must
+    /// not be confirmable away either". That made $DIG structurally unsendable: `PolicyIndeterminate`
+    /// is a hard error with no route onward, so no user, ceremony or host could ever move the token
+    /// the whole product is denominated in.
+    ///
+    /// The premise was also wrong about what a ceremony is. A large XCH send over the limit escalates
+    /// to a human too; escalation is not a bound being confirmed away, it is the human BEING the
+    /// bound. What made the old shape defensible was that nothing could yet build a CAT spend, so the
+    /// error was unreachable.
+    ///
+    /// What the new contract genuinely requires is that the human be told the truth, so this test
+    /// asserts the summary the ceremony renders actually NAMES the asset and its amount. An
+    /// escalation to an uninformed prompt WOULD be confirming a bound away, and that is the
+    /// property worth holding.
     #[test]
-    fn a_spend_paying_a_non_native_asset_is_indeterminate_however_small_its_mojo_total() {
+    fn a_spend_paying_a_non_native_asset_escalates_to_an_informed_human_and_never_auto_approves() {
         let gate = gate_with(
             hot_custody(),
             AutoSendPolicy {
@@ -1621,10 +1637,31 @@ mod tests {
             1,
             "the CAT amount is invisible to a mojo total: {summary:?}"
         );
-        assert_eq!(summary.tier, SpendTier::AutoSend);
+        assert_eq!(
+            summary.tier,
+            SpendTier::Confirm,
+            "a spend moving a non-native asset is Confirm by rule, not by accident of where a              filter sits: {summary:?}"
+        );
 
-        let err = refusal(gate.authorize_op(&coin_spends, SpendOpClass::Tip));
-        assert!(matches!(err, AccountError::PolicyIndeterminate(_)), "{err}");
+        let pending = match gate.authorize_op(&coin_spends, SpendOpClass::Tip) {
+            Ok(SpendRuling::RequiresConfirmation(pending)) => pending,
+            Ok(SpendRuling::Approved(_)) => {
+                panic!("a spend no mojo limit can bound must never auto-approve")
+            }
+            Err(e) => panic!("it must reach the ceremony rather than dead-ending: {e}"),
+        };
+
+        let paid = pending
+            .summary()
+            .recipients
+            .iter()
+            .find(|recipient| recipient.asset_id.is_some())
+            .expect("the ceremony must show the human WHICH asset is leaving");
+        assert_eq!(
+            paid.amount_mojos, 1_000_000_000,
+            "and HOW MUCH of it — an escalation to an uninformed prompt would be worse than a              refusal: {:?}",
+            pending.summary()
+        );
     }
 
     /// An unreadable clock means the rolling window cannot be measured. The gate must refuse rather
