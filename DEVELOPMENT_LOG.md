@@ -91,27 +91,43 @@ That narrow boundary used to be load-bearing for a second reason. Until 0.4, thi
 0.34, so THAT subtree is gone and the pin MUST NOT go back: dropping to 0.2 re-splits every
 chia-wallet-sdk type in this custody binary.
 
-## Which chia duplicates remain, and why they are NOT ours to fix
+## Where the chia 0.26 family came from, and what is left after removing it
 
-`chia-wallet-sdk` is unified at 0.34.0 — one version, so no sdk type can differ across an API
-boundary here. Lower-level chia crates still resolve to several versions, from two sources, and
-neither is a dig-account defect:
+`chia-wallet-sdk` is unified at 0.34.0. Getting there left a second, lower chia family behind, and
+finding its parents took two passes — worth recording, because the first answer was incomplete.
+
+It entered through **two separate edges of `dig-session` 0.5.1**, not one: `dig-identity` 0.5.0
+brought `chia-sdk-utils` 0.30.0, `chia-protocol` 0.26.0 and `chia-bls` 0.26.0, while `dig-constants`
+0.7.0 separately brought `chia-protocol` 0.26.0 and `chia-consensus` 0.26.0. Naming only
+`dig-constants` looked sufficient because both edges produce `chia-protocol` 0.26.0 — the shared
+symptom hid the second cause.
+
+Bumping `dig-session` to 0.6.1 cut both edges at once and removed the whole family:
+`chia-protocol` 0.26.0, `chia-puzzle-types` 0.26.0, `chia-consensus` 0.26.0, `chia-sdk-utils` 0.30.0,
+`chia-sha2` 0.22.0, `chia-traits` 0.22.0, `clvm-traits` 0.26.0, `clvm-utils` 0.26.0, `clvmr` 0.14.0
+and `dig-constants` 0.7.0. `chia-protocol`, `chia-consensus`, `chia-puzzle-types`, `chia-sdk-utils`,
+`clvmr`, `dig-constants`, `dig-session` and `dig-keystore` are each single-version now.
+
+**What genuinely remains, and is NOT ours to fix:**
 
 - **Inside chia-wallet-sdk 0.34.0 itself.** It reaches `chia-bls` 0.42.1 through `chialisp` 0.4.6 and
   `chia-bls` 0.36.1 through `chia-consensus` 0.36.1. A single sdk version is internally split, so no
   pin in this crate can collapse it. Upstream.
-- **Through `dig-session` 0.5.1's two older edges.** `dig-identity` 0.5.0 brings
-  `chia-sdk-utils` 0.30.0, `chia-protocol` 0.26.0 and `chia-bls` 0.26.0; separately,
-  `dig-constants` 0.7.0 brings `chia-protocol` 0.26.0 and `chia-consensus` 0.26.0 only.
-  `dig-constants` is already on the modern family at 0.10.0, so the release-first fix lives in
-  `dig-identity` / `dig-session`, not here.
+- **`dig-identity` 0.6.0 vs 0.7.0** — 0.6.0 for dig-account / `dig-session` / `dig-wallet-backend`,
+  0.7.0 for `dig-social-profile`. Closing it needs those two released onto 0.7, release-first, in
+  their own repos.
 
-Both are tolerable for the same reason the schema dependency is: **no chia type crosses either
-boundary in use.** `dig-session` hands this crate `Password`, `UnlockedMasterSeed`, `Session`,
-`SessionError` and two length constants — plain secrets and integers. Re-check that claim before
-widening the `dig-session` surface; the day a `Coin`, `CoinSpend`, `SpendBundle` or `Program` crosses
-it, the version split stops being cosmetic and starts being a type error — or worse, two structurally
-identical types that silently disagree.
+Tolerable for the reason the schema dependency is: **no chia type crosses either boundary in use.**
+`dig-session` hands this crate `Password`, `UnlockedMasterSeed`, `Session`, `SessionError` and two
+length constants — plain secrets and integers. Re-check that before widening the `dig-session`
+surface; the day a `Coin`, `CoinSpend`, `SpendBundle` or `Program` crosses it, the split stops being
+cosmetic and becomes a type error — or worse, two structurally identical types that silently
+disagree.
+
+**The removal changed this crate's own contract.** Three dependency types are public here —
+`SlotId` in `ProfileSeed::with_utf8`, and `dig_session::SessionError` + `dig_keystore::KeystoreError`
+as `#[from]` variants of `StoreError` — so moving those crates across majors is BREAKING for
+consumers, which is what 0.13.0 buys (for a `0.x` crate Cargo reads the minor position as the major).
 
 ## A dependency pin that looks stale can be the one holding the tree together
 
