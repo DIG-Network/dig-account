@@ -8,9 +8,8 @@ a DID + dig-store + SMT-of-profile-info, recorded as a `ProfileAnchor`, minted a
 with the account seed's key at that profile index.
 
 This crate owns the object model, unlock policy + keystore crypto, the in-process identity+money
-signer, per-profile key/DEK derivation, the on-chain **DID mint**, and all wallet ops. The store half
-of a profile mint is not implemented yet: its evidence types exist, and the launch that produces them
-lands with phase B (dig_ecosystem#2342). It never draws
+signer, per-profile key/DEK derivation, the on-chain **profile mint** (the DID *and* the dig-store
+launched from its coin), and all wallet ops. It never draws
 UI — the host harness (dig-app) injects a UI/auth provider that this crate calls back through.
 
 `PolicyAuthorizer` is the custody gate for the **money path**, and on that path **it is not optional.**
@@ -55,6 +54,35 @@ if let MintStatus::Confirmed(minted) = minter.mint_status(&pending, &chain)? { �
 A pushed bundle is not a DID. `begin_did_mint` returns a `PendingMint`; only a sufficiently-buried
 confirmation of the exact coin that bundle created becomes a `MintedDid`, so a host cannot claim an
 identity the chain has not shown it. On mainnet this spends real XCH.
+
+## The profile mint
+
+A DID is never minted alone. A profile is a DID singleton **plus** a dig-store launched from that
+DID's coin **plus** a seeded profile SMT — two bundles, two confirmations, and a real minutes-wide
+window between them in which the DID is already paid for.
+
+```rust
+let minter = unlocked.profile_minter();
+let seed = ProfileSeed::new().with_display_name("ada");
+
+minter.begin_profile_mint(&mut registry, ix, &seed, &chain, &publisher, &network, &options)?;
+
+// On a timer. It reads chain FIRST and advances only on evidence, so calling it repeatedly
+// against an unchanged chain pushes nothing.
+if let ProfileMintStatus::Confirmed { did, store } =
+    minter.advance_profile_mint(&mut registry, ix, &chain, &publisher, &network)?
+{
+    // The minter owns the JOURNAL; the host owns the ENTRIES — it picks the label.
+    registry.record_minted(ix, &did, &store, Some("ada".into()))?;
+}
+```
+
+The window is survivable because it is journalled, and each half is journalled BEFORE it is
+broadcast. A restart resumes from `DidConfirmedStoreNotLaunched` by launching the store from the
+EXISTING DID coin — never by minting a second identity the user has already paid for.
+
+`ConfirmedStore` has no public constructor. A host obtains one only as the output of a real mint, so
+store evidence cannot be fabricated without a chain read.
 
 ## The recovery phrase
 

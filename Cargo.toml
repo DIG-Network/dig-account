@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -43,6 +43,18 @@ dig-did = "0.6"
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
 dig-chainsource-interface = "0.3"
+# The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
+# the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
+# back are folded into the DID's own spend so the two ride in one atomic bundle.
+dig-merkle = "0.6"
+# The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
+#
+# This crate is still on the chia 0.26 family while dig-account is on 0.36.1, so it brings a SECOND
+# chia subtree. That is accepted deliberately and is safe ONLY because no chia type crosses the
+# boundary used here: a seeded profile goes in as slots and comes out as a plain `[u8; 32]` root
+# (`ProfileSeed`). Nothing else from this crate may be used — in particular NOT
+# `IdentityProfile::mint_from_did`, which cannot mint a DID-rooted store (see `mint::store_launch`).
+dig-social-profile = "0.2"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.36.1"
 # The `serde` feature is required: coin ids and launcher ids are persisted in the profile

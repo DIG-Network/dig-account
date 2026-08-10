@@ -283,15 +283,63 @@ fn signature_windows(rest: &str) -> [&str; 2] {
     ]
 }
 
+/// Whether a function `name` signs, judged by its underscore-separated words.
+///
+/// A door is not always named `sign…` FIRST. This crate already ships
+/// `build_and_sign_store_launch`, and the shape a contributor would most plausibly add next is
+/// `build_and_sign_from(coin_spends: &[CoinSpend])` — the #1698 exploit verbatim, and invisible to a
+/// rule anchored on the name's start. So the whole name is read.
+///
+/// The word set is EXPLICIT rather than a prefix test, and both halves of that are deliberate.
+///
+/// It must include the participles. Reading whole words replaced a rule anchored on the name's
+/// START, and `sign` alone would have made `signed_spends`, `signer_for` and `signing_pass`
+/// invisible — three shapes the old prefix rule DID catch, each of them the #1698 exploit spelled as
+/// a participle. Widening the position while narrowing the word is a net loss of coverage, which is
+/// exactly the shape a "widening" hides.
+///
+/// It must NOT be a prefix test either. `required_signatures`, `signature_windows` and
+/// `assert_signable_by` all EXTRACT or ASSERT and hand back no signature at all. Flagging them would
+/// make the guard trip on the crate's own honest code, and a guard that always trips gets weakened
+/// rather than obeyed. `signature`/`signable` are therefore absent from the set on purpose.
+///
+/// # This name check is a TRIPWIRE, not the guarantee
+///
+/// It is deliberately not exhaustive and cannot be: `resign_`, `countersign_` and `sig_` are all
+/// uncaught, and the prefix rule this replaced missed strictly MORE than the set does. The actual
+/// enforcement is [`no_signing_function_accepts_bare_coin_spends`] plus the compile-fail proof in
+/// `tests/compile_fail/the_1698_exploit.rs`, which are shape-based and cannot be renamed around.
+/// Treating a name heuristic as the guarantee is the failure to avoid; as an outer tripwire in front
+/// of a real guard it earns its place.
+fn is_a_signing_name(name: &str) -> bool {
+    name.split('_').any(|word| {
+        matches!(
+            word,
+            "sign" | "signs" | "signed" | "signer" | "signers" | "signing"
+        )
+    })
+}
+
+/// The declared function name at `rest`, which begins with `fn `.
+///
+/// Ends at whichever of `(`, `<` or a space comes first, so a generic door
+/// (`sign_generic_spends<S: …>`) is read as its bare name.
+fn declared_name(rest: &str) -> &str {
+    let after_fn = &rest["fn ".len()..];
+    let end = after_fn.find(['(', '<', ' ']).unwrap_or(after_fn.len());
+    &after_fn[..end]
+}
+
 /// Every function in `source` that turns loose coin spends into a signature, exempt or not.
 ///
-/// A signing door is a function whose name begins `sign` and which receives coin spends in any
-/// spelling. No visibility filter: an unreachable door is excluded by NAME above, never by a guess at
-/// what "reachable" looks like in text.
+/// A signing door is a function with a `sign` word in its name (see [`is_a_signing_name`]) which
+/// receives coin spends in any spelling. No visibility filter: an unreachable door is excluded by
+/// NAME above, never by a guess at what "reachable" looks like in text.
 fn signing_doors(source: &str) -> Vec<String> {
     let normalized = without_line_breaks(source);
     normalized
-        .match_indices("fn sign")
+        .match_indices("fn ")
+        .filter(|(start, _)| is_a_signing_name(declared_name(&normalized[*start..])))
         .filter_map(|(start, _)| {
             let rest = &normalized[start..];
             signature_windows(rest)
@@ -488,8 +536,11 @@ fn the_signing_door_guard_fires_on_every_form_it_once_missed() {
 /// `Vec`) are shapes the PRE-rewrite guard actually caught, so they are regressions rather than
 /// merely gaps; the rest are the parameter spellings a future author reaches for without thinking.
 ///
-/// The rule these encode: a signing door is any function named `sign…` that receives coin spends AT
-/// ALL, however the type is spelled — owned, borrowed, generic, or fully qualified.
+/// The rule these encode: a signing door is any function with a `sign` word in its name that
+/// receives coin spends AT ALL, however the type is spelled — owned, borrowed, generic, or fully
+/// qualified. (The name half of that rule was `sign…` as a PREFIX until the store launch shipped a
+/// signing site called `build_and_sign_store_launch`; see
+/// [`the_signing_door_guard_fires_on_a_sign_that_is_not_the_first_word`].)
 #[test]
 fn the_signing_door_guard_fires_on_every_shape_the_rewrite_missed() {
     let missed_forms: [(&str, &str); 4] = [
@@ -538,6 +589,132 @@ fn the_signing_door_guard_fires_on_every_shape_the_rewrite_missed() {
             "not a signing door: {benign}"
         );
     }
+}
+
+/// NEGATIVE CONTROLS for the door forms whose name does not START with `sign`.
+///
+/// The guard read `fn sign` for as long as every signing site in the crate was named `sign_…`. The
+/// profile mint's store half broke that assumption: it signs inside
+/// `build_and_sign_store_launch`, so the guard's model of "where a signature can be produced" no
+/// longer matched the crate. The rule it encodes now is the one it always meant — a door is any
+/// function that SIGNS and receives coin spends, wherever the word sits in its name.
+///
+/// `build_and_sign_from` is not hypothetical: it is `sign_these_spends` with a build step bolted on
+/// the front, which is exactly how the #1698 shape would come back.
+#[test]
+fn the_signing_door_guard_fires_on_a_sign_that_is_not_the_first_word() {
+    let missed_forms: [(&str, &str); 3] = [
+        (
+            "a build-and-sign door",
+            "pub fn build_and_sign_from(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a re-sign door",
+            "pub(crate) fn re_sign_spends(&self, coin_spends: Vec<CoinSpend>) -> Result<Signature> {",
+        ),
+        (
+            // Wrapped as rustfmt would emit it, so the two widenings are proven to compose rather
+            // than each being tested only in the other's easy case.
+            "a wrapped build-and-sign door",
+            "pub fn prepare_and_sign_bundle(\n    &self,\n    coin_spends: &[chia_protocol::CoinSpend],\n) -> Result<Signature> {",
+        ),
+    ];
+
+    let uncaught: Vec<&str> = missed_forms
+        .iter()
+        .filter(|(_, source)| unauthorized_signing_doors(source).len() != 1)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(
+        uncaught.is_empty(),
+        "each of these signs over caller-supplied spends and must be caught, but the guard \
+         missed: {uncaught:?}"
+    );
+}
+
+/// **The PARTICIPLE forms, which reading whole words nearly lost.**
+///
+/// Moving from a `fn sign` PREFIX test to whole-word matching widened the position the word may sit
+/// in and simultaneously narrowed which words count. `signed`, `signer` and `signing` were caught by
+/// the prefix rule and would have become invisible — each one a door that takes loose caller-supplied
+/// spends and hands back a signature, i.e. #1698 verbatim, spelled as a participle.
+///
+/// This is the direction a coverage change is least likely to be re-read: the commit said "widening".
+/// So the participles get their own test rather than another row in the list above.
+#[test]
+fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
+    let participle_forms: [(&str, &str); 5] = [
+        (
+            "a past-participle door",
+            "pub fn signed_spends(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "an agent-noun door",
+            "pub fn signer_for(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a gerund door",
+            "pub fn signing_pass(coin_spends: Vec<CoinSpend>) -> chia_bls::Signature {",
+        ),
+        (
+            "a third-person door",
+            "pub fn signs_these_spends(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a plural agent-noun door",
+            "pub fn signers_over(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+    ];
+
+    let uncaught: Vec<&str> = participle_forms
+        .iter()
+        .filter(|(_, source)| unauthorized_signing_doors(source).len() != 1)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(
+        uncaught.is_empty(),
+        "a participle spelling is still a signing door, but the guard missed: {uncaught:?}"
+    );
+
+    // The other half of the rule: the set stops at the participles and does NOT reach `signature`.
+    // `required_signatures` is real (`src/wallet/money_signer.rs:180`) and extracts messages rather
+    // than producing a signature, so a prefix test would trip the guard on the crate's own code.
+    for honest in [
+        "pub fn required_signatures(coin_spends: &[CoinSpend]) -> Result<Vec<RequiredSignature>> {",
+        "fn signature_windows(coin_spends: &[CoinSpend]) -> Vec<Window> {",
+        "fn assert_signable_by(coin_spends: &[CoinSpend], pk: PublicKey) -> Result<()> {",
+    ] {
+        assert!(
+            unauthorized_signing_doors(honest).is_empty(),
+            "extracting signature requirements is not signing: {honest}"
+        );
+    }
+
+    // The widening must not swallow the crate's own honest neighbours. `required_signatures`
+    // CONTAINS the letters `sign` and produces no signature; `assign_spends` contains them too.
+    // Flagging either would make the guard trip on correct code, which is how a guard gets deleted.
+    for benign in [
+        "fn required_signatures( signer: &LocalSigner, coin_spends: &[CoinSpend], ) -> Result<Vec<RequiredSignature>> {",
+        "fn assign_spends(&self, coin_spends: &[CoinSpend]) -> Vec<Assignment> {",
+        "fn signature_windows(coin_spends: &[CoinSpend]) -> Vec<Window> {",
+        "fn assert_signable_by(coin_spends: &[CoinSpend], pk: PublicKey) -> Result<()> {",
+    ] {
+        assert!(
+            unauthorized_signing_doors(benign).is_empty(),
+            "not a signing door: {benign}"
+        );
+    }
+
+    // And the crate's REAL new signing site must stay unflagged for the honest reason — it receives
+    // no loose coin spends at all. If it ever grows a `&[CoinSpend]` parameter, this flips.
+    assert!(
+        unauthorized_signing_doors(
+            "pub(super) fn build_and_sign_store_launch( wallet: &WalletKey, did: Did, \
+             did_coin_id: Bytes32, funding: Coin, ) -> MintResult<StoreLaunchBundle> {"
+        )
+        .is_empty(),
+        "the store launch builds its own spends; it is not a route to signing someone else's"
+    );
 }
 
 /// NEGATIVE CONTROLS for the EXEMPTION's own edges — the two ways a name-scoped exemption leaks.

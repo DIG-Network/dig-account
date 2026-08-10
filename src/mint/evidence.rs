@@ -214,6 +214,38 @@ impl MintedDid {
         })
     }
 
+    /// Re-establish evidence for a DID this host has ALREADY journalled, from a FRESH chain read.
+    ///
+    /// # This is not a conversion from a record
+    ///
+    /// The journal deliberately has no `From<MintedDidRecord> for MintedDid`, because a file cannot
+    /// vouch for the chain. This is not that conversion: the journalled values say only WHICH coin
+    /// to look up and set the floor a re-read must clear, and the evidence returned is built
+    /// entirely from `record` and `peak_height` — a fresh reading of the chain. If the coin has been
+    /// reorged away, is shallower than [`MIN_CONFIRMATION_DEPTH`], or answers for a different coin,
+    /// this returns `None` and the resume path stops. That is the point: a DID the chain no longer
+    /// shows must not be spent from just because a file remembers it.
+    ///
+    /// The five rules are [`from_confirmed`](Self::from_confirmed)'s, with the journalled height as
+    /// the floor in place of the push height — a re-read may report the same height or a later one
+    /// after a reorg, never an earlier one.
+    pub(super) fn reverified(
+        launcher_id: Bytes32,
+        coin_id: Bytes32,
+        journalled_height: u32,
+        record: &CoinRecord,
+        peak_height: u32,
+    ) -> Option<Self> {
+        Self::from_confirmed(
+            // Not evidence, and not treated as any: a `PendingMint` names a coin to look for. The
+            // source coin is unknown on this path and unused by the rules below, so it is the coin
+            // itself — a value that can only make rule 1 stricter, never looser.
+            &PendingMint::new(launcher_id, coin_id, coin_id, journalled_height),
+            record,
+            peak_height,
+        )
+    }
+
     /// The canonical `did:chia:…` string.
     pub fn did(&self) -> &str {
         &self.did

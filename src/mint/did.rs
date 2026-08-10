@@ -92,7 +92,10 @@ impl MintNetwork {
     }
 
     /// The `AGG_SIG_ME` constants this network signs under.
-    fn constants(&self) -> &AggSigConstants {
+    ///
+    /// `pub(super)`: the store-launch half of a profile mint gates on the SAME domain, and reading
+    /// it from here is what stops the two halves drifting onto different constants.
+    pub(super) fn constants(&self) -> &AggSigConstants {
         &self.constants
     }
 }
@@ -162,9 +165,27 @@ impl ProfileMinter {
         C: ChainSource + ?Sized,
         P: SpendPublisher + ?Sized,
     {
-        // The two refusals that must happen before anything else: a relocked account derives no key
-        // material at all, and an over-ceiling fee is rejected before a coin is even selected. Both
-        // are checked here rather than deeper down so that neither can be reached after a push.
+        let (bundle, pending) = self.prepare_did_mint(ix, chain, network, options)?;
+        push(publisher, &bundle)?;
+        Ok(pending)
+    }
+
+    /// Build and SIGN a DID mint, without pushing it.
+    ///
+    /// Split out of [`begin_did_mint`](Self::begin_did_mint) so the profile mint can journal its
+    /// reservation of `ix` BEFORE the bundle reaches a mempool. Pushing first would leave a window
+    /// in which the user has paid for a DID that no journal entry names — the exact loss
+    /// dig_ecosystem#2377 describes.
+    pub(super) fn prepare_did_mint<C>(
+        &self,
+        ix: ProfileIx,
+        chain: &C,
+        network: &MintNetwork,
+        options: &MintOptions,
+    ) -> MintResult<(SpendBundle, PendingMint)>
+    where
+        C: ChainSource + ?Sized,
+    {
         let wallet = self.live_wallet_key(ix)?;
         options.check_fee_ceiling()?;
 
@@ -176,13 +197,7 @@ impl ProfileMinter {
         let (coin_spends, pending) = build_mint_spends(&wallet, source, options, pushed_at_height)?;
         let signature = sign_mint_spends(&wallet, &coin_spends, network)?;
 
-        match publisher
-            .push(&SpendBundle::new(coin_spends, signature))
-            .map_err(|e| MintError::ChainUnreachable(e.to_string()))?
-        {
-            PushOutcome::Accepted | PushOutcome::AlreadyInMempool => Ok(pending),
-            PushOutcome::Rejected { reason } => Err(MintError::Rejected(reason)),
-        }
+        Ok((SpendBundle::new(coin_spends, signature), pending))
     }
 
     /// Ask the chain where `pending` stands: confirmed, still waiting, or dead.
@@ -238,8 +253,27 @@ impl ProfileMinter {
     /// Derived per call from the live seed rather than stored, which is what makes the residency
     /// effective: a minter that had derived the key at construction would keep spending after the
     /// account relocked. In-crate only — the raw key never crosses the public API.
-    fn live_wallet_key(&self, ix: ProfileIx) -> MintResult<WalletKey> {
+    pub(super) fn live_wallet_key(&self, ix: ProfileIx) -> MintResult<WalletKey> {
         Ok(WalletKey::from_seed_at(&self.live_master_seed()?[..], ix))
+    }
+}
+
+/// Pushes an already-signed bundle, turning the mempool's answer into this crate's taxonomy.
+///
+/// The distinction the return type carries is load-bearing: [`MintError::Rejected`] means the
+/// network ANSWERED no, while [`MintError::ChainUnreachable`] means the outcome is UNKNOWN and the
+/// bundle may yet be included — so a caller must never treat the second as a failure to retry from
+/// scratch.
+pub(super) fn push<P>(publisher: &P, bundle: &SpendBundle) -> MintResult<()>
+where
+    P: SpendPublisher + ?Sized,
+{
+    match publisher
+        .push(bundle)
+        .map_err(|e| MintError::ChainUnreachable(e.to_string()))?
+    {
+        PushOutcome::Accepted | PushOutcome::AlreadyInMempool => Ok(()),
+        PushOutcome::Rejected { reason } => Err(MintError::Rejected(reason)),
     }
 }
 
@@ -248,7 +282,7 @@ impl ProfileMinter {
 /// A source that does not expose a peak (`Ok(None)`) is not an absence to work around: without a
 /// peak, a claimed confirmation height cannot be bounded, so the mint refuses to evaluate evidence
 /// at all rather than accept an unbounded one.
-fn peak_height<C>(chain: &C) -> MintResult<u32>
+pub(super) fn peak_height<C>(chain: &C) -> MintResult<u32>
 where
     C: ChainSource + ?Sized,
 {
@@ -270,7 +304,7 @@ where
 /// unconfirmed, already spent, or locked by a puzzle this wallet cannot unlock is not spendable, so
 /// it is not a candidate — and it is not counted toward `available` either, or
 /// [`MintError::InsufficientFunds`] would report a balance the user cannot actually spend.
-fn select_funding_coin<C>(
+pub(super) fn select_funding_coin<C>(
     chain: &C,
     puzzle_hash: Bytes32,
     options: &MintOptions,
