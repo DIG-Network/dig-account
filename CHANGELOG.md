@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-08-10
+
+### Features
+- Implement the profile mint (DID + DID-rooted dig-store + seeded SMT) (#15)
+
 ## [0.9.0] - 2026-08-09
 
 ### Chores
