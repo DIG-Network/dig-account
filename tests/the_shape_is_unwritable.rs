@@ -290,12 +290,21 @@ fn signature_windows(rest: &str) -> [&str; 2] {
 /// `build_and_sign_from(coin_spends: &[CoinSpend])` — the #1698 exploit verbatim, and invisible to a
 /// rule anchored on the name's start. So the whole name is read.
 ///
-/// The word must be exactly `sign`, not merely contain it, and that narrowness is deliberate:
-/// `required_signatures` EXTRACTS the messages a bundle needs and hands back no signature at all.
-/// Flagging it would make the guard trip on the crate's own honest code, and a guard that always
-/// trips gets weakened rather than obeyed.
+/// The word set is EXPLICIT rather than a prefix test, and both halves of that are deliberate.
+///
+/// It must include the participles. Reading whole words replaced a rule anchored on the name's
+/// START, and `sign` alone would have made `signed_spends`, `signer_for` and `signing_pass`
+/// invisible — three shapes the old prefix rule DID catch, each of them the #1698 exploit spelled as
+/// a participle. Widening the position while narrowing the word is a net loss of coverage, which is
+/// exactly the shape a "widening" hides.
+///
+/// It must NOT be a prefix test either: `required_signatures` and any `signature_*` helper EXTRACT
+/// the messages a bundle needs and hand back no signature at all. Flagging them would make the guard
+/// trip on the crate's own honest code, and a guard that always trips gets weakened rather than
+/// obeyed. `signature`/`signatures` are therefore absent from the set on purpose.
 fn is_a_signing_name(name: &str) -> bool {
-    name.split('_').any(|word| word == "sign")
+    name.split('_')
+        .any(|word| matches!(word, "sign" | "signed" | "signer" | "signing"))
 }
 
 /// The declared function name at `rest`, which begins with `fn `.
@@ -608,6 +617,56 @@ fn the_signing_door_guard_fires_on_a_sign_that_is_not_the_first_word() {
         "each of these signs over caller-supplied spends and must be caught, but the guard \
          missed: {uncaught:?}"
     );
+}
+
+/// **The PARTICIPLE forms, which reading whole words nearly lost.**
+///
+/// Moving from a `fn sign` PREFIX test to whole-word matching widened the position the word may sit
+/// in and simultaneously narrowed which words count. `signed`, `signer` and `signing` were caught by
+/// the prefix rule and would have become invisible — each one a door that takes loose caller-supplied
+/// spends and hands back a signature, i.e. #1698 verbatim, spelled as a participle.
+///
+/// This is the direction a coverage change is least likely to be re-read: the commit said "widening".
+/// So the participles get their own test rather than another row in the list above.
+#[test]
+fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
+    let participle_forms: [(&str, &str); 3] = [
+        (
+            "a past-participle door",
+            "pub fn signed_spends(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "an agent-noun door",
+            "pub fn signer_for(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a gerund door",
+            "pub fn signing_pass(coin_spends: Vec<CoinSpend>) -> chia_bls::Signature {",
+        ),
+    ];
+
+    let uncaught: Vec<&str> = participle_forms
+        .iter()
+        .filter(|(_, source)| unauthorized_signing_doors(source).len() != 1)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(
+        uncaught.is_empty(),
+        "a participle spelling is still a signing door, but the guard missed: {uncaught:?}"
+    );
+
+    // The other half of the rule: the set stops at the participles and does NOT reach `signature`.
+    // `required_signatures` is real (`src/wallet/money_signer.rs:180`) and extracts messages rather
+    // than producing a signature, so a prefix test would trip the guard on the crate's own code.
+    for honest in [
+        "pub fn required_signatures(coin_spends: &[CoinSpend]) -> Result<Vec<RequiredSignature>> {",
+        "fn signature_windows(coin_spends: &[CoinSpend]) -> Vec<Window> {",
+    ] {
+        assert!(
+            unauthorized_signing_doors(honest).is_empty(),
+            "extracting signature requirements is not signing: {honest}"
+        );
+    }
 
     // The widening must not swallow the crate's own honest neighbours. `required_signatures`
     // CONTAINS the letters `sign` and produces no signature; `assign_spends` contains them too.
