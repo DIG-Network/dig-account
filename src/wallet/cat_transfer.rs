@@ -51,8 +51,8 @@ use chia_puzzle_types::Memos;
 use chia_wallet_sdk::driver::{
     Cat, CatSpend, Puzzle, SpendContext, SpendWithConditions, StandardLayer,
 };
-use chia_wallet_sdk::types::Conditions;
 use chia_wallet_sdk::prelude::TreeHash;
+use chia_wallet_sdk::types::Conditions;
 use clvmr::serde::node_from_bytes;
 use clvmr::Allocator;
 use dig_chainsource_interface::ChainSource;
@@ -143,7 +143,9 @@ pub enum CatTransferError {
     },
 
     /// The recipient is this very wallet.
-    #[error("the recipient is this wallet's own address; a self-payment moves nothing and costs a fee")]
+    #[error(
+        "the recipient is this wallet's own address; a self-payment moves nothing and costs a fee"
+    )]
     SelfPayment,
 
     /// The amount is zero.
@@ -534,11 +536,7 @@ where
 /// spend that CREATED the coin. So each input costs one `parent_spend` read, and a parent that
 /// cannot be read, cannot be parsed as a CAT, or does not actually create this coin is a refusal —
 /// never a skip.
-fn resolve_lineage<C>(
-    chain: &C,
-    asset_id: Bytes32,
-    coins: &[Coin],
-) -> CatTransferResult<Vec<Cat>>
+fn resolve_lineage<C>(chain: &C, asset_id: Bytes32, coins: &[Coin]) -> CatTransferResult<Vec<Cat>>
 where
     C: ChainSource + ?Sized,
 {
@@ -560,10 +558,9 @@ where
             .map_err(|e| unprovable(format!("the parent solution does not decode: {e}")))?;
         let puzzle = Puzzle::parse(&allocator, puzzle_ptr);
 
-        let children =
-            Cat::parse_children(&mut allocator, parent.coin, puzzle, solution_ptr)
-                .map_err(|e| unprovable(format!("the parent spend could not be parsed: {e}")))?
-                .ok_or_else(|| unprovable("the parent coin is not a CAT".into()))?;
+        let children = Cat::parse_children(&mut allocator, parent.coin, puzzle, solution_ptr)
+            .map_err(|e| unprovable(format!("the parent spend could not be parsed: {e}")))?
+            .ok_or_else(|| unprovable("the parent coin is not a CAT".into()))?;
 
         // The child is matched BY COIN ID, never by position or by amount. The parent may create
         // several CAT children — a payment and change — and taking the wrong one would build a spend
@@ -684,9 +681,9 @@ fn build_dig_transfer_spends(
         .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
         .ok_or_else(|| CatTransferError::Build("the fee coins overflow u64".into()))?;
     if !fee_coins.is_empty() {
-        let fee_change = fee_total.checked_sub(request.fee_mojos).ok_or_else(|| {
-            CatTransferError::Build("the fee coins do not cover the fee".into())
-        })?;
+        let fee_change = fee_total
+            .checked_sub(request.fee_mojos)
+            .ok_or_else(|| CatTransferError::Build("the fee coins do not cover the fee".into()))?;
         for (index, coin) in fee_coins.iter().enumerate() {
             let mut conditions = Conditions::new().assert_coin_announcement(binding);
             // Only ONE fee coin carries the fee reserve and the change, so the two are never
@@ -716,4 +713,3 @@ fn build_dig_transfer_spends(
         change_base_units: change,
     })
 }
-

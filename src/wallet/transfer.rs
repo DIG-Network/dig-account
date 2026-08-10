@@ -2106,7 +2106,11 @@ mod tests {
             .answering_by_name_with(listing);
 
         let plan = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+            )
             .expect("both inputs agree, so the transfer must build");
 
         assert_eq!(
@@ -2137,7 +2141,11 @@ mod tests {
 
         // 1_500 needs both coins, so selection takes both and the stale one is genuinely in the plan.
         let error = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+            )
             .expect_err("a selected input the network calls spent must abandon the attempt");
 
         assert!(
@@ -2160,7 +2168,11 @@ mod tests {
             .answering_by_name_with(vec![confirmed(honest)]);
 
         let error = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+            )
             .expect_err("an input the by-name read denies must abandon the attempt");
 
         assert!(
@@ -2185,7 +2197,11 @@ mod tests {
             .answering_by_name_with(vec![spent(only)]);
 
         let error = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+            )
             .expect_err("the single-coin path must confirm its coin by name as well");
 
         assert!(
@@ -2213,7 +2229,11 @@ mod tests {
             .answering_by_name_with(doubled);
 
         let error = ops
-            .build_transfer(&chain, &hot(), &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500))
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+            )
             .expect_err("one 1000-mojo coin cannot fund 1500, however many times it is listed");
 
         assert!(

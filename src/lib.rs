@@ -62,7 +62,9 @@ pub use auth::factors::AuthFactors;
 pub use auth::policy::{AllOf, AuthPolicy, PasswordOnlyPolicy, UnlockError, UnlockGate};
 pub use auth::provider::{AuthProvider, SpendConfirmRequest, SpendDecision, UnlockRequest};
 pub use auth::second_factor::SecondFactor;
-pub use chain_confirm::{confirm_all_spendable_by_name, confirm_spendable_by_name, UnconfirmedInput};
+pub use chain_confirm::{
+    confirm_all_spendable_by_name, confirm_spendable_by_name, UnconfirmedInput,
+};
 pub use constants::MAINNET_ADDRESS_PREFIX;
 pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};

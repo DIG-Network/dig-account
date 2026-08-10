@@ -117,7 +117,11 @@ fn one_dig_is_a_thousand_base_units_and_not_a_trillion() {
 #[test]
 fn amounts_convert_to_whole_dig_and_thousandths() {
     assert_eq!(amount_in_dig(0), (0, 0));
-    assert_eq!(amount_in_dig(1), (0, 1), "one base unit is a thousandth of a $DIG");
+    assert_eq!(
+        amount_in_dig(1),
+        (0, 1),
+        "one base unit is a thousandth of a $DIG"
+    );
     assert_eq!(amount_in_dig(999), (0, 999));
     assert_eq!(amount_in_dig(1_000), (1, 0));
     assert_eq!(amount_in_dig(1_500), (1, 500));

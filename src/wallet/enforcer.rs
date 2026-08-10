@@ -12,7 +12,7 @@
 //! | A [`Confirm`](SpendTier::Confirm)-tier spend | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
 //! | Auto-send globally off, or off for this op class | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
 //! | No op class declared | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) — ask the human |
-//! | Value in units no mojo limit can bound | [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) |
+//! | Value in units no mojo limit can bound | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) — such a spend is [`Confirm`](SpendTier::Confirm)-tier by rule ([`moves_non_native_assets`](SpendSummary::moves_non_native_assets)), so it escalates rather than dead-ending |
 //! | Over the per-transaction limit, or over the rolling period cap | [`RequiresConfirmation`](SpendRuling::RequiresConfirmation) |
 //! | Within the op class, the per-transaction limit, AND the rolling cap | [`Approved`](SpendRuling::Approved) |
 //!
@@ -305,7 +305,20 @@ impl PolicyAuthorizer {
         }
     }
 
-    /// Refuse any spend whose value is denominated in units the configured limits cannot bound.
+    /// The unreachable backstop against a spend whose value is denominated in units the configured
+    /// limits cannot bound.
+    ///
+    /// # Why this is a backstop and not the rule
+    ///
+    /// [`SpendSummary::moves_non_native_assets`] now classifies such a spend
+    /// [`Confirm`](SpendTier::Confirm) BEFORE the tier is dispatched, so it escalates to the human
+    /// and never enters `rule_on_auto_send` at all. That is what makes $DIG sendable: a
+    /// `PolicyIndeterminate` here is a hard error with no route onward, and reaching it would leave
+    /// the token the product is denominated in structurally unspendable.
+    ///
+    /// This guard is kept because it fails CLOSED. If a future change let a non-native spend arrive
+    /// at the auto-send tier anyway, the wrong outcome is a dead end the user reports, not a silent
+    /// auto-approval of an amount no limit ever weighed.
     ///
     /// The auto-send limits are mojo amounts, and
     /// [`native_total_mojos`](SpendSummary::native_total_mojos) counts only native XCH. A CAT output

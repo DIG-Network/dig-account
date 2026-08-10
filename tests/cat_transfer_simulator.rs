@@ -25,10 +25,11 @@ use chia_protocol::{Bytes32, Coin, SpendBundle};
 use chia_wallet_sdk::driver::{Cat, SpendContext, StandardLayer};
 use chia_wallet_sdk::types::Conditions;
 use dig_account::{
-    cat_curried_puzzle_hash, AccountId, AuthFactors, AuthProvider, SpendConfirmRequest,
-    SpendDecision, SpendPublisher, UnlockRequest, MIN_CONFIRMATION_DEPTH, AutoSendPolicy, CatTransferError, CatTransferPlan, CatTransferRequest,
-    CustodyPolicy, FixedClock, HotWallet, MoneySigner, OpClassLimits, PayableDestination,
-    PolicyAuthorizer, ProfileIx, SpendOpClass, SpendRuling, SpendTier, UnlockedAccount, WalletOps,
+    cat_curried_puzzle_hash, AccountId, AuthFactors, AuthProvider, AutoSendPolicy,
+    CatTransferError, CatTransferPlan, CatTransferRequest, CustodyPolicy, FixedClock, HotWallet,
+    MoneySigner, OpClassLimits, PayableDestination, PolicyAuthorizer, ProfileIx,
+    SpendConfirmRequest, SpendDecision, SpendOpClass, SpendPublisher, SpendRuling, SpendTier,
+    UnlockRequest, UnlockedAccount, WalletOps, MIN_CONFIRMATION_DEPTH,
 };
 use dig_wallet_backend::types::Network;
 
@@ -108,13 +109,8 @@ fn issue_cat_coins_to_wallet(
     for each in amounts {
         payouts = payouts.create_coin(p2, *each, hint);
     }
-    let (issue_conditions, children) = Cat::single_issuance(
-        &mut ctx,
-        issuer.coin.coin_id(),
-        None,
-        amount,
-        payouts,
-    )?;
+    let (issue_conditions, children) =
+        Cat::single_issuance(&mut ctx, issuer.coin.coin_id(), None, amount, payouts)?;
     StandardLayer::new(issuer.pk).spend(&mut ctx, issuer.coin, issue_conditions)?;
 
     chain
@@ -154,15 +150,17 @@ fn sign_via_gate(account: &UnlockedAccount, spends: &[chia_protocol::CoinSpend])
         Ok(SpendRuling::Approved(approval)) => approval,
         // A CAT spend always lands here: no mojo-denominated limit can bound its amount, so the gate
         // escalates it to the human, and `AlwaysApproves` stands in for that human.
-        Ok(SpendRuling::RequiresConfirmation(pending)) => tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("a current-thread runtime")
-            .block_on(pending.confirm_with(
-                &AlwaysApproves,
-                AccountId::new("cat-transfer-simulator"),
-                ProfileIx::ROOT,
-            ))
-            .expect("an approving ceremony yields a signable approval"),
+        Ok(SpendRuling::RequiresConfirmation(pending)) => {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a current-thread runtime")
+                .block_on(pending.confirm_with(
+                    &AlwaysApproves,
+                    AccountId::new("cat-transfer-simulator"),
+                    ProfileIx::ROOT,
+                ))
+                .expect("an approving ceremony yields a signable approval")
+        }
         Err(e) => panic!("the gate refused a legitimate spend: {e}"),
     };
     ops.money_signer(Network::Testnet)
