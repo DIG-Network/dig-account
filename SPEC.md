@@ -193,11 +193,23 @@ journalled as a `ProfileMintInProgress`, which is NOT a profile and MUST NOT be 
   seed or abandon a DID that is already paid for. It is `Option` because the field is ADDITIVE: an
   entry written before it existed is a DID-only mint, and phase B MUST refuse such an entry by name
   rather than substituting a default.
+- `seed_root`'s compatibility is ONE-DIRECTIONAL, and MUST NOT be described as simply "additive". Old
+  file → new code works: a missing `seed_root` reads as `None`. New file → OLD code does NOT: the
+  registry is `#[serde(deny_unknown_fields)]` and `seed_root` serializes as an explicit `null` even
+  when absent, so 0.9.0 fails the WHOLE registry load rather than the one entry — taking the
+  confirmed-profile list down with it. That is fail-closed and acceptable (a downgrade must not
+  silently drop a journalled mint whose DID is already paid for), but it means a downgrade is a
+  restore-from-backup, not a shrug.
 - Each half MUST be journalled at its pushed stage BEFORE its bundle is broadcast. A lost answer then
   leaves a stage that re-reads chain, never one that re-spends.
 - A DEFINITIVE rejection of the DID bundle (the network answered "no") MUST release the reserved
   index; an UNREACHABLE chain MUST NOT, because the outcome is unknown and the bundle may yet be
   included.
+- A DEFINITIVE rejection of the STORE bundle MUST rewind the stage to `DidConfirmedStoreNotLaunched`
+  so the next advance rebuilds and retries the launch. It MUST NOT release the index: unlike a
+  rejected DID mint, an identity exists on chain and is paid for. An UNREACHABLE chain MUST NOT
+  rewind — the launch may yet be included, and rebuilding would broadcast a second one.
+- `StorePending` MUST NOT be reported for a bundle the network has refused.
 
 #### 2.4.4 Profile-store discovery: lineage, NOT launcher memos
 
@@ -1185,6 +1197,17 @@ gate is used. It MUST refuse unless:
    no foreign key, no secp requirement); and
 2. exactly two pre-existing coins are spent — this profile's DID coin, identified BY COIN ID, and a
    coin at this wallet's own puzzle hash — with every other spent coin created by the same bundle.
+
+The coin id in (2) MUST be the id this mint RECORDED for the DID — journalled evidence computed from
+the bundle this crate built — and MUST NOT be derived from the `Did` value being spent. Derived from
+the spend, the rule compares the coin to itself and proves only that some singleton was spent.
+
+Accordingly, before building the launch the resume path MUST refuse when the tip returned by
+`dig_did::walk_did_lineage_to_tip` is not that recorded coin. The walk proves only that the coins a
+source returned are internally consistent — a matching launcher id is explicitly INSUFFICIENT — so
+without this check a hostile source could substitute a stranger's lineage, and an honest source could
+hand back a later tip after the singleton was spent. Both end at a store whose evidence can never
+match the DID half, over a DID already paid for.
 
 ### 6B.5 Custody boundary
 

@@ -170,6 +170,20 @@ impl SimulatorChain {
         self.push_undeliverable = true;
     }
 
+    /// Start answering every push with a definitive REJECTION.
+    ///
+    /// Distinct from [`rejecting`](Self::rejecting), which refuses from the first push onward and so
+    /// can only ever exercise phase A: a ceremony's SECOND bundle can only be refused by a node that
+    /// accepted the first. That gap is why a rejected store launch went unobserved.
+    pub fn start_rejecting(&mut self, reason: &str) {
+        self.reject_with = Some(reason.to_string());
+    }
+
+    /// Accept pushes again — the operator restarted the node, or the mempool made room.
+    pub fn stop_rejecting(&mut self) {
+        self.reject_with = None;
+    }
+
     /// Resume delivering pushes.
     pub fn resume_delivering_pushes(&mut self) {
         self.push_undeliverable = false;

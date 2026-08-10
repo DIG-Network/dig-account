@@ -91,6 +91,16 @@ fn store_metadata(did_string: &str) -> (Option<String>, Option<String>) {
 /// read from a file), and `funding` is a pre-existing coin of this wallet paying the launcher's mojo
 /// and the fee.
 ///
+/// # `did_coin_id` is the ANCHOR, and it does not come from `did`
+///
+/// The caller passes the coin id this mint RECORDED for the profile's DID — a value this crate
+/// computed from the bundle it built itself, held in the journal, and never learned from a chain
+/// source. Deriving it here from `did` instead would make [`gate_store_launch`]'s rule 3 circular:
+/// it would compare the tip to itself and prove only that *some* singleton was spent. The first
+/// thing this function does is refuse a `did` whose coin is not that anchor, so every later use of
+/// the id — the intermediate launcher's parent, the gate, the pending evidence — is the same coin
+/// the mint is FOR.
+///
 /// # Building and signing are ONE step on purpose
 ///
 /// There is deliberately no `sign(coin_spends)` seam here. A helper that turned loose coin spends
@@ -105,6 +115,7 @@ fn store_metadata(did_string: &str) -> (Option<String>, Option<String>) {
 pub(super) fn build_and_sign_store_launch(
     wallet: &WalletKey,
     did: Did,
+    did_coin_id: Bytes32,
     funding: Coin,
     seed_root: [u8; 32],
     did_string: &str,
@@ -112,9 +123,17 @@ pub(super) fn build_and_sign_store_launch(
     pushed_at_height: u32,
     network: &MintNetwork,
 ) -> MintResult<StoreLaunchBundle> {
+    if did.coin.coin_id() != did_coin_id {
+        return Err(MintError::Refused(format!(
+            "the DID coin to spend is {}, but this mint recorded {}; a launch is built only \
+             against the coin the mint itself named",
+            did.coin.coin_id(),
+            did_coin_id
+        )));
+    }
+
     let mut ctx = SpendContext::new();
     let owner_puzzle_hash = wallet.puzzle_hash();
-    let did_coin_id = did.coin.coin_id();
 
     // Step 1: the even-amount intermediate. Its coin id is fixed by the DID coin that creates it, so
     // the launcher can be built against it inside this same bundle.
@@ -265,9 +284,16 @@ fn spend_funding_coin(
 ///    blank cheque reusable against any coin, and a requirement under another key asks this account
 ///    to authorize a stranger's spend.
 /// 2. **Exactly two pre-existing coins are spent: THIS profile's DID coin, and a coin at this
-///    wallet's own puzzle hash.** Every other spent coin must be created by this same bundle. The
-///    DID coin is identified by id — not by shape — so a bundle that swapped in a different
-///    singleton could not be signed even though it would look identical structurally.
+///    wallet's own puzzle hash.** Every other spent coin must be created by this same bundle.
+///
+/// # The rule is only as strong as where `did_coin_id` came from
+///
+/// Identifying the DID by id rather than by shape is what refuses a structurally identical bundle
+/// carrying a stranger's singleton — but ONLY because the id is supplied by
+/// [`build_and_sign_store_launch`]'s caller from this mint's own journalled evidence. An earlier
+/// version derived it from the `Did` being spent, which made this rule circular: it compared the
+/// spent coin to itself and would have passed a lineage a hostile chain source chose. The refusal at
+/// the top of [`build_and_sign_store_launch`] is what keeps the two from silently converging again.
 fn gate_store_launch(
     wallet: &WalletKey,
     coin_spends: &[CoinSpend],
@@ -428,6 +454,7 @@ mod gate_tests {
         let launch = build_and_sign_store_launch(
             &wallet,
             did,
+            did_coin_id,
             funding,
             [0x6d; 32],
             "did:chia:1test",
@@ -526,6 +553,11 @@ mod gate_tests {
     /// A bundle that does not spend THIS profile's DID coin is refused. The DID is identified by
     /// COIN ID rather than by shape, so a structurally identical bundle carrying a different
     /// singleton cannot be signed.
+    ///
+    /// The id is passed in — here a value belonging to no coin at all — which is the only reason
+    /// this proves anything. Derived from the `Did` being spent, the rule would compare the coin to
+    /// itself; `a_did_that_is_not_the_recorded_coin_is_refused_before_building` is what keeps the
+    /// two from converging.
     #[test]
     fn a_bundle_that_spends_a_different_singleton_is_refused() {
         let (wallet, coin_spends, _) = honest_launch();
@@ -540,6 +572,52 @@ mod gate_tests {
         assert!(error
             .to_string()
             .contains("does not spend this profile's DID coin"));
+    }
+
+    /// **The anchor and the coin being spent must agree, or nothing is built at all.**
+    ///
+    /// This is what stops [`gate_store_launch`]'s rule 3 quietly becoming circular again: the gate
+    /// can only be as strong as the id it is handed, so the id is checked against the `Did` before a
+    /// single spend is staged. The fixture is the real DID this module mints, with ONE thing varied
+    /// — the recorded id — so the refusal cannot come from a malformed bundle.
+    #[test]
+    fn a_did_that_is_not_the_recorded_coin_is_refused_before_building() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1_000_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let ctx = &mut SpendContext::new();
+        let (create_did, did) = Launcher::new(alice.coin.coin_id(), 1)
+            .create_simple_did(ctx, &alice_p2)
+            .expect("the simulator mints a DID");
+        alice_p2
+            .spend(ctx, alice.coin, create_did)
+            .expect("alice funds the DID");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .expect("the DID mint validates");
+
+        let funding = Coin::new(Bytes32::new([7; 32]), wallet.puzzle_hash(), 1_000_000);
+        // Matched rather than `expect_err`: a signed bundle is not a value this crate derives
+        // `Debug` for, and it must not acquire one merely to make a test read nicely.
+        let Err(error) = build_and_sign_store_launch(
+            &wallet,
+            did,
+            Bytes32::new([0xEE; 32]),
+            funding,
+            [0x6d; 32],
+            "did:chia:1test",
+            0,
+            1,
+            &network(),
+        ) else {
+            panic!("the DID coin must be the one the mint recorded, and nothing may be signed");
+        };
+
+        assert!(matches!(error, MintError::Refused(_)), "{error:?}");
+        assert!(error.to_string().contains("this mint recorded"));
+        // The honest control lives in `the_launchs_own_bundle_passes_the_gate`, which builds the
+        // same fixture with the matching anchor and reaches a signed bundle.
     }
 
     /// A launch spends exactly TWO pre-existing coins. A bundle reaching outside its own lineage for

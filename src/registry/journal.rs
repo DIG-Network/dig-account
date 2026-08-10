@@ -232,9 +232,17 @@ pub struct ProfileMintInProgress {
     /// would either have to invent a seed — committing the store to bytes the user never chose — or
     /// abandon a DID that is already paid for.
     ///
-    /// `Option` because it is ADDITIVE: a registry written by 0.9.0 could journal a DID-only mint
-    /// (via `begin_did_mint`), which is not a profile mint and carries no seed. Phase B refuses such
-    /// an entry by name rather than substituting a default.
+    /// `Option` because an entry may legitimately have no seed: a registry written by 0.9.0 could
+    /// journal a DID-only mint (via `begin_did_mint`), which is not a profile mint. Phase B refuses
+    /// such an entry by name rather than substituting a default.
+    ///
+    /// **Compatibility is ONE-DIRECTIONAL, not simply "additive".** Old file → new code works, via
+    /// the `#[serde(default)]` below. New file → 0.9.0 does NOT: there is no `skip_serializing_if`,
+    /// so an absent root still serializes as an explicit `null`, and this struct is
+    /// `deny_unknown_fields` — so 0.9.0 fails the WHOLE registry load, confirmed profiles included,
+    /// rather than the one entry. That is the right direction to fail (a downgrade must not silently
+    /// drop a journalled mint whose DID is already paid for), but a downgrade is a
+    /// restore-from-backup rather than a shrug. See `SPEC.md` §2.4.3.
     #[serde(default)]
     seed_root: Option<[u8; 32]>,
     /// The fee, in mojos, disclosed for the STORE-LAUNCH bundle.
@@ -507,8 +515,10 @@ mod tests {
         );
     }
 
-    /// A registry written before the seed root existed still loads, with no seed. The field is
-    /// ADDITIVE, and an old file is not an invalid one.
+    /// A registry written before the seed root existed still loads, with no seed.
+    ///
+    /// This pins the OLD-file → new-code direction only, which is the one that is additive. The
+    /// reverse does not hold and is not a gap in this test: see the field's own docs.
     #[test]
     fn a_pre_seed_root_journal_entry_still_loads() {
         let legacy = r#"{"ix":1,"stage":{"DidPushed":{"pending":{"launcher_id":"0x0101010101010101010101010101010101010101010101010101010101010101","did_coin_id":"0x0202020202020202020202020202020202020202020202020202020202020202","source_coin_id":"0x0303030303030303030303030303030303030303030303030303030303030303","pushed_at_height":100}}},"store_fee":5}"#;

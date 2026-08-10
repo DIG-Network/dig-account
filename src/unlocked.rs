@@ -252,6 +252,73 @@ mod tests {
         assert_ne!(acct.dek(ProfileIx::ROOT), acct.dek(ProfileIx(1)));
     }
 
+    /// **`wallet_ops_at(ix)` derives at `ix`, and NOT at the default profile.**
+    ///
+    /// Written to fail against one specific wrong implementation: a body that ignores its argument
+    /// and uses `self.default_profile_ix`. That mutant passed the entire 416-test suite, because
+    /// every other fixture in this crate enrols at [`ProfileIx::ROOT`] and mints there — so no test
+    /// had a second index to be wrong about. With the profile mint shipping, the mutant is a money
+    /// bug: a host that switched the active profile would sign spends from the wrong wallet.
+    ///
+    /// The default index is deliberately NOT `ROOT` here either, so an implementation that ignored
+    /// both arguments and hardcoded `ROOT` is equally visible.
+    #[test]
+    fn wallet_ops_at_derives_at_the_requested_index_not_the_default() {
+        const DEFAULT: ProfileIx = ProfileIx(2);
+        const OTHER: ProfileIx = ProfileIx(7);
+
+        let acct = unlocked(DEFAULT);
+        let expected =
+            crate::keys::wallet_key::WalletKey::from_seed_at(&acct.master_seed()[..], OTHER);
+
+        assert_eq!(
+            acct.wallet_ops_at(OTHER).puzzle_hash(),
+            expected.puzzle_hash(),
+            "the handle must derive at the index it was asked for"
+        );
+        assert_eq!(
+            acct.wallet_ops_at(OTHER).public_key(),
+            expected.public_key()
+        );
+
+        // The control that kills the ignore-the-argument mutant: the two indices must land on
+        // DIFFERENT coins. Without it, an implementation returning the default's handle for every
+        // index would satisfy the equalities above on any fixture whose default happened to be OTHER.
+        assert_ne!(
+            acct.wallet_ops_at(OTHER).puzzle_hash(),
+            acct.wallet_ops().puzzle_hash(),
+            "a profile's money lives at its OWN index; these must not collapse together"
+        );
+
+        // And the default still routes to the default, so the fix is a redirection rather than a
+        // break: `wallet_ops()` is defined as `wallet_ops_at(default)`.
+        assert_eq!(
+            acct.wallet_ops_at(DEFAULT).puzzle_hash(),
+            acct.wallet_ops().puzzle_hash()
+        );
+    }
+
+    /// Every profile index lands on its own address — the user-visible form of the property above.
+    #[test]
+    fn each_profile_has_its_own_receive_address() {
+        let acct = unlocked(ProfileIx::ROOT);
+        let addresses: Vec<String> = [ProfileIx::ROOT, ProfileIx(1), ProfileIx(2)]
+            .into_iter()
+            .map(|ix| acct.wallet_ops_at(ix).address().expect("derives"))
+            .collect();
+
+        assert!(
+            addresses.iter().all(|a| a.starts_with("xch1")),
+            "{addresses:?}"
+        );
+        let unique: std::collections::HashSet<&String> = addresses.iter().collect();
+        assert_eq!(
+            unique.len(),
+            addresses.len(),
+            "three profiles must have three receive addresses, not one repeated: {addresses:?}"
+        );
+    }
+
     #[test]
     fn wallet_ops_derives_the_default_profile_key() {
         let acct = unlocked(ProfileIx(2));

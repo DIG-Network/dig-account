@@ -17,11 +17,14 @@
 //! [`the_bundle_carries_exactly_the_signatures_it_requires`] pins the signature set explicitly
 //! rather than leaning on "it validated".
 
-use chia_protocol::Bytes32;
+use std::cell::Cell;
+
+use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use dig_account::{
-    MintNetwork, MintOptions, MintStage, ProfileIx, ProfileMintStatus, ProfileRegistry,
-    ProfileSeed, UnlockedAccount,
+    ChainUnavailable, MintError, MintNetwork, MintOptions, MintStage, ProfileIx, ProfileMintStatus,
+    ProfileRegistry, ProfileSeed, PushOutcome, SpendPublisher, UnlockedAccount,
 };
+use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 
 mod common;
 
@@ -512,6 +515,320 @@ fn an_unanswered_did_push_keeps_the_mint_journalled() -> anyhow::Result<()> {
         "the outcome is UNKNOWN, so the index stays reserved and the mint stays resumable"
     );
     assert_eq!(registry.in_progress()[0].ix(), ProfileIx::ROOT);
+    Ok(())
+}
+
+/// A chain source that answers the singleton walk with SOMEONE ELSE'S lineage.
+///
+/// Every other read is delegated untouched, so exactly one thing varies: which tip
+/// `resolve_singleton_lineage` reports for the profile's launcher id.
+///
+/// The substituted tip is a REAL DID minted on the same simulator, and that is the whole design of
+/// this double. A fabricated coin id would be refused by `dig_did::walk_did_lineage_to_tip` itself —
+/// the parent spend would not parse — and the test would then be measuring dig-did's parser while
+/// appearing to measure the mint's binding. Only a genuine, spendable, WRONG singleton can tell the
+/// two apart, which is the case an attacker with a hostile source actually has.
+struct SubstitutedLineage<'a> {
+    inner: &'a SimulatorChain,
+    /// The tip to answer with, when armed. `None` delegates — the honest control.
+    substitute_tip: Cell<Option<Bytes32>>,
+}
+
+impl<'a> SubstitutedLineage<'a> {
+    fn honest(inner: &'a SimulatorChain) -> Self {
+        Self {
+            inner,
+            substitute_tip: Cell::new(None),
+        }
+    }
+
+    fn answer_with(&self, tip: Bytes32) {
+        self.substitute_tip.set(Some(tip));
+    }
+
+    fn tell_the_truth_again(&self) {
+        self.substitute_tip.set(None);
+    }
+}
+
+impl ChainSource for SubstitutedLineage<'_> {
+    type Error = String;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        match self.substitute_tip.get() {
+            Some(tip) => Ok(Some(SingletonLineage::new(tip, vec![launcher_id, tip]))),
+            None => self.inner.resolve_singleton_lineage(launcher_id),
+        }
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.inner.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_timestamp(height)
+    }
+}
+
+impl SpendPublisher for SubstitutedLineage<'_> {
+    fn push(&self, bundle: &SpendBundle) -> Result<PushOutcome, ChainUnavailable> {
+        self.inner.push(bundle)
+    }
+}
+
+/// Mint a SECOND, unrelated DID on `chain` and return the coin id of its tip.
+///
+/// It stands in for the identity a hostile source would substitute: genuine, spendable, and not this
+/// profile's.
+fn a_second_real_did(account: &UnlockedAccount, chain: &SimulatorChain) -> anyhow::Result<Bytes32> {
+    const STRANGER: ProfileIx = ProfileIx(1);
+
+    chain.fund(account.wallet_ops_at(STRANGER).puzzle_hash(), FUNDING);
+    let pending = account.profile_minter().begin_did_mint(
+        STRANGER,
+        chain,
+        chain,
+        &simulator_network(),
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+
+    let tip = dig_did::walk_did_lineage_to_tip(chain, pending.launcher_id())
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .expect("the second DID resolves to a tip");
+    Ok(tip.coin.coin_id())
+}
+
+/// **A lineage that resolves to a DIFFERENT singleton is refused before anything is signed.**
+///
+/// `walk_did_lineage_to_tip` proves only that the coins a source returned are internally consistent
+/// — dig-did's own docs say a matching launcher id is INSUFFICIENT — so the tip it yields is
+/// source-chosen data until something pins it. The mint pins it to the coin id it recorded itself.
+///
+/// Without that, the launch's own gate could not see the swap: it identifies the DID coin by an id
+/// derived from the very `Did` being spent, so it would compare the substituted tip to itself and
+/// pass. The user's XCH would launch their profile store from a stranger's identity, and the store
+/// half's evidence could then never match the DID half — a permanent dead end over an already-paid-
+/// for DID (dig_ecosystem#2377).
+///
+/// The refusal and the honest control run against the SAME fixture and the same double, so the
+/// refusal cannot be passing because the launch broke wholesale.
+#[test]
+fn a_lineage_answering_with_a_different_singleton_is_refused() -> anyhow::Result<()> {
+    let (account, chain, mut registry) = ready_to_mint();
+    let minter = account.profile_minter();
+    let network = simulator_network();
+
+    minter.begin_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &seeded_profile(),
+        &chain,
+        &chain,
+        &network,
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+
+    let stranger_tip = a_second_real_did(&account, &chain)?;
+    let ProfileMintStatus::DidConfirmedStoreNotLaunched(did) =
+        minter.profile_mint_status(&registry, ProfileIx::ROOT, &chain)?
+    else {
+        panic!("a farmed DID with no store launch is the resumable state");
+    };
+    assert_ne!(
+        stranger_tip,
+        did.coin_id(),
+        "the substituted tip must be a DIFFERENT coin, or this fixture asserts nothing"
+    );
+
+    let hostile = SubstitutedLineage::honest(&chain);
+    hostile.answer_with(stranger_tip);
+    let attempts_before = chain.push_attempts();
+
+    let error = minter
+        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &hostile, &hostile, &network)
+        .expect_err("a tip that is not this mint's DID coin must be refused");
+
+    assert!(
+        matches!(error, MintError::Refused(_)),
+        "the refusal is the mint's own, not a chain-read failure: {error:?}"
+    );
+    let message = error.to_string();
+    for named in [stranger_tip.to_string(), did.coin_id().to_string()] {
+        assert!(
+            message.contains(&named),
+            "the refusal must name both the tip it was offered and the coin it recorded: {message}"
+        );
+    }
+    assert_eq!(
+        chain.push_attempts(),
+        attempts_before,
+        "nothing was signed and nothing was broadcast"
+    );
+
+    // THE HONEST CONTROL: the identical double, telling the truth, still launches the store. Without
+    // it the refusal above would also be satisfied by a launch path that had simply stopped working.
+    hostile.tell_the_truth_again();
+    let status = minter.advance_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &hostile,
+        &hostile,
+        &network,
+    )?;
+    assert!(
+        matches!(status, ProfileMintStatus::StorePending { .. }),
+        "the honest tip launches the store, got {status:?}"
+    );
+    chain.farm()?;
+    let ProfileMintStatus::Confirmed { store, .. } = minter.advance_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &hostile,
+        &hostile,
+        &network,
+    )?
+    else {
+        panic!("the honestly-resolved launch confirms the profile");
+    };
+    assert_eq!(
+        store.did_coin_id(),
+        did.coin_id(),
+        "the store that DID launch is bound to this profile's own DID coin"
+    );
+    Ok(())
+}
+
+/// **A REJECTED store launch rewinds to "not launched", and the next advance retries it.**
+///
+/// The store half is journalled as `StorePushed` before it is broadcast, which is right for a LOST
+/// answer and wrong for a refused one: a rejected bundle sits in no mempool, so the stage names a
+/// launch nothing is carrying. Left there, every later advance reports `StorePending` and pushes
+/// nothing — forever — over a DID the user has already paid for.
+///
+/// The fixture varies ONE actor: the node accepts the DID bundle and then refuses the store bundle.
+/// That ordering is the point — `SimulatorChain::rejecting` refuses from the first push onward and
+/// so can only ever reach phase A, which is why this was invisible.
+#[test]
+fn a_rejected_store_launch_rewinds_and_is_retried() -> anyhow::Result<()> {
+    let (account, mut chain, mut registry) = ready_to_mint();
+    let minter = account.profile_minter();
+    let network = simulator_network();
+
+    minter.begin_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &seeded_profile(),
+        &chain,
+        &chain,
+        &network,
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+
+    chain.start_rejecting("MEMPOOL_CONFLICT");
+    let error = minter
+        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)
+        .expect_err("a refused launch is not a success");
+    assert!(matches!(error, MintError::Rejected(_)), "got {error:?}");
+
+    assert!(
+        matches!(
+            registry.in_progress()[0].stage(),
+            MintStage::DidConfirmedStoreNotLaunched { .. }
+        ),
+        "a refused bundle is in no mempool, so the mint stands where it stood before the push; \
+         stage is {:?}",
+        registry.in_progress()[0].stage()
+    );
+    assert!(
+        !matches!(
+            minter.profile_mint_status(&registry, ProfileIx::ROOT, &chain)?,
+            ProfileMintStatus::StorePending { .. }
+        ),
+        "and the status must not report a launch as in flight when the network refused it"
+    );
+
+    // The node recovers. The retry is what the rewind exists for: without it this advance would read
+    // `StorePushed`, report `StorePending`, and push nothing for the rest of the mint's life.
+    chain.stop_rejecting();
+    minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    chain.farm()?;
+    let status =
+        minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    assert!(
+        matches!(status, ProfileMintStatus::Confirmed { .. }),
+        "the retried launch confirms the profile, got {status:?}"
+    );
+    Ok(())
+}
+
+/// **THE CONTROL for the rewind above: an UNKNOWN outcome does NOT rewind.**
+///
+/// A node that never answered may still have broadcast the launch, so rewinding there would let the
+/// next advance build and push a SECOND one — spending the funding coin twice and orphaning the
+/// first launcher. The asymmetry is the whole point, and a rewind-on-every-error implementation
+/// satisfies the test above while failing this one.
+#[test]
+fn an_unanswered_store_launch_does_not_rewind() -> anyhow::Result<()> {
+    let (account, mut chain, mut registry) = ready_to_mint();
+    let minter = account.profile_minter();
+    let network = simulator_network();
+
+    minter.begin_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &seeded_profile(),
+        &chain,
+        &chain,
+        &network,
+        &MintOptions::default(),
+    )?;
+    chain.farm()?;
+
+    chain.stop_delivering_pushes();
+    let error = minter
+        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)
+        .expect_err("an undeliverable push reports an UNKNOWN outcome");
+    assert!(
+        matches!(error, MintError::ChainUnreachable(_)),
+        "got {error:?}"
+    );
+
+    assert!(
+        matches!(
+            registry.in_progress()[0].stage(),
+            MintStage::StorePushed { .. }
+        ),
+        "the outcome is unknown, so the launch stays journalled as pushed and is never rebuilt; \
+         stage is {:?}",
+        registry.in_progress()[0].stage()
+    );
     Ok(())
 }
 

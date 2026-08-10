@@ -76,7 +76,12 @@ pub enum ProfileMintStatus {
     /// the identity the user already owns (dig_ecosystem#2377).
     DidConfirmedStoreNotLaunched(MintedDid),
 
-    /// The store bundle is in flight against a confirmed DID.
+    /// The store bundle has been broadcast against a confirmed DID and no block carries it yet.
+    ///
+    /// "Broadcast", not "in flight": a node's acceptance is one node's opinion, and this is also the
+    /// state after a push whose answer never arrived. It is NOT the state after a REJECTED push —
+    /// that rewinds to [`DidConfirmedStoreNotLaunched`](Self::DidConfirmedStoreNotLaunched), so this
+    /// variant never names a bundle the network has refused.
     StorePending {
         /// The DID that already exists.
         did: MintedDid,
@@ -87,9 +92,10 @@ pub enum ProfileMintStatus {
     /// Both halves are confirmed on chain.
     ///
     /// The host completes the mint by passing both to
-    /// [`ProfileRegistry::record_minted`](crate::ProfileRegistry::record_minted), which is the ONLY
-    /// public producer of a [`ConfirmedStore`] — the mint's output, never a value a host can
-    /// fabricate.
+    /// [`ProfileRegistry::record_minted`](crate::ProfileRegistry::record_minted), which CONSUMES a
+    /// [`ConfirmedStore`]. There is no public producer of one at all: this variant is the only place
+    /// a host can obtain store evidence, and it is reached only from a chain read. A host cannot
+    /// fabricate the value, and cannot record a profile without it.
     Confirmed {
         /// The DID half.
         did: MintedDid,
@@ -273,8 +279,10 @@ impl ProfileMinter {
 
     /// Build, journal, sign and push the store half against an ALREADY CONFIRMED DID.
     ///
-    /// The DID is re-derived from chain by walking its singleton lineage to the tip — never read
-    /// from the journal, which holds no puzzle material and could not vouch for it if it did.
+    /// The DID's PUZZLE MATERIAL is re-derived from chain by walking its singleton lineage to the
+    /// tip — never read from the journal, which holds none and could not vouch for it if it did.
+    /// Its IDENTITY is the opposite: the tip must be the exact coin id this mint recorded, or the
+    /// launch is refused. Chain answers what the coin looks like; the journal decides which coin.
     fn launch_store<C, P>(
         &self,
         registry: &mut ProfileRegistry,
@@ -311,6 +319,24 @@ impl ProfileMinter {
                 )
             })?;
 
+        // The walk verifies that the coins the SOURCE returned are internally consistent; it does
+        // not verify that they are THIS profile's. So the tip is pinned to the coin id this mint
+        // recorded — a value computed from the bundle this crate built, never learned from a chain
+        // source. Without this, a source that answered with someone else's DID would have its
+        // lineage silently adopted, and the launch's own gate would compare that lineage to itself.
+        //
+        // It also catches the honest case with no attacker at all: a DID singleton spent between
+        // confirmation and this call has a different tip coin, and launching from it would produce
+        // a store whose evidence can never match the DID half (dig_ecosystem#2377).
+        if tip.coin.coin_id() != did.coin_id() {
+            return Err(MintError::Refused(format!(
+                "the chain resolves this DID's lineage to tip coin {}, but this mint recorded its \
+                 DID coin as {}; the store is launched only from the coin the mint itself named",
+                tip.coin.coin_id(),
+                did.coin_id()
+            )));
+        }
+
         let funding =
             select_funding_coin(chain, wallet.puzzle_hash(), &MintOptions::with_fee(fee))?;
         let pushed_at_height = peak_height(chain)?;
@@ -318,6 +344,7 @@ impl ProfileMinter {
         let launch = build_and_sign_store_launch(
             &wallet,
             tip.did(),
+            did.coin_id(),
             funding,
             seed_root,
             did.did(),
@@ -338,12 +365,51 @@ impl ProfileMinter {
             )
             .map_err(|e| MintError::Journal(e.to_string()))?;
 
-        push(publisher, &launch.bundle)?;
+        if let Err(error) = push(publisher, &launch.bundle) {
+            rewind_to_an_unlaunched_store_on_a_definitive_no(registry, ix, did, &error);
+            return Err(error);
+        }
 
         Ok(ProfileMintStatus::StorePending {
             did: did.clone(),
             store_launcher_id,
         })
+    }
+}
+
+/// Put the mint at `ix` back to "the DID exists, the store does not" when the network answered a
+/// definitive NO to the store launch.
+///
+/// The store half is journalled as `StorePushed` BEFORE it is broadcast, so a LOST answer leaves a
+/// stage that re-reads chain rather than one that re-spends. A rejection is the other case entirely:
+/// the bundle reached a node and was refused, so it sits in no mempool and no block will ever carry
+/// it. Left at `StorePushed`, every later advance would report `StorePending` — "in flight" — for a
+/// bundle nothing is carrying, and would push nothing, forever, stranding a DID the user has already
+/// paid for.
+///
+/// This is the phase-B twin of [`release_index_on_a_definitive_no`], and it stops SHORT of that
+/// function's remedy on purpose: the index is NOT released, because unlike a rejected DID mint there
+/// IS an identity on chain here. `DidConfirmedStoreNotLaunched` is precisely that state, so the next
+/// advance rebuilds and retries the launch.
+///
+/// An UNREACHABLE chain is excluded for the same reason it is excluded there, and the stakes are
+/// higher: the launch may yet be included, and rewinding would let the next advance broadcast a
+/// SECOND launch — the double-spend the pre-push journalling exists to prevent.
+fn rewind_to_an_unlaunched_store_on_a_definitive_no(
+    registry: &mut ProfileRegistry,
+    ix: ProfileIx,
+    did: &MintedDid,
+    error: &MintError,
+) {
+    if matches!(error, MintError::Rejected(_)) {
+        // This same call journalled the entry moments ago, so it exists; if it somehow did not,
+        // there is no stage to rewind.
+        let _ = registry.advance_mint(
+            ix,
+            MintStage::DidConfirmedStoreNotLaunched {
+                did: MintedDidRecord::from(did),
+            },
+        );
     }
 }
 

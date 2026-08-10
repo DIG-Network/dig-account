@@ -2,3 +2,6 @@ target/
 
 # cargo-mutants scratch output (regenerable; a full run is minutes of CPU, never a build input)
 mutants.out*/
+
+# gitnexus index — per-worktree, regenerable, never committed (CLAUDE.md 2.0)
+.gitnexus/
