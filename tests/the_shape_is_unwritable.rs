@@ -298,13 +298,26 @@ fn signature_windows(rest: &str) -> [&str; 2] {
 /// a participle. Widening the position while narrowing the word is a net loss of coverage, which is
 /// exactly the shape a "widening" hides.
 ///
-/// It must NOT be a prefix test either: `required_signatures` and any `signature_*` helper EXTRACT
-/// the messages a bundle needs and hand back no signature at all. Flagging them would make the guard
-/// trip on the crate's own honest code, and a guard that always trips gets weakened rather than
-/// obeyed. `signature`/`signatures` are therefore absent from the set on purpose.
+/// It must NOT be a prefix test either. `required_signatures`, `signature_windows` and
+/// `assert_signable_by` all EXTRACT or ASSERT and hand back no signature at all. Flagging them would
+/// make the guard trip on the crate's own honest code, and a guard that always trips gets weakened
+/// rather than obeyed. `signature`/`signable` are therefore absent from the set on purpose.
+///
+/// # This name check is a TRIPWIRE, not the guarantee
+///
+/// It is deliberately not exhaustive and cannot be: `resign_`, `countersign_` and `sig_` are all
+/// uncaught, and the prefix rule this replaced missed strictly MORE than the set does. The actual
+/// enforcement is [`no_signing_function_accepts_bare_coin_spends`] plus the compile-fail proof in
+/// `tests/compile_fail/the_1698_exploit.rs`, which are shape-based and cannot be renamed around.
+/// Treating a name heuristic as the guarantee is the failure to avoid; as an outer tripwire in front
+/// of a real guard it earns its place.
 fn is_a_signing_name(name: &str) -> bool {
-    name.split('_')
-        .any(|word| matches!(word, "sign" | "signed" | "signer" | "signing"))
+    name.split('_').any(|word| {
+        matches!(
+            word,
+            "sign" | "signs" | "signed" | "signer" | "signers" | "signing"
+        )
+    })
 }
 
 /// The declared function name at `rest`, which begins with `fn `.
@@ -630,7 +643,7 @@ fn the_signing_door_guard_fires_on_a_sign_that_is_not_the_first_word() {
 /// So the participles get their own test rather than another row in the list above.
 #[test]
 fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
-    let participle_forms: [(&str, &str); 3] = [
+    let participle_forms: [(&str, &str); 5] = [
         (
             "a past-participle door",
             "pub fn signed_spends(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
@@ -642,6 +655,14 @@ fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
         (
             "a gerund door",
             "pub fn signing_pass(coin_spends: Vec<CoinSpend>) -> chia_bls::Signature {",
+        ),
+        (
+            "a third-person door",
+            "pub fn signs_these_spends(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
+        ),
+        (
+            "a plural agent-noun door",
+            "pub fn signers_over(coin_spends: &[CoinSpend]) -> chia_bls::Signature {",
         ),
     ];
 
@@ -661,6 +682,7 @@ fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
     for honest in [
         "pub fn required_signatures(coin_spends: &[CoinSpend]) -> Result<Vec<RequiredSignature>> {",
         "fn signature_windows(coin_spends: &[CoinSpend]) -> Vec<Window> {",
+        "fn assert_signable_by(coin_spends: &[CoinSpend], pk: PublicKey) -> Result<()> {",
     ] {
         assert!(
             unauthorized_signing_doors(honest).is_empty(),
@@ -675,6 +697,7 @@ fn the_signing_door_guard_fires_on_the_participles_a_prefix_rule_once_caught() {
         "fn required_signatures( signer: &LocalSigner, coin_spends: &[CoinSpend], ) -> Result<Vec<RequiredSignature>> {",
         "fn assign_spends(&self, coin_spends: &[CoinSpend]) -> Vec<Assignment> {",
         "fn signature_windows(coin_spends: &[CoinSpend]) -> Vec<Window> {",
+        "fn assert_signable_by(coin_spends: &[CoinSpend], pk: PublicKey) -> Result<()> {",
     ] {
         assert!(
             unauthorized_signing_doors(benign).is_empty(),
