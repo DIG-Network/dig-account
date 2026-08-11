@@ -8,14 +8,23 @@
 //! but the wrapper still matters: re-exporting any `dig-social-profile` type here would pull that
 //! crate's release cadence into dig-account's public API and its SemVer.
 //!
-//! The wrapper is not airtight, and it is worth naming what escapes it. [`Self::with_utf8`] takes a
-//! `SlotId`, so that one type IS public here — and it is not alone: `AccountStoreError::Session`
-//! carries `dig_session::SessionError`, and `AccountStoreError::Backend` carries
-//! `dig_keystore::KeystoreError`. All three are why a dependency bump on those crates is a BREAKING
-//! change for consumers, and why 0.13.0 is the correct release: for a `0.x` crate Cargo treats the
-//! minor position as the major, so 0.12 -> 0.13 IS the breaking bump. Widening this surface makes
-//! that worse; narrowing it (an owned slot-id newtype, opaque error variants) is the direction of
-//! travel.
+//! The wrapper is not airtight. [`Self::with_utf8`] takes a `SlotId`, so that type IS public here —
+//! and it is far from alone. At least NINE public sites across five modules expose a type from a
+//! crate whose major this crate has moved: `AccountStoreError::Session` and
+//! `AccountStoreError::Backend` (`crate::store`), `AuthFactors.password` as a **public field**,
+//! `AccountSession::enroll`, `profile_dek`, the two `profile_sealing_*` functions, `ProfileSigner`,
+//! and — heaviest of all — `AccountStore::new`, which takes `Arc<dyn KeychainBackend>`. A consumer
+//! cannot construct an `AccountStore` at all without naming a `dig-session` trait and implementing
+//! it; that binds far harder than an error variant, which a caller can ignore.
+//!
+//! Together they are why a dependency bump on those crates is BREAKING for consumers, and why
+//! 0.13.0 is the correct release: for a `0.x` crate Cargo treats the minor position as the major, so
+//! 0.12 -> 0.13 IS the breaking bump. Widening this surface makes it worse; narrowing it (an owned
+//! slot-id newtype, opaque error variants, a local backend trait) is the direction of travel.
+//!
+//! An earlier revision of this paragraph claimed three. Counting by grepping `pub fn` for dependency
+//! type names misses precisely the shapes that bind hardest: a `pub` field, and a trait object in a
+//! constructor. Enumerate from `pub mod` outward (`crate::lib`), not from a grep.
 //!
 //! [`ProfileSeed`] is the boundary that stops that: slots go in, and the only thing that comes out
 //! is a plain `[u8; 32]` root, which belongs to no chia family at all.

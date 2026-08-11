@@ -108,27 +108,60 @@ Bumping `dig-session` to 0.6.1 cut both edges at once and removed the whole fami
 and `dig-constants` 0.7.0. `chia-protocol`, `chia-consensus`, `chia-puzzle-types`, `chia-sdk-utils`,
 `clvmr`, `dig-constants`, `dig-session` and `dig-keystore` are each single-version now.
 
-**What genuinely remains, and is NOT ours to fix:**
+**What remains — and only SOME of it is upstream. `chia-bls` still resolves four ways:**
 
-- **Inside chia-wallet-sdk 0.34.0 itself.** It reaches `chia-bls` 0.42.1 through `chialisp` 0.4.6 and
-  `chia-bls` 0.36.1 through `chia-consensus` 0.36.1. A single sdk version is internally split, so no
-  pin in this crate can collapse it. Upstream.
+```
+chia-bls 0.26.0 <- dig-ipc-protocol 0.3.0, dig-keystore 0.8.0    OURS (both direct deps)
+chia-bls 0.28.2 <- clvmr 0.16.4
+chia-bls 0.36.1 <- chia-consensus 0.36.1, chia-wallet-sdk 0.34.0, dig-account
+chia-bls 0.42.1 <- chialisp 0.4.6                                 internal to the sdk
+```
+
+- **DIG-owned, fixable release-first in our own repos:** `chia-bls` 0.26.0, pulled by
+  `dig-ipc-protocol` 0.3.0 and `dig-keystore` 0.8.0 — both declared right here in `Cargo.toml`, both
+  declaring `chia-bls ^0.26` on crates.io. **A second BLS implementation inside a custody binary.**
+  Tracked as dig_ecosystem#2626. Do not call this upstream; that is the one conclusion guaranteeing
+  nobody files the DIG-side ticket. It is PRE-EXISTING, not caused here — `dig-keystore` 0.4.1
+  declared the same `^0.26`, and this change took `chia-bls` from five roots to four by removing
+  0.22.0.
+- **Genuinely upstream:** only the 0.36.1 / 0.42.1 pair, split *inside* `chia-wallet-sdk` 0.34.0
+  (`chia-consensus` 0.36.1 vs `chialisp` 0.4.6). No pin here can collapse those.
 - **`dig-identity` 0.6.0 vs 0.7.0** — 0.6.0 for dig-account / `dig-session` / `dig-wallet-backend`,
-  0.7.0 for `dig-social-profile`. Closing it needs those two released onto 0.7, release-first, in
-  their own repos.
+  0.7.0 for `dig-social-profile`; needs those two released onto 0.7. Inert today: 0.6.0 -> 0.7.0 is
+  purely additive, `bls.rs`/`did.rs`/`keys.rs`/`hash.rs` are byte-identical, and no `dig-identity`
+  type crosses into this crate.
 
-Tolerable for the reason the schema dependency is: **no chia type crosses either boundary in use.**
-`dig-session` hands this crate `Password`, `UnlockedMasterSeed`, `Session`, `SessionError` and two
-length constants — plain secrets and integers. Re-check that before widening the `dig-session`
-surface; the day a `Coin`, `CoinSpend`, `SpendBundle` or `Program` crosses it, the split stops being
-cosmetic and becomes a type error — or worse, two structurally identical types that silently
-disagree.
+The `chia-bls` split is tolerable only because the seam is BYTES, not types: `WalletKey::from_seed_at`
+(`src/keys/wallet_key.rs:47`) takes `&[u8]` and calls `SecretKey::from_seed` on dig-account's own
+0.36.1, and `UnlockedMasterSeed` yields bytes. Verified empirically against both published
+`dig-keystore` artifacts — same pubkey, same signature.
 
-**The removal changed this crate's own contract.** Three dependency types are public here —
-`SlotId` in `ProfileSeed::with_utf8`, and `dig_session::SessionError` + `dig_keystore::KeystoreError`
-as `#[from]` variants of `AccountStoreError::Session` and `AccountStoreError::Backend` — so moving
-those crates across majors is BREAKING for consumers, which is what 0.13.0 buys (for a `0.x` crate
-Cargo reads the minor position as the major).
+**Do not trust the sentence above without re-deriving it.** It has been wrong twice. Both times the
+error was the same: a claim true of ONE dependency path, written as though true of the crate. Read
+the lock's reverse deps, not the surrounding prose.
+
+**The removal changed this crate's own contract.** At least **nine** public sites expose a type from
+a crate this change moved across a major — every module is `pub mod` (`src/lib.rs:44-59`), so they
+are all reachable:
+
+| site | leaked type |
+|---|---|
+| `src/store.rs:63` | `dig_session::KeychainBackend` (**trait object**, in `AccountStore::new`) |
+| `src/auth/factors.rs:12` | `dig_session::Password` (**pub field** `AuthFactors.password`) |
+| `src/auth/factors.rs:22`, `src/session.rs:53`, `src/session.rs:79` | `dig_session::Password` |
+| `src/keys/dek.rs:12`, `src/keys/sealing.rs:29`, `src/keys/sealing.rs:38`, `src/signer.rs:28` | `dig_session::UnlockedMasterSeed` |
+| `src/store.rs:43`, `src/store.rs:47` | `dig_session::SessionError`, `dig_keystore::KeystoreError` (`AccountStoreError` variants) |
+| `src/mint/seed.rs:66` | `dig_social_profile::SlotId` |
+
+`src/store.rs:63` is the heaviest and the easiest to overlook: `AccountStore::new` takes
+`Arc<dyn KeychainBackend>`, so a consumer **cannot construct an `AccountStore` at all** without
+naming a `dig-session` trait and implementing it. That is far harder coupling than an `#[from]`
+error variant, which a consumer can simply ignore. This is why 0.13.0 is BREAKING, and correct: for
+a `0.x` crate Cargo reads the minor position as the major.
+
+An earlier revision of this entry said "three dependency types". Counting by grepping `pub fn` for
+dependency type names misses exactly the shapes that bind hardest — a `pub` field, and a trait
+object in a constructor.
 
 ## A dependency pin that looks stale can be the one holding the tree together
 
