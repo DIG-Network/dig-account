@@ -140,7 +140,7 @@ The `chia-bls` split is tolerable only because the seam is BYTES, not types: `Wa
 error was the same: a claim true of ONE dependency path, written as though true of the crate. Read
 the lock's reverse deps, not the surrounding prose.
 
-**The removal changed this crate's own contract.** At least **nine** public sites expose a type from
+**The removal changed this crate's own contract.** At least **twelve** public sites expose a type from
 a crate this change moved across a major — every module is `pub mod` (`src/lib.rs:44-59`), so they
 are all reachable:
 
@@ -151,7 +151,7 @@ are all reachable:
 | `src/auth/factors.rs:22`, `src/session.rs:53`, `src/session.rs:79` | `dig_session::Password` |
 | `src/keys/dek.rs:12`, `src/keys/sealing.rs:29`, `src/keys/sealing.rs:38`, `src/signer.rs:28` | `dig_session::UnlockedMasterSeed` |
 | `src/store.rs:43`, `src/store.rs:47` | `dig_session::SessionError`, `dig_keystore::KeystoreError` (`AccountStoreError` variants) |
-| `src/mint/seed.rs:66` | `dig_social_profile::SlotId` |
+| `src/mint/seed.rs:83` | `dig_social_profile::SlotId` |
 
 `src/store.rs:63` is the heaviest and the easiest to overlook: `AccountStore::new` takes
 `Arc<dyn KeychainBackend>`, so a consumer **cannot construct an `AccountStore` at all** without
