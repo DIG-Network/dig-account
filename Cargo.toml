@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -37,9 +37,9 @@ coinset-push = ["dep:ureq"]
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
 dig-wallet-backend = { version = "0.27", default-features = false, features = ["client"] }
-dig-session = "0.5"
+dig-session = "0.6"
 dig-identity = "0.6"
-dig-keystore = "0.4.1"
+dig-keystore = "0.8"
 dig-constants = "0.10"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
@@ -53,15 +53,24 @@ dig-chainsource-interface = "0.3"
 # The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.
+#
+# DO NOT bump to ^0.7 to "keep current". dig-store 0.7.1 — reached through dig-social-profile 0.4 —
+# requires dig-merkle ^0.6, and ^0.6 excludes 0.7.0. Asking for ^0.7 here does not upgrade that
+# edge; it resolves a SECOND dig-merkle line beside it. 0.6 and 0.7 both already build on
+# chia-wallet-sdk 0.34, so ^0.6 costs nothing and keeps the tree single-rooted.
 dig-merkle = "0.6"
 # The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
 #
-# This crate is still on the chia 0.26 family while dig-account is on 0.36.1, so it brings a SECOND
-# chia subtree. That is accepted deliberately and is safe ONLY because no chia type crosses the
-# boundary used here: a seeded profile goes in as slots and comes out as a plain `[u8; 32]` root
-# (`ProfileSeed`). Nothing else from this crate may be used — in particular NOT
-# `IdentityProfile::mint_from_did`, which cannot mint a DID-rooted store (see `mint::store_launch`).
-dig-social-profile = "0.2"
+# 0.4 is the first release on the chia 0.36.1 / chia-wallet-sdk 0.34 family. Before it, this crate
+# pinned dig-did ^0.4 and dig-store ^0.5, which dragged a SECOND chia subtree (chia-wallet-sdk 0.30)
+# into the money path through two independent chains. Keep this at ^0.4 or newer: dropping back
+# re-splits every chia type in this binary, which is the byte-drift class that has cost real money.
+#
+# The boundary is still narrow by design: a seeded profile goes in as slots and comes out as a plain
+# `[u8; 32]` root (`ProfileSeed`), so no chia type crosses it. Nothing else from this crate may be
+# used — in particular NOT `IdentityProfile::mint_from_did`, which cannot mint a DID-rooted store
+# (see `mint::store_launch`).
+dig-social-profile = "0.4"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.36.1"
 # The `serde` feature is required: coin ids and launcher ids are persisted in the profile
@@ -96,7 +105,11 @@ hex = "0.4"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # Test-only: the ONLY published ChainSource impl that serves `resolve_singleton_lineage`, which the
 # store half needs via `dig_did::walk_did_lineage_to_tip`. Used by the ignored mainnet harness.
-chia-query = "0.7"
+#
+# Held at ^0.8, the first line on chia-wallet-sdk 0.34. 0.7 pinned ^0.33, and because 0.33 and 0.34
+# are incompatible 0.x minors, it resolved a THIRD chia-wallet-sdk alongside the crate's own — under
+# `cfg(test)`, which is precisely where the mainnet mint harness proves its spends.
+chia-query = "0.8"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.

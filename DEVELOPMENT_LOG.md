@@ -79,13 +79,115 @@ This is decided, not accidental (dig_ecosystem#2463). Lineage is the trust predi
 proves the store descends from the DID's coin — and memos are only an index. The memo-writing direct
 shape is not available here at all, for the odd-amount reason above.
 
-## `dig-social-profile` is a SCHEMA dependency, and a chia-family boundary
+## `dig-social-profile` is a SCHEMA dependency
 
-`dig-social-profile` 0.2 is on the chia 0.26 family while this crate is on 0.36.1, so depending on it
-brings a second chia subtree. That is accepted ONLY because no chia type crosses the boundary in use:
-slots go in, and a plain `[u8; 32]` root comes out (`ProfileSeed`). Re-implementing the slot schema
-here is forbidden — it is a byte-compatibility contract with golden vectors, and a second
-implementation is a future drift bug.
+Re-implementing the slot schema here is forbidden — it is a byte-compatibility contract with golden
+vectors, and a second implementation is a future drift bug. Only the schema surface is used: slots go
+in, and a plain `[u8; 32]` root comes out (`ProfileSeed`), so no chia type crosses the boundary.
+
+That narrow boundary used to be load-bearing for a second reason. Until 0.4, this crate pinned
+`dig-social-profile` 0.2, which sat on the chia 0.26 family and pinned `dig-did ^0.4` / `dig-store
+^0.5` — dragging a whole SECOND chia-wallet-sdk (0.30) in behind it. 0.4 moved onto chia-wallet-sdk
+0.34, so THAT subtree is gone and the pin MUST NOT go back: dropping to 0.2 re-splits every
+chia-wallet-sdk type in this custody binary.
+
+## Where the chia 0.26 family came from, and what is left after removing it
+
+`chia-wallet-sdk` is unified at 0.34.0. Getting there left a second, lower chia family behind, and
+finding its parents took two passes — worth recording, because the first answer was incomplete.
+
+It entered through **two separate edges of `dig-session` 0.5.1**, not one: `dig-identity` 0.5.0
+brought `chia-sdk-utils` 0.30.0, `chia-protocol` 0.26.0 and `chia-bls` 0.26.0, while `dig-constants`
+0.7.0 separately brought `chia-protocol` 0.26.0 and `chia-consensus` 0.26.0. Naming only
+`dig-constants` looked sufficient because both edges produce `chia-protocol` 0.26.0 — the shared
+symptom hid the second cause.
+
+Bumping `dig-session` to 0.6.1 cut both edges at once and removed the whole family:
+`chia-protocol` 0.26.0, `chia-puzzle-types` 0.26.0, `chia-consensus` 0.26.0, `chia-sdk-utils` 0.30.0,
+`chia-sha2` 0.22.0, `chia-traits` 0.22.0, `clvm-traits` 0.26.0, `clvm-utils` 0.26.0, `clvmr` 0.14.0
+and `dig-constants` 0.7.0. `chia-protocol`, `chia-consensus`, `chia-puzzle-types`, `chia-sdk-utils`,
+`clvmr`, `dig-constants`, `dig-session` and `dig-keystore` are each single-version now.
+
+**What remains — and only SOME of it is upstream. `chia-bls` still resolves four ways:**
+
+```
+chia-bls 0.26.0 <- dig-ipc-protocol 0.3.0, dig-keystore 0.8.0    OURS (both direct deps)
+chia-bls 0.28.2 <- clvmr 0.16.4
+chia-bls 0.36.1 <- chia-consensus 0.36.1, chia-wallet-sdk 0.34.0, dig-account
+chia-bls 0.42.1 <- chialisp 0.4.6                                 internal to the sdk
+```
+
+- **DIG-owned, fixable release-first in our own repos:** `chia-bls` 0.26.0, pulled by
+  `dig-ipc-protocol` 0.3.0 and `dig-keystore` 0.8.0 — both declared right here in `Cargo.toml`, both
+  declaring `chia-bls ^0.26` on crates.io. **A second BLS implementation inside a custody binary.**
+  Tracked as dig_ecosystem#2626. Do not call this upstream; that is the one conclusion guaranteeing
+  nobody files the DIG-side ticket. It is PRE-EXISTING, not caused here — `dig-keystore` 0.4.1
+  declared the same `^0.26`, and this change took `chia-bls` from five roots to four by removing
+  0.22.0.
+- **Genuinely upstream:** only the 0.36.1 / 0.42.1 pair, split *inside* `chia-wallet-sdk` 0.34.0
+  (`chia-consensus` 0.36.1 vs `chialisp` 0.4.6). No pin here can collapse those.
+- **`dig-identity` 0.6.0 vs 0.7.0** — 0.6.0 for dig-account / `dig-session` / `dig-wallet-backend`,
+  0.7.0 for `dig-social-profile`; needs those two released onto 0.7. Inert today: 0.6.0 -> 0.7.0 is
+  purely additive, `bls.rs`/`did.rs`/`keys.rs`/`hash.rs` are byte-identical, and no `dig-identity`
+  type crosses into this crate.
+
+The `chia-bls` split is tolerable only because the seam is BYTES, not types: `WalletKey::from_seed_at`
+(`src/keys/wallet_key.rs:47`) takes `&[u8]` and calls `SecretKey::from_seed` on dig-account's own
+0.36.1, and `UnlockedMasterSeed` yields bytes. Verified empirically against both published
+`dig-keystore` artifacts — same pubkey, same signature.
+
+**Do not trust the sentence above without re-deriving it.** It has been wrong twice. Both times the
+error was the same: a claim true of ONE dependency path, written as though true of the crate. Read
+the lock's reverse deps, not the surrounding prose.
+
+**The removal changed this crate's own contract.** At least **twelve** public sites expose a type from
+a crate this change moved across a major — every module is `pub mod` (`src/lib.rs:44-59`), so they
+are all reachable:
+
+| site | leaked type |
+|---|---|
+| `src/store.rs:63` | `dig_session::KeychainBackend` (**trait object**, in `AccountStore::new`) |
+| `src/auth/factors.rs:12` | `dig_session::Password` (**pub field** `AuthFactors.password`) |
+| `src/auth/factors.rs:22`, `src/session.rs:53`, `src/session.rs:79` | `dig_session::Password` |
+| `src/keys/dek.rs:12`, `src/keys/sealing.rs:29`, `src/keys/sealing.rs:38`, `src/signer.rs:28` | `dig_session::UnlockedMasterSeed` |
+| `src/store.rs:43`, `src/store.rs:47` | `dig_session::SessionError`, `dig_keystore::KeystoreError` (`AccountStoreError` variants) |
+| `src/mint/seed.rs:83` | `dig_social_profile::SlotId` |
+
+`src/store.rs:63` is the heaviest and the easiest to overlook: `AccountStore::new` takes
+`Arc<dyn KeychainBackend>`, so a consumer **cannot construct an `AccountStore` at all** without
+naming a `dig-session` trait and implementing it. That is far harder coupling than an `#[from]`
+error variant, which a consumer can simply ignore. This is why 0.13.0 is BREAKING, and correct: for
+a `0.x` crate Cargo reads the minor position as the major.
+
+An earlier revision of this entry said "three dependency types". Counting by grepping `pub fn` for
+dependency type names misses exactly the shapes that bind hardest — a `pub` field, and a trait
+object in a constructor. The count went three, then nine, then twelve across three revisions; each
+correction came from enumerating differently, never from new code.
+
+There is a further coupling the table above cannot show, because it is not a signature at all:
+`src/signer.rs:49` implements `dig_ipc_protocol`'s `SessionSigner` trait for the public
+`ProfileSigner`, which puts `dig_ipc_protocol::domain::{Signature, SigningPublicKey}` in this crate's
+public surface at `signer.rs:50,58,66`. `dig-ipc-protocol` is pinned `"0.3"` and did not move, so it
+does not affect 0.13.0 — it is recorded because a future `dig-ipc-protocol` 0.4 is breaking here for
+exactly the same reason, and nothing in the table would warn you.
+
+That is the durable form of the lesson: an `impl Trait for PublicType` exports every type in the
+trait's method signatures without any of them appearing in this crate's own `pub fn` declarations.
+Enumerate from `pub mod` outward, and treat trait impls on public types as part of the surface.
+
+## A dependency pin that looks stale can be the one holding the tree together
+
+`Cargo.lock` once resolved THREE chia-wallet-sdk versions here while `Cargo.toml` already said
+`"0.34"` — the other two arrived transitively, so the manifest read as correct and only the lock
+disagreed. **A manifest diff is never evidence that a version unified.** Prove it from the lock, or
+from `cargo tree -d` reading ONLY column-0 lines (indented lines are dependent paths, not duplicate
+roots, so a clean tree looks alarming if you grep naively).
+
+The counter-intuitive half: `dig-merkle` is deliberately held at `^0.6` even though 0.7.0 exists.
+`dig-store` 0.7.1 — reached through `dig-social-profile` 0.4 — requires `dig-merkle ^0.6`, and `^0.6`
+EXCLUDES 0.7.0. Asking for `^0.7` here does not upgrade that edge; it resolves a SECOND dig-merkle
+line beside it. Both already build on chia-wallet-sdk 0.34, so `^0.6` costs nothing. Bumping a pin
+"to keep current" can create the duplicate you were trying to remove.
 
 Do NOT reach for `IdentityProfile::mint_from_did` from that crate. It delegates to
 `dig_store::create_store`, which cannot mint a DID-rooted store; the `StoreOwner::Custom` route it
