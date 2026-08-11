@@ -8,7 +8,7 @@
 //! but the wrapper still matters: re-exporting any `dig-social-profile` type here would pull that
 //! crate's release cadence into dig-account's public API and its SemVer.
 //!
-//! The wrapper is not airtight. [`Self::with_utf8`] takes a `SlotId`, so that type IS public here —
+//! The wrapper is not airtight. [`ProfileSeed::with_utf8`] takes a `SlotId`, so that type IS public here —
 //! and it is far from alone. At least NINE public sites across five modules expose a type from a
 //! crate whose major this crate has moved: `AccountStoreError::Session` and
 //! `AccountStoreError::Backend` (`crate::store`), `AuthFactors.password` as a **public field**,
