@@ -126,8 +126,9 @@ disagree.
 
 **The removal changed this crate's own contract.** Three dependency types are public here —
 `SlotId` in `ProfileSeed::with_utf8`, and `dig_session::SessionError` + `dig_keystore::KeystoreError`
-as `#[from]` variants of `StoreError` — so moving those crates across majors is BREAKING for
-consumers, which is what 0.13.0 buys (for a `0.x` crate Cargo reads the minor position as the major).
+as `#[from]` variants of `AccountStoreError::Session` and `AccountStoreError::Backend` — so moving
+those crates across majors is BREAKING for consumers, which is what 0.13.0 buys (for a `0.x` crate
+Cargo reads the minor position as the major).
 
 ## A dependency pin that looks stale can be the one holding the tree together
 
