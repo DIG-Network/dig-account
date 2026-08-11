@@ -161,7 +161,19 @@ a `0.x` crate Cargo reads the minor position as the major.
 
 An earlier revision of this entry said "three dependency types". Counting by grepping `pub fn` for
 dependency type names misses exactly the shapes that bind hardest — a `pub` field, and a trait
-object in a constructor.
+object in a constructor. The count went three, then nine, then twelve across three revisions; each
+correction came from enumerating differently, never from new code.
+
+There is a further coupling the table above cannot show, because it is not a signature at all:
+`src/signer.rs:49` implements `dig_ipc_protocol`'s `SessionSigner` trait for the public
+`ProfileSigner`, which puts `dig_ipc_protocol::domain::{Signature, SigningPublicKey}` in this crate's
+public surface at `signer.rs:50,58,66`. `dig-ipc-protocol` is pinned `"0.3"` and did not move, so it
+does not affect 0.13.0 — it is recorded because a future `dig-ipc-protocol` 0.4 is breaking here for
+exactly the same reason, and nothing in the table would warn you.
+
+That is the durable form of the lesson: an `impl Trait for PublicType` exports every type in the
+trait's method signatures without any of them appearing in this crate's own `pub fn` declarations.
+Enumerate from `pub mod` outward, and treat trait impls on public types as part of the surface.
 
 ## A dependency pin that looks stale can be the one holding the tree together
 
