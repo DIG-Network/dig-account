@@ -318,9 +318,40 @@ impl SpendSummary {
     }
 }
 
+/// Base units in one XCH — the Chia native asset carries **12** decimal places.
+///
+/// Named here because a bare `1_000_000_000_000` in a format path is indistinguishable from the
+/// wrong divisor at a glance, and this module exists to stop exactly that. It is the XCH factor and
+/// no other: see [`format_xch`] for why no CAT amount may pass through it.
+const MOJOS_PER_XCH: u64 = 1_000_000_000_000;
+
+/// Render a mojo count as whole XCH.
+///
+/// Trailing zeros are trimmed so the figure is glanceable (`1.5`, not `1.500000000000`), but nothing
+/// is ROUNDED: a single mojo renders all twelve places, because an amount displayed as `0` is how a
+/// person concludes their money is gone.
+///
+/// **XCH only.** A CAT recipient carries an asset id, not a precision, and CATs do not agree on one
+/// — $DIG is three decimals, others are not. Passing a CAT amount through the XCH factor would show
+/// `0.000000001` for 1,000 $DIG; that is the same defect this function exists to remove, pointed at
+/// a different asset. CAT amounts are therefore shown as base units, said in those words.
+fn format_xch(mojos: u64) -> String {
+    let whole = mojos / MOJOS_PER_XCH;
+    let fraction = mojos % MOJOS_PER_XCH;
+    if fraction == 0 {
+        return whole.to_string();
+    }
+    let digits = format!("{fraction:012}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
 impl fmt::Display for SpendSummary {
     /// A one-line human summary for a plain-text prompt (the harness may render richer UI from the
     /// structured fields directly).
+    ///
+    /// Every figure on the line is stated in the units it is labelled with — the amount, and the fee
+    /// that used to be labelled `mojos` beside an amount labelled `XCH`, so that the sentence
+    /// disagreed with itself about which units it was speaking in.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}: ", self.tier)?;
         if self.recipients.is_empty() {
@@ -330,15 +361,22 @@ impl fmt::Display for SpendSummary {
                 if i > 0 {
                     write!(f, ", ")?;
                 }
-                let asset = recipient.asset_id.as_deref().unwrap_or("XCH");
-                write!(
-                    f,
-                    "{} {} -> {}",
-                    recipient.amount_mojos, asset, recipient.address
-                )?;
+                match recipient.asset_id.as_deref() {
+                    None => write!(
+                        f,
+                        "{} XCH -> {}",
+                        format_xch(recipient.amount_mojos),
+                        recipient.address
+                    )?,
+                    Some(asset) => write!(
+                        f,
+                        "{} base units of CAT {asset} -> {}",
+                        recipient.amount_mojos, recipient.address
+                    )?,
+                }
             }
         }
-        write!(f, " (fee {} mojos)", self.fee)
+        write!(f, " (fee {} XCH)", format_xch(self.fee))
     }
 }
 
@@ -781,12 +819,35 @@ mod tests {
         assert_eq!(summary.native_total_mojos(), 610);
     }
 
+    /// **An XCH figure beside the ticker is WHOLE COINS, never mojos.**
+    ///
+    /// The amount and the fee are deliberately different values, and neither is a multiple of the
+    /// other, so a rendering that printed one figure twice — or that formatted one and not the
+    /// other — cannot satisfy both halves. Each is asserted from BOTH sides: the true figure appears
+    /// AND the raw base-unit count does not, because a `contains` on the correct string alone is
+    /// still satisfied by a line that ALSO carries the 10^12-overstated one.
     #[test]
-    fn display_renders_recipients_and_fee() {
-        let summary = SpendSummary::new(SpendTier::AutoSend, vec![paying("xch1abc", 42, None)], 5);
+    fn display_renders_xch_amounts_in_whole_coins_not_base_units() {
+        let summary = SpendSummary::new(
+            SpendTier::AutoSend,
+            vec![paying("xch1abc", 1_500_000_000_000, None)],
+            5_000_000_000,
+        );
         let line = summary.to_string();
-        assert!(line.contains("42 XCH -> xch1abc"), "{line}");
-        assert!(line.contains("fee 5 mojos"), "{line}");
+        assert!(line.contains("1.5 XCH -> xch1abc"), "{line}");
+        assert!(!line.contains("1500000000000"), "{line}");
+        assert!(line.contains("fee 0.005 XCH"), "{line}");
+        assert!(!line.contains("5000000000"), "{line}");
+    }
+
+    /// A sub-mojo-precision amount renders every place it needs rather than rounding to `0` — a held
+    /// amount displayed as nothing is how a person concludes their money has gone.
+    #[test]
+    fn display_renders_a_single_mojo_without_rounding_it_away() {
+        let summary = SpendSummary::new(SpendTier::AutoSend, vec![paying("xch1abc", 1, None)], 0);
+        let line = summary.to_string();
+        assert!(line.contains("0.000000000001 XCH -> xch1abc"), "{line}");
+        assert!(line.contains("fee 0 XCH"), "{line}");
     }
 
     #[test]
@@ -805,7 +866,7 @@ mod tests {
         let summary = SpendSummary::new(SpendTier::Vault, vec![], 3);
         let line = summary.to_string();
         assert!(line.contains("no recipients"), "{line}");
-        assert!(line.contains("fee 3 mojos"), "{line}");
+        assert!(line.contains("fee 0.000000000003 XCH"), "{line}");
     }
 
     #[test]
@@ -815,7 +876,12 @@ mod tests {
             vec![paying("xch1cat", 7, Some("cafe"))],
             0,
         );
-        assert!(summary.to_string().contains("7 cafe -> xch1cat"));
+        assert!(
+            summary
+                .to_string()
+                .contains("7 base units of CAT cafe -> xch1cat"),
+            "a CAT amount is base units, said in those words: {summary}"
+        );
     }
 
     /// A multi-recipient summary renders each recipient SEPARATED, in order, on one line.
@@ -836,7 +902,10 @@ mod tests {
         );
         assert_eq!(
             summary.to_string(),
-            "Confirm: 100 XCH -> xch1first, 250 cafe -> xch1second (fee 7 mojos)"
+            concat!(
+                "Confirm: 0.0000000001 XCH -> xch1first, ",
+                "250 base units of CAT cafe -> xch1second (fee 0.000000000007 XCH)"
+            )
         );
     }
 
