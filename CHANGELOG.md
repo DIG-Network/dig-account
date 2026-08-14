@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.14.0] - 2026-08-14
+
+### Bug Fixes
+- Render SpendSummary amounts in the units a person reads (#19)
+
 ## [0.13.0] - 2026-08-11
 
 ### Chores
