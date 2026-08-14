@@ -415,6 +415,14 @@ from the coin spends alone via `dig-wallet-backend`'s `client::verify::derive_su
 engine-supplied claim); `SpendTier` (`AutoSend` / `Confirm` / `Vault`) classifies the spend under the
 profile's `CustodyPolicy`.
 
+**Every figure `SpendSummary`'s `Display` renders MUST be stated in the units it is labelled with.** A
+native amount and the fee are mojo counts internally and MUST be rendered as whole XCH (divided by
+`10^12`, trailing zeros trimmed, nothing rounded away — a held amount shown as `0` is a money lie of its
+own). A CAT amount MUST be rendered as its BASE UNITS, said in those words beside its asset id, and MUST
+NOT be divided by any factor: a recipient carries an asset id, not a precision, and CATs do not agree on
+one, so applying $DIG's three decimals would be confidently wrong for every other CAT. A line MUST NOT
+mix units it does not name.
+
 ### 5.3 Domain-separation tags
 
 Domain-separation tags for identity signing are consumed from `dig-ipc-protocol`; dig-account MUST NOT
