@@ -26,9 +26,9 @@
 use std::sync::Arc;
 
 use chia_bls::Signature;
-use chia_protocol::{Bytes32, SpendBundle};
+use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use dig_chainsource_interface::ChainSource;
-use dig_merkle::{required_signatures, DigDataStoreMetadata, Owner, RequiredSignature};
+use dig_merkle::{required_signatures, DataStore, DigDataStoreMetadata, Owner, RequiredSignature};
 use dig_social_profile::slot::standard::SCHEMA_VERSION;
 use dig_social_profile::SlotEdit;
 
@@ -221,6 +221,11 @@ impl ProfileEditor {
         C: ChainSource + ?Sized,
     {
         let store = resolve_store_tip(anchor, chain)?;
+        // The hydration above is reconstructed from a spend the CHAIN SOURCE supplied, and the root
+        // check covers only the profile BODY. Everything else the recreation is built from — who the
+        // singleton is recreated FOR, and which singleton it is — is checked here, before any spend
+        // exists to sign.
+        gate_store_identity(wallet, anchor, &store)?;
 
         // dig-merkle replaces the metadata WHOLESALE, so every other field is carried forward here
         // and only the root advances. Rebuilding it from defaults would drop the store's label,
@@ -237,7 +242,7 @@ impl ProfileEditor {
         let coin_spends = update.coin_spends;
         let required = required_signatures(&coin_spends, network.constants())
             .map_err(|e| EditError::Build(format!("required signatures: {e}")))?;
-        gate_edit(wallet, &required, network)?;
+        gate_edit(wallet, &store, &coin_spends, &required, network)?;
 
         let mut signature = Signature::default();
         for requirement in &required {
@@ -288,17 +293,87 @@ fn reject_protected_removals(edit: &ProfileEdit) -> EditResult<()> {
     Ok(())
 }
 
+/// The pre-BUILD whitelist for the store an edit was hydrated from. Every rule states what IS
+/// allowed; anything else refuses.
+///
+/// # Why the root check is not enough
+///
+/// [`resolve_store_tip`] reconstructs the store from a coin spend the CHAIN SOURCE supplied, and the
+/// content check that follows binds only the profile BODY to the anchored root. Three values come out
+/// of that same hydration which the root covers NOTHING of, and one of them decides where the
+/// singleton goes:
+///
+/// 1. **`owner_puzzle_hash` is the DESTINATION.** With an empty delegation set, dig-store recreates
+///    the singleton at the owner puzzle hash carried in the hydrated info — while AUTHORIZING the
+///    spend from [`Owner::Standard`], which is built locally from this wallet's key. A hostile source
+///    that answers with the store's real launcher coin and a crafted solution therefore passes every
+///    other check, and the user signs a genuine `AGG_SIG_ME` that hands their store to a stranger.
+///    Permanent: the attacker then publishes under the victim's DID-anchored profile, `xch_address`
+///    included. So the owner MUST be this profile's own wallet puzzle hash.
+/// 2. **`launcher_id` names WHICH singleton** is recreated, and must be the one the anchor names.
+/// 3. **The delegation set must be EMPTY**, which is what every DIG profile store is launched with
+///    (`mint::store_launch` passes no delegated puzzles). A non-empty set changes how the destination
+///    is derived, and this seam neither creates one nor can reason about where it would send the coin.
+///
+/// The mint seam never needed this rule because it derives the owner LOCALLY; the edit seam is the
+/// first code here to take a store's identity from chain, so it is the first that must check it.
+fn gate_store_identity(
+    wallet: &WalletKey,
+    anchor: &ProfileAnchor,
+    store: &DataStore<DigDataStoreMetadata>,
+) -> EditResult<()> {
+    if store.info.owner_puzzle_hash != wallet.puzzle_hash() {
+        return Err(EditError::Refused(
+            "the store to be recreated is owned by a puzzle hash this profile does not hold".into(),
+        ));
+    }
+    if store.info.launcher_id != anchor.store_launcher_id() {
+        return Err(EditError::Refused(
+            "the store to be recreated is not the singleton this profile's anchor names".into(),
+        ));
+    }
+    if !store.info.delegated_puzzles.is_empty() {
+        return Err(EditError::Refused(
+            "the store to be recreated carries delegated puzzles, which a DIG profile store never has"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// The pre-signing whitelist for an edit. Every rule states what IS allowed; anything else refuses.
 ///
 /// **Only this profile's own key signs, and only `AGG_SIG_ME`.** An `AGG_SIG_UNSAFE` requirement is a
 /// blank cheque reusable against any coin, and a requirement under another public key asks this
 /// account to authorize a stranger's spend. An edit recreates ONE singleton the profile owns, so a
 /// requirement under any other key means the spend being signed is not the one that was built.
+///
+/// **Exactly one coin is spent, and it is the store tip [`gate_store_identity`] just cleared.** An
+/// edit recreates one singleton and funds nothing, so a bundle carrying any other coin spend is
+/// asking this account to authorize a spend it did not build — the rule `mint::did::gate` states for
+/// the mint, in the shape the edit seam takes.
 fn gate_edit(
     wallet: &WalletKey,
+    store: &DataStore<DigDataStoreMetadata>,
+    coin_spends: &[CoinSpend],
     required: &[RequiredSignature],
     network: &MintNetwork,
 ) -> EditResult<()> {
+    match coin_spends {
+        [only] if only.coin == store.coin => {}
+        [_] => {
+            return Err(EditError::Refused(
+                "the edit spends a coin that is not the store tip it was built from".into(),
+            ))
+        }
+        _ => {
+            return Err(EditError::Refused(format!(
+                "the edit's bundle spends {} coins; an edit recreates exactly one singleton",
+                coin_spends.len()
+            )))
+        }
+    }
+
     for requirement in required {
         let RequiredSignature::Bls(bls) = requirement else {
             return Err(EditError::Refused(
@@ -315,7 +390,8 @@ fn gate_edit(
         // network and one replayable against any other spend of the same key.
         if bls.domain_string != Some(network.constants().me()) {
             return Err(EditError::Refused(
-                "a signature that is not AGG_SIG_ME (an edit never signs an unbound message)".into(),
+                "a signature that is not AGG_SIG_ME (an edit never signs an unbound message)"
+                    .into(),
             ));
         }
     }
@@ -359,7 +435,8 @@ mod tests {
         let wallet = wallet();
         let required = requirement(wallet.public_key(), Some(network().constants().me()));
 
-        gate_edit(&wallet, &required, &network()).expect("an edit's own bound requirement is signed");
+        gate_edit(&wallet, &required, &network())
+            .expect("an edit's own bound requirement is signed");
     }
 
     /// An `AGG_SIG_UNSAFE` requirement — a message bound to no coin, replayable against any other

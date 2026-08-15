@@ -15,11 +15,12 @@
 //! harness models them separately (`start_rejecting` vs `stop_delivering_pushes`), and the two tests
 //! below assert different things about the same next call.
 
+use chia_protocol::{Bytes32, CoinSpend};
 use dig_account::{
     EditError, EditStatus, ProfileAnchor, ProfileContentSource, ProfileEdit, ProfileIx,
     ProfileMintStatus, ProfileRegistry, ProfileSeed, ProfileSlot, UnlockedAccount,
 };
-use dig_chainsource_interface::ChainSource;
+use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_merkle::DigDataStoreMetadata;
 use dig_social_profile::{slot::standard, Profile as SchemaProfile, Value};
 
@@ -127,30 +128,40 @@ fn a_minted_profile() -> anyhow::Result<(UnlockedAccount, SimulatorChain, Profil
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), FUNDING);
 
+    let anchor = mint_profile_at(&account, &chain, ProfileIx::ROOT)?;
+    Ok((account, chain, anchor))
+}
+
+/// Mint one whole profile at `ix` — the same seeded content every time, so two profiles of the same
+/// account differ ONLY in the key that owns them.
+fn mint_profile_at(
+    account: &UnlockedAccount,
+    chain: &SimulatorChain,
+    ix: ProfileIx,
+) -> anyhow::Result<ProfileAnchor> {
     let network = simulator_network();
     let mut registry = ProfileRegistry::empty();
     let minter = account.profile_minter();
 
     minter.begin_profile_mint(
         &mut registry,
-        ProfileIx::ROOT,
+        ix,
         &seeded_profile(),
-        &chain,
-        &chain,
+        chain,
+        chain,
         &network,
         &Default::default(),
     )?;
     chain.farm()?;
-    minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    minter.advance_profile_mint(&mut registry, ix, chain, chain, &network)?;
     chain.farm()?;
 
-    let status =
-        minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    let status = minter.advance_profile_mint(&mut registry, ix, chain, chain, &network)?;
     let ProfileMintStatus::Confirmed { did, store } = status else {
         panic!("both halves farmed and buried, so the mint is confirmed; got {status:?}");
     };
 
-    Ok((account, chain, ProfileAnchor::from_confirmed(&did, &store)?))
+    Ok(ProfileAnchor::from_confirmed(&did, &store)?)
 }
 
 /// **A set-and-remove batch commits the root the schema crate computes independently, and the spend
@@ -382,6 +393,126 @@ fn an_unanswered_push_reports_an_unknown_fate() -> anyhow::Result<()> {
         EditStatus::Pushed {
             new_root: would_be_root
         }
+    );
+    Ok(())
+}
+
+/// A chain source that answers honestly about everything EXCEPT which singleton one launcher id
+/// names: asked for `victim`'s lineage it returns `substitute`'s.
+///
+/// This is the shape of the store-theft attack in the only place it can be mounted — the read side.
+/// Every value the edit seam consumes about the store (owner, launcher id, coin, metadata) comes out
+/// of hydrating the tip this walk lands on, and the root check cannot see the swap when both stores
+/// commit the same content.
+struct SubstitutedStoreChain<'a> {
+    inner: &'a SimulatorChain,
+    victim: Bytes32,
+    substitute: Bytes32,
+}
+
+impl ChainSource for SubstitutedStoreChain<'_> {
+    type Error = String;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        let asked = if launcher_id == self.victim {
+            self.substitute
+        } else {
+            launcher_id
+        };
+        self.inner.resolve_singleton_lineage(asked)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.inner.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_timestamp(height)
+    }
+}
+
+/// **A store the account does not own is refused BEFORE anything is signed or pushed.**
+///
+/// The attack this closes: the root check binds the profile BODY, but the owner puzzle hash the
+/// singleton is RECREATED AT comes out of the same untrusted hydration and is covered by no root. A
+/// source that answers with a store owned by someone else — honest metadata, honest root, content
+/// that re-hashes perfectly — would otherwise have the user sign a genuine `AGG_SIG_ME` handing their
+/// profile store to a stranger, permanently.
+///
+/// The substitute is a REAL second profile minted by the same account at a different index, so it is
+/// a genuinely hydratable store with a genuinely different owner key and launcher id, committing the
+/// SAME root — which is what lets it get past the content check and reach the gate under test. A
+/// substitute committing a different root would be caught by `StaleOrTamperedContent` and would leave
+/// this gate untested, which is exactly how the hole got here.
+#[test]
+fn a_store_owned_by_another_key_is_refused_before_signing() -> anyhow::Result<()> {
+    let (account, chain, victim_anchor) = a_minted_profile()?;
+    let second = ProfileIx::from(1);
+    // The second profile spends from ITS OWN key's coins — which is the same reason its store is
+    // owned by a puzzle hash the first profile does not hold.
+    chain.fund(account.wallet_ops_at(second).puzzle_hash(), FUNDING);
+    let substitute_anchor = mint_profile_at(&account, &chain, second)?;
+
+    // The premise of the attack: both stores commit the same root, so nothing about the CONTENT
+    // distinguishes them. Only ownership does.
+    assert_eq!(
+        anchored_metadata(&victim_anchor, &chain)?.root_hash,
+        anchored_metadata(&substitute_anchor, &chain)?.root_hash,
+        "the substitute must be indistinguishable by root, or the content check would refuse first"
+    );
+
+    let hostile = SubstitutedStoreChain {
+        inner: &chain,
+        victim: victim_anchor.store_launcher_id(),
+        substitute: substitute_anchor.store_launcher_id(),
+    };
+    let pushes_before = chain.push_attempts();
+
+    let refusal = account.profile_editor().commit_edit(
+        ProfileIx::ROOT,
+        &victim_anchor,
+        &the_edit(),
+        &hostile,
+        &SeededContent,
+        &chain,
+        &simulator_network(),
+    );
+
+    let Err(EditError::Refused(reason)) = refusal else {
+        panic!("a store this profile does not own must be refused; got {refusal:?}");
+    };
+    assert!(
+        reason.contains("owned by a puzzle hash this profile does not hold"),
+        "{reason}"
+    );
+    assert_eq!(
+        chain.push_attempts(),
+        pushes_before,
+        "the refusal must come BEFORE any spend is signed or pushed"
     );
     Ok(())
 }
