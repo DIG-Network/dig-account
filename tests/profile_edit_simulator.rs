@@ -19,6 +19,8 @@ use dig_account::{
     EditError, EditStatus, ProfileAnchor, ProfileContentSource, ProfileEdit, ProfileIx,
     ProfileMintStatus, ProfileRegistry, ProfileSeed, ProfileSlot, UnlockedAccount,
 };
+use dig_chainsource_interface::ChainSource;
+use dig_merkle::DigDataStoreMetadata;
 use dig_social_profile::{slot::standard, Profile as SchemaProfile, Value};
 
 mod common;
@@ -380,6 +382,84 @@ fn an_unanswered_push_reports_an_unknown_fate() -> anyhow::Result<()> {
         EditStatus::Pushed {
             new_root: would_be_root
         }
+    );
+    Ok(())
+}
+
+/// The store's CURRENTLY anchored metadata, read from the chain the way the crate reads it: walk
+/// the singleton lineage to the tip and re-parse the tip's own creating spend.
+///
+/// Nothing here is taken from the caller — the metadata compared below is the bytes really on chain.
+fn anchored_metadata(
+    anchor: &ProfileAnchor,
+    chain: &SimulatorChain,
+) -> anyhow::Result<DigDataStoreMetadata> {
+    let lineage = chain
+        .resolve_singleton_lineage(anchor.store_launcher_id())
+        .map_err(anyhow::Error::msg)?
+        .expect("the store was minted, so its lineage resolves");
+    let creating_spend = chain
+        .parent_spend(lineage.tip())
+        .map_err(anyhow::Error::msg)?
+        .expect("the tip was created by a spend this simulator recorded");
+    Ok(dig_merkle::hydrate(&creating_spend)?.info.metadata)
+}
+
+/// **An edit advances the root and changes NOTHING else about the store.**
+///
+/// `dig-merkle` replaces the metadata WHOLESALE, so an edit that rebuilt it from defaults would
+/// erase the store's label, description, size bucket and program hash — permanently, on chain, and
+/// invisibly to every assertion about the root. This is the test that sees that.
+///
+/// The fixture is the store the MINT really launched, whose label and description are non-default
+/// (`store_metadata` writes "DIG profile" and a description naming the DID). That is load-bearing:
+/// comparing a `None` field against a `None` field passes while proving nothing, so the assertion
+/// below is guarded by asserting those two fields are populated BEFORE the edit.
+#[test]
+fn an_edit_advances_the_root_and_preserves_every_other_metadata_field() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+
+    let before = anchored_metadata(&anchor, &chain)?;
+    // Vacuity guard: at least two fields must be non-default, or "everything else is unchanged"
+    // would be a comparison of empties.
+    assert!(
+        before.label.is_some() && before.description.is_some(),
+        "the minted store must carry non-default metadata for this test to mean anything: {before:?}"
+    );
+
+    let expected_root = schema_profile_after_the_edit().build_root()?;
+    account.profile_editor().commit_edit(
+        ProfileIx::ROOT,
+        &anchor,
+        &the_edit(),
+        &chain,
+        &SeededContent,
+        &chain,
+        &simulator_network(),
+    )?;
+    chain.farm()?;
+
+    let after = anchored_metadata(&anchor, &chain)?;
+    assert_eq!(
+        after.root_hash.to_bytes(),
+        expected_root,
+        "the edit's whole purpose is to advance the root"
+    );
+    assert_ne!(
+        after.root_hash, before.root_hash,
+        "a root that did not move would make the comparison below trivially true"
+    );
+
+    // Every other field, compared as ONE value: the previous metadata with only the root advanced.
+    // Stated this way so a field added to `DigDataStoreMetadata` later is covered without editing
+    // this test.
+    assert_eq!(
+        after,
+        DigDataStoreMetadata {
+            root_hash: after.root_hash,
+            ..before
+        },
+        "an edit must change the root and nothing else"
     );
     Ok(())
 }
