@@ -237,7 +237,7 @@ impl ProfileEditor {
         let coin_spends = update.coin_spends;
         let required = required_signatures(&coin_spends, network.constants())
             .map_err(|e| EditError::Build(format!("required signatures: {e}")))?;
-        gate_edit(wallet, &required)?;
+        gate_edit(wallet, &required, network)?;
 
         let mut signature = Signature::default();
         for requirement in &required {
@@ -294,7 +294,11 @@ fn reject_protected_removals(edit: &ProfileEdit) -> EditResult<()> {
 /// blank cheque reusable against any coin, and a requirement under another public key asks this
 /// account to authorize a stranger's spend. An edit recreates ONE singleton the profile owns, so a
 /// requirement under any other key means the spend being signed is not the one that was built.
-fn gate_edit(wallet: &WalletKey, required: &[RequiredSignature]) -> EditResult<()> {
+fn gate_edit(
+    wallet: &WalletKey,
+    required: &[RequiredSignature],
+    network: &MintNetwork,
+) -> EditResult<()> {
     for requirement in required {
         let RequiredSignature::Bls(bls) = requirement else {
             return Err(EditError::Refused(
@@ -306,6 +310,95 @@ fn gate_edit(wallet: &WalletKey, required: &[RequiredSignature]) -> EditResult<(
                 "the edit asks for a signature under a key this profile does not hold".into(),
             ));
         }
+        // Stated exactly as `mint::did::gate` states it: AGG_SIG_UNSAFE is the ABSENCE of a domain
+        // string, so this is the whole difference between a signature bound to this coin on this
+        // network and one replayable against any other spend of the same key.
+        if bls.domain_string != Some(network.constants().me()) {
+            return Err(EditError::Refused(
+                "a signature that is not AGG_SIG_ME (an edit never signs an unbound message)".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+    use chia_wallet_sdk::signer::{AggSigConstants, RequiredBlsSignature};
+
+    const SEED: [u8; 32] = [0x5A; 32];
+    const OTHER_SEED: [u8; 32] = [0xA5; 32];
+
+    fn network() -> MintNetwork {
+        MintNetwork::from_constants(AggSigConstants::from(&*TESTNET11_CONSTANTS))
+    }
+
+    fn wallet() -> WalletKey {
+        WalletKey::from_seed_at(&SEED, ProfileIx::ROOT)
+    }
+
+    /// A requirement under `key`, bound to `domain_string`.
+    fn requirement(
+        key: chia_bls::PublicKey,
+        domain_string: Option<Bytes32>,
+    ) -> Vec<RequiredSignature> {
+        vec![RequiredSignature::Bls(RequiredBlsSignature {
+            public_key: key,
+            raw_message: vec![1, 2, 3].into(),
+            appended_info: Vec::new(),
+            domain_string,
+        })]
+    }
+
+    /// The control: a well-formed AGG_SIG_ME requirement under this profile's own key is exactly
+    /// what an edit signs. Without it, every refusal below could pass for the wrong reason.
+    #[test]
+    fn this_profiles_own_agg_sig_me_requirement_passes_the_gate() {
+        let wallet = wallet();
+        let required = requirement(wallet.public_key(), Some(network().constants().me()));
+
+        gate_edit(&wallet, &required, &network()).expect("an edit's own bound requirement is signed");
+    }
+
+    /// An `AGG_SIG_UNSAFE` requirement — a message bound to no coin, replayable against any other
+    /// spend of the same key — is REFUSED even though it names the right key.
+    #[test]
+    fn an_unsafe_unbound_signature_requirement_is_refused() {
+        let wallet = wallet();
+        // AGG_SIG_UNSAFE is exactly the absence of a domain string.
+        let required = requirement(wallet.public_key(), None);
+
+        let error = gate_edit(&wallet, &required, &network())
+            .expect_err("an edit never signs an unbound message");
+        assert!(error.to_string().contains("AGG_SIG_ME"), "{error}");
+    }
+
+    /// A requirement bound to a DIFFERENT network's genesis challenge is refused too: the domain
+    /// string is checked for the value this network demands, not merely for being present.
+    #[test]
+    fn a_requirement_bound_to_another_network_is_refused() {
+        let wallet = wallet();
+        let required = requirement(wallet.public_key(), Some(Bytes32::new([0x11; 32])));
+
+        let error = gate_edit(&wallet, &required, &network())
+            .expect_err("an edit signs only for the network it is committing on");
+        assert!(error.to_string().contains("AGG_SIG_ME"), "{error}");
+    }
+
+    /// A signature demanded under a key this profile does not hold is refused: the account never
+    /// authorizes a stranger's spend.
+    #[test]
+    fn a_signature_under_another_key_is_refused() {
+        let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
+        let required = requirement(stranger.public_key(), Some(network().constants().me()));
+
+        let error = gate_edit(&wallet(), &required, &network())
+            .expect_err("only this profile's own key signs");
+        assert!(
+            error.to_string().contains("this profile does not hold"),
+            "{error}"
+        );
+    }
 }
