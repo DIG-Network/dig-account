@@ -225,7 +225,7 @@ impl ProfileEditor {
         // check covers only the profile BODY. Everything else the recreation is built from — who the
         // singleton is recreated FOR, and which singleton it is — is checked here, before any spend
         // exists to sign.
-        gate_store_identity(wallet, anchor, &store)?;
+        gate_store_identity(wallet, anchor.store_launcher_id(), &store)?;
 
         // dig-merkle replaces the metadata WHOLESALE, so every other field is carried forward here
         // and only the root advances. Rebuilding it from defaults would drop the store's label,
@@ -319,7 +319,7 @@ fn reject_protected_removals(edit: &ProfileEdit) -> EditResult<()> {
 /// first code here to take a store's identity from chain, so it is the first that must check it.
 fn gate_store_identity(
     wallet: &WalletKey,
-    anchor: &ProfileAnchor,
+    expected_launcher_id: Bytes32,
     store: &DataStore<DigDataStoreMetadata>,
 ) -> EditResult<()> {
     if store.info.owner_puzzle_hash != wallet.puzzle_hash() {
@@ -327,7 +327,7 @@ fn gate_store_identity(
             "the store to be recreated is owned by a puzzle hash this profile does not hold".into(),
         ));
     }
-    if store.info.launcher_id != anchor.store_launcher_id() {
+    if store.info.launcher_id != expected_launcher_id {
         return Err(EditError::Refused(
             "the store to be recreated is not the singleton this profile's anchor names".into(),
         ));
@@ -401,8 +401,10 @@ fn gate_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chia_protocol::{Coin, Program};
     use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
     use chia_wallet_sdk::signer::{AggSigConstants, RequiredBlsSignature};
+    use dig_merkle::{DataStoreInfo, DelegatedPuzzle, LineageProof, Proof};
 
     const SEED: [u8; 32] = [0x5A; 32];
     const OTHER_SEED: [u8; 32] = [0xA5; 32];
@@ -413,6 +415,141 @@ mod tests {
 
     fn wallet() -> WalletKey {
         WalletKey::from_seed_at(&SEED, ProfileIx::ROOT)
+    }
+
+    const LAUNCHER_ID: Bytes32 = Bytes32::new([0x7E; 32]);
+
+    /// A hydrated store as it would come back from the chain: owned by `owner`, naming `launcher_id`.
+    ///
+    /// Fabricated deliberately — the point of these tests is that a store the chain source COULD
+    /// return, with any of these three fields chosen by an attacker, is refused before it is built on.
+    /// The honest case is covered where it must be, on the simulator
+    /// (`tests/profile_edit_simulator.rs`).
+    fn hydrated_store(
+        owner: Bytes32,
+        launcher_id: Bytes32,
+        delegated_puzzles: Vec<DelegatedPuzzle>,
+    ) -> DataStore<DigDataStoreMetadata> {
+        DataStore {
+            coin: Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1),
+            proof: Proof::Lineage(LineageProof {
+                parent_parent_coin_info: Bytes32::new([3; 32]),
+                parent_inner_puzzle_hash: Bytes32::new([4; 32]),
+                parent_amount: 1,
+            }),
+            info: DataStoreInfo {
+                launcher_id,
+                metadata: DigDataStoreMetadata {
+                    root_hash: Bytes32::new([5; 32]),
+                    ..Default::default()
+                },
+                owner_puzzle_hash: owner,
+                delegated_puzzles,
+            },
+        }
+    }
+
+    /// The control: the store this profile really owns clears the identity gate, so the three
+    /// refusals below are refusing the thing that changed and not the fixture itself.
+    #[test]
+    fn this_profiles_own_store_clears_the_identity_gate() {
+        let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
+
+        gate_store_identity(&wallet, LAUNCHER_ID, &store).expect("the profile's own store is edited");
+    }
+
+    /// A store owned by a puzzle hash this profile does not hold is REFUSED. The singleton would be
+    /// recreated at that owner, so signing it hands the profile's store away permanently.
+    #[test]
+    fn a_store_owned_by_another_puzzle_hash_is_refused() {
+        let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
+        let store = hydrated_store(stranger.puzzle_hash(), LAUNCHER_ID, Vec::new());
+
+        let error = gate_store_identity(&wallet(), LAUNCHER_ID, &store)
+            .expect_err("an edit never recreates a singleton at a stranger's puzzle hash");
+        assert!(
+            error
+                .to_string()
+                .contains("owned by a puzzle hash this profile does not hold"),
+            "{error}"
+        );
+    }
+
+    /// A store that is not the singleton the anchor names is refused, even when this profile owns it.
+    #[test]
+    fn a_store_that_is_not_the_anchored_singleton_is_refused() {
+        let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), Bytes32::new([0x0B; 32]), Vec::new());
+
+        let error = gate_store_identity(&wallet, LAUNCHER_ID, &store)
+            .expect_err("an edit commits to the singleton the anchor names");
+        assert!(
+            error.to_string().contains("this profile's anchor names"),
+            "{error}"
+        );
+    }
+
+    /// A store carrying delegated puzzles is refused: a DIG profile store is launched without any,
+    /// and a delegation set changes how the recreation's destination is derived.
+    #[test]
+    fn a_store_carrying_delegated_puzzles_is_refused() {
+        let wallet = wallet();
+        let store = hydrated_store(
+            wallet.puzzle_hash(),
+            LAUNCHER_ID,
+            vec![DelegatedPuzzle::Admin(Bytes32::new([9; 32]).into())],
+        );
+
+        let error = gate_store_identity(&wallet, LAUNCHER_ID, &store)
+            .expect_err("a DIG profile store never carries delegated puzzles");
+        assert!(error.to_string().contains("delegated puzzles"), "{error}");
+    }
+
+    /// A bundle carrying a coin spend beyond the store tip is refused: an edit recreates ONE
+    /// singleton and funds nothing, so a second spend is a spend this account did not build.
+    #[test]
+    fn a_bundle_spending_more_than_the_store_tip_is_refused() {
+        let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
+        let spends = vec![
+            CoinSpend::new(store.coin, Program::default(), Program::default()),
+            CoinSpend::new(
+                Coin::new(Bytes32::new([8; 32]), wallet.puzzle_hash(), 1_000),
+                Program::default(),
+                Program::default(),
+            ),
+        ];
+
+        let error = gate_edit(&wallet, &store, &spends, &[], &network())
+            .expect_err("an edit signs exactly one coin spend");
+        assert!(error.to_string().contains("spends 2 coins"), "{error}");
+    }
+
+    /// A single spend of a coin that is NOT the store tip is refused too — the count alone would let
+    /// a substituted coin through.
+    #[test]
+    fn a_bundle_spending_some_other_coin_is_refused() {
+        let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
+        let spends = vec![CoinSpend::new(
+            Coin::new(Bytes32::new([8; 32]), wallet.puzzle_hash(), 1_000),
+            Program::default(),
+            Program::default(),
+        )];
+
+        let error = gate_edit(&wallet, &store, &spends, &[], &network())
+            .expect_err("an edit signs only the store tip it was built from");
+        assert!(error.to_string().contains("not the store tip"), "{error}");
+    }
+
+    /// The one honest coin spend an edit builds: the store tip itself.
+    fn spends_of(store: &DataStore<DigDataStoreMetadata>) -> Vec<CoinSpend> {
+        vec![CoinSpend::new(
+            store.coin,
+            Program::default(),
+            Program::default(),
+        )]
     }
 
     /// A requirement under `key`, bound to `domain_string`.
@@ -433,9 +570,10 @@ mod tests {
     #[test]
     fn this_profiles_own_agg_sig_me_requirement_passes_the_gate() {
         let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
         let required = requirement(wallet.public_key(), Some(network().constants().me()));
 
-        gate_edit(&wallet, &required, &network())
+        gate_edit(&wallet, &store, &spends_of(&store), &required, &network())
             .expect("an edit's own bound requirement is signed");
     }
 
@@ -444,10 +582,11 @@ mod tests {
     #[test]
     fn an_unsafe_unbound_signature_requirement_is_refused() {
         let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
         // AGG_SIG_UNSAFE is exactly the absence of a domain string.
         let required = requirement(wallet.public_key(), None);
 
-        let error = gate_edit(&wallet, &required, &network())
+        let error = gate_edit(&wallet, &store, &spends_of(&store), &required, &network())
             .expect_err("an edit never signs an unbound message");
         assert!(error.to_string().contains("AGG_SIG_ME"), "{error}");
     }
@@ -457,9 +596,10 @@ mod tests {
     #[test]
     fn a_requirement_bound_to_another_network_is_refused() {
         let wallet = wallet();
+        let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
         let required = requirement(wallet.public_key(), Some(Bytes32::new([0x11; 32])));
 
-        let error = gate_edit(&wallet, &required, &network())
+        let error = gate_edit(&wallet, &store, &spends_of(&store), &required, &network())
             .expect_err("an edit signs only for the network it is committing on");
         assert!(error.to_string().contains("AGG_SIG_ME"), "{error}");
     }
@@ -469,9 +609,10 @@ mod tests {
     #[test]
     fn a_signature_under_another_key_is_refused() {
         let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
+        let store = hydrated_store(wallet().puzzle_hash(), LAUNCHER_ID, Vec::new());
         let required = requirement(stranger.public_key(), Some(network().constants().me()));
 
-        let error = gate_edit(&wallet(), &required, &network())
+        let error = gate_edit(&wallet(), &store, &spends_of(&store), &required, &network())
             .expect_err("only this profile's own key signs");
         assert!(
             error.to_string().contains("this profile does not hold"),
