@@ -456,7 +456,8 @@ mod tests {
         let wallet = wallet();
         let store = hydrated_store(wallet.puzzle_hash(), LAUNCHER_ID, Vec::new());
 
-        gate_store_identity(&wallet, LAUNCHER_ID, &store).expect("the profile's own store is edited");
+        gate_store_identity(&wallet, LAUNCHER_ID, &store)
+            .expect("the profile's own store is edited");
     }
 
     /// A store owned by a puzzle hash this profile does not hold is REFUSED. The singleton would be
