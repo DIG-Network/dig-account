@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-08-16
+
+### Features
+- **edit:** Profile-edit seam — read SMT slots, commit a set/remove batch (#20)
+
 ## [0.14.0] - 2026-08-14
 
 ### Bug Fixes
