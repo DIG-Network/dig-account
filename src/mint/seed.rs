@@ -35,7 +35,7 @@
 //! [`ProfileSeed`] is the boundary that stops that: slots go in, and the only thing that comes out
 //! is a plain `[u8; 32]` root, which belongs to no chia family at all.
 
-use dig_social_profile::{Profile as SchemaProfile, SlotId, Value};
+use dig_social_profile::{Profile as SchemaProfile, SlotId, Value, VerifiedBody};
 
 use crate::mint::error::{MintError, MintResult};
 
@@ -99,9 +99,36 @@ impl ProfileSeed {
     /// pushed on this path: the root is computed before any spend is built, so a seed that cannot be
     /// committed costs the user nothing.
     pub fn root(&self) -> MintResult<[u8; 32]> {
-        self.0
-            .build_root()
-            .map_err(|e| MintError::Build(format!("profile seed root: {e}")))
+        Ok(self.body()?.root())
+    }
+
+    /// The canonical DPB body bytes these slots commit to — the artifact a freshly minted profile
+    /// must be readable FROM.
+    ///
+    /// # Why the mint hands back bytes instead of returning them from the mint call
+    ///
+    /// The store launch writes a root; the body that root commits to lives off chain, and until
+    /// someone holds it a minted profile cannot be read and its FIRST edit has nothing to read. The
+    /// seed is a pure, deterministic function of its slots, and the caller already owns the seed it
+    /// minted with — so the body is rebuilt from it here rather than threaded back out through the
+    /// mint's status types. That keeps the mint's return shape unchanged, works identically for a
+    /// mint RESUMED after a restart (`SPEC.md` §2.4.3, which rebuilds the same commitment from the
+    /// same seed), and — like [`root`](Self::root) — lets nothing but plain bytes cross this API.
+    ///
+    /// [`root`](Self::root) is defined in terms of this, so the two can never disagree about what
+    /// the seed commits to.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::Build`] if the slots cannot be encoded as a body. Nothing is signed or pushed.
+    pub fn body_bytes(&self) -> MintResult<Vec<u8>> {
+        Ok(self.body()?.as_bytes().to_vec())
+    }
+
+    /// The verified body. Private: `VerifiedBody` is a dependency type.
+    fn body(&self) -> MintResult<VerifiedBody> {
+        VerifiedBody::from_profile(&self.0)
+            .map_err(|e| MintError::Build(format!("profile seed body: {e}")))
     }
 }
 
@@ -142,6 +169,36 @@ mod tests {
 
         assert_ne!(ada.root().unwrap(), grace.root().unwrap());
         assert_ne!(ada.root().unwrap(), empty.root().unwrap());
+    }
+
+    /// The bytes and the root are two views of ONE commitment: the body a caller persists must be
+    /// the preimage of the root the store launch writes, or a minted profile is unreadable. Checked
+    /// through the format's own reader, which is the acceptance a consumer will apply.
+    #[test]
+    fn the_seed_body_is_the_preimage_of_the_root_the_mint_commits() {
+        let seed = ProfileSeed::new()
+            .with_display_name("ada")
+            .with_bio("counts things");
+
+        let bytes = seed.body_bytes().unwrap();
+        let reopened = dig_social_profile::VerifiedBody::open(
+            &bytes,
+            dig_social_profile::AnchoredRoot::from_chain_read(seed.root().unwrap()),
+        )
+        .expect("the seed's own bytes verify against the root the mint commits");
+
+        assert_eq!(reopened.root(), seed.root().unwrap());
+        assert_eq!(reopened.profile().display_name(), Some("ada"));
+    }
+
+    /// A body rebuilt from an equal seed is byte-identical, which is what makes the mint RESUME
+    /// path sound: it reconstructs the artifact rather than having journalled it.
+    #[test]
+    fn an_equal_seed_rebuilds_byte_identical_bytes() {
+        let one = ProfileSeed::new().with_display_name("ada").with_bio("hi");
+        let rebuilt = ProfileSeed::new().with_bio("hi").with_display_name("ada");
+
+        assert_eq!(one.body_bytes().unwrap(), rebuilt.body_bytes().unwrap());
     }
 
     /// The schema stamp is part of the seed, so an empty profile is not the empty tree. A host that

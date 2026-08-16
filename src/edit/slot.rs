@@ -8,7 +8,7 @@
 //! slot-id newtype". This is that newtype, introduced at the moment the edit seam would otherwise
 //! have added a tenth leak.
 //!
-//! It is deliberately a CLOSED enum over the eight standard person-facing slots rather than an open
+//! It is deliberately a CLOSED enum over the ten standard person-facing slots rather than an open
 //! `u16` wrapper. The edit seam's scope is the named standard slots (dig_ecosystem#3000); custom and
 //! ecosystem-extension slots are out of it, and an open newtype would have promised them.
 
@@ -37,6 +37,15 @@ pub enum ProfileSlot {
     Links,
     /// The XCH receive address strangers can tip (slot `0x0008`).
     XchAddress,
+    /// An RFC 2397 data URL carrying the avatar image INLINE (slot `0x0020`).
+    ///
+    /// Distinct from [`Avatar`](Self::Avatar), which is a `dig://` REFERENCE to an image stored
+    /// elsewhere. The inline bytes ride in the profile body, so they are committed to by the same
+    /// root as every other slot and need no second fetch — which is what lets an editor show an
+    /// avatar the instant the body is read.
+    AvatarImage,
+    /// An RFC 2397 data URL carrying the banner image INLINE (slot `0x0021`).
+    BannerImage,
 }
 
 /// Ordered by SCHEMA ID, not by declaration position.
@@ -59,7 +68,7 @@ impl PartialOrd for ProfileSlot {
 impl ProfileSlot {
     /// Every standard slot, in schema order. The canonical iteration order for a UI that renders
     /// "all fields", so two surfaces cannot disagree about which fields exist.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::DisplayName,
         Self::Bio,
         Self::Avatar,
@@ -68,6 +77,8 @@ impl ProfileSlot {
         Self::Location,
         Self::Links,
         Self::XchAddress,
+        Self::AvatarImage,
+        Self::BannerImage,
     ];
 
     /// The slot's numeric id in the on-chain schema — the stable wire identity a host may log,
@@ -100,6 +111,8 @@ impl ProfileSlot {
             Self::Location => "location",
             Self::Links => "links",
             Self::XchAddress => "xch_address",
+            Self::AvatarImage => "avatar_image",
+            Self::BannerImage => "banner_image",
         }
     }
 
@@ -114,6 +127,8 @@ impl ProfileSlot {
             Self::Location => standard::LOCATION,
             Self::Links => standard::LINKS,
             Self::XchAddress => standard::XCH_ADDRESS,
+            Self::AvatarImage => standard::AVATAR_INLINE,
+            Self::BannerImage => standard::BANNER_INLINE,
         }
     }
 }
@@ -135,6 +150,8 @@ mod tests {
         assert_eq!(ProfileSlot::Location.id(), standard::LOCATION.0);
         assert_eq!(ProfileSlot::Links.id(), standard::LINKS.0);
         assert_eq!(ProfileSlot::XchAddress.id(), standard::XCH_ADDRESS.0);
+        assert_eq!(ProfileSlot::AvatarImage.id(), standard::AVATAR_INLINE.0);
+        assert_eq!(ProfileSlot::BannerImage.id(), standard::BANNER_INLINE.0);
     }
 
     #[test]

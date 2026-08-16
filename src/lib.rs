@@ -68,8 +68,8 @@ pub use chain_confirm::{
 };
 pub use constants::MAINNET_ADDRESS_PREFIX;
 pub use edit::{
-    read_profile, EditError, EditResult, EditStatus, ProfileContentSource, ProfileEdit,
-    ProfileEditor, ProfileFields, ProfileSlot, ProfileSnapshot,
+    read_profile, CommittedEdit, EditError, EditResult, EditStatus, ProfileContentSource,
+    ProfileEdit, ProfileEditor, ProfileFields, ProfileSlot, ProfileSnapshot,
 };
 pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};

@@ -30,7 +30,7 @@ use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use dig_chainsource_interface::ChainSource;
 use dig_merkle::{required_signatures, DataStore, DigDataStoreMetadata, Owner, RequiredSignature};
 use dig_social_profile::slot::standard::SCHEMA_VERSION;
-use dig_social_profile::SlotEdit;
+use dig_social_profile::{SlotEdit, VerifiedBody};
 
 use crate::id::ProfileIx;
 use crate::keys::wallet_key::WalletKey;
@@ -74,6 +74,51 @@ impl EditStatus {
             Self::Confirmed { root } => Some(*root),
             Self::Pushed { .. } => None,
         }
+    }
+}
+
+/// A committed edit: where it stands, and the body bytes the new root commits to.
+///
+/// # Why the bytes come back
+///
+/// A root is a commitment to a body, and a commitment nobody holds the preimage of is useless. The
+/// spend anchors `new_root`; these are the bytes that hash to it — the artifact the caller persists,
+/// serves to a [`ProfileContentSource`], and reads its own profile back from. An edit that returned
+/// only a status would leave the profile committed to content that no longer exists anywhere.
+///
+/// The bytes are plain `Vec<u8>` in the canonical DPB encoding, so no dependency type crosses this
+/// API — the boundary [`ProfileSeed`](crate::mint::seed::ProfileSeed) draws, in the write direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedEdit {
+    status: EditStatus,
+    body: Vec<u8>,
+}
+
+impl CommittedEdit {
+    /// Where the edit stands: pushed (a prediction) or confirmed (proven on chain).
+    pub fn status(&self) -> &EditStatus {
+        &self.status
+    }
+
+    /// The canonical DPB body bytes the edit's root commits to.
+    pub fn body_bytes(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// The root those bytes commit to, whether the edit is pushed or already confirmed.
+    ///
+    /// Distinct from [`EditStatus::confirmed_root`], which is deliberately `None` for a push: this
+    /// answers "which root do these bytes belong to", never "which root is on chain".
+    pub fn root(&self) -> [u8; 32] {
+        match self.status {
+            EditStatus::Pushed { new_root } => new_root,
+            EditStatus::Confirmed { root } => root,
+        }
+    }
+
+    /// Consume it into its two halves.
+    pub fn into_parts(self) -> (EditStatus, Vec<u8>) {
+        (self.status, self.body)
     }
 }
 
@@ -126,6 +171,10 @@ impl ProfileEditor {
 
     /// Apply `edit` to the profile at `anchor`: read, build, sign, push.
     ///
+    /// Returns a [`CommittedEdit`] — the status AND the body bytes the new root commits to. The
+    /// caller MUST persist those bytes (and serve them from its [`ProfileContentSource`]), or the
+    /// profile ends up committed to content nobody holds.
+    ///
     /// Reads the chain and the profile's body FIRST, so the new root is computed over the profile's
     /// WHOLE published content — every slot, including those this seam does not name — rather than
     /// over the eight standard fields, which would silently drop the rest.
@@ -161,7 +210,7 @@ impl ProfileEditor {
         content: &S,
         publisher: &P,
         network: &MintNetwork,
-    ) -> EditResult<EditStatus>
+    ) -> EditResult<CommittedEdit>
     where
         C: ChainSource + ?Sized,
         S: ProfileContentSource + ?Sized,
@@ -177,18 +226,23 @@ impl ProfileEditor {
         let wallet = self.live_wallet_key(ix)?;
         let snapshot = read_profile(anchor, chain, content)?;
 
-        // The advanced root, computed by the SCHEMA crate over the whole verified body. Computed
-        // before anything is built, so an edit that cannot be encoded costs the user nothing.
+        // The advanced body and the root it commits to, both computed by the SCHEMA crate over the
+        // whole verified body. Computed before anything is built, so an edit that cannot be encoded
+        // — including an inline image over the format's size bounds — costs the user nothing.
         let mut next = snapshot.content().clone();
         next.apply_all(edit.slot_edits());
-        let new_root = next
-            .build_root()
-            .map_err(|e| EditError::Format(format!("edited profile root: {e}")))?;
+        let next_body = VerifiedBody::from_profile(&next)
+            .map_err(|e| EditError::Format(format!("edited profile body: {e}")))?;
+        let new_root = next_body.root();
+        let body = next_body.as_bytes().to_vec();
 
         // Already there: a previous attempt landed, or another surface committed the same content.
         // Returning here is what makes a retry after an unanswered push safe.
         if new_root == snapshot.root() {
-            return Ok(EditStatus::Confirmed { root: new_root });
+            return Ok(CommittedEdit {
+                status: EditStatus::Confirmed { root: new_root },
+                body,
+            });
         }
 
         let bundle = self.build_and_sign_update(anchor, &wallet, new_root, chain, network)?;
@@ -197,9 +251,10 @@ impl ProfileEditor {
             .push(&bundle)
             .map_err(|e| EditError::ChainUnreachable(e.to_string()))?
         {
-            PushOutcome::Accepted | PushOutcome::AlreadyInMempool => {
-                Ok(EditStatus::Pushed { new_root })
-            }
+            PushOutcome::Accepted | PushOutcome::AlreadyInMempool => Ok(CommittedEdit {
+                status: EditStatus::Pushed { new_root },
+                body,
+            }),
             PushOutcome::Rejected { reason } => Err(EditError::Rejected(reason)),
         }
     }

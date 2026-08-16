@@ -22,7 +22,9 @@ use dig_account::{
 };
 use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_merkle::DigDataStoreMetadata;
-use dig_social_profile::{slot::standard, Profile as SchemaProfile, Value};
+use dig_social_profile::{
+    slot::standard, AnchoredRoot, Profile as SchemaProfile, Value, VerifiedBody,
+};
 
 mod common;
 
@@ -179,7 +181,7 @@ fn a_set_and_remove_batch_commits_the_independently_computed_root() -> anyhow::R
     // The edit must actually MOVE the root, or every assertion below would hold for a no-op.
     assert_ne!(expected_root, seeded_profile().root()?);
 
-    let status = editor.commit_edit(
+    let committed = editor.commit_edit(
         ProfileIx::ROOT,
         &anchor,
         &the_edit(),
@@ -190,14 +192,14 @@ fn a_set_and_remove_batch_commits_the_independently_computed_root() -> anyhow::R
     )?;
 
     assert_eq!(
-        status,
-        EditStatus::Pushed {
+        committed.status(),
+        &EditStatus::Pushed {
             new_root: expected_root
         },
         "an accepted push is PUSHED, never confirmed: the block has not been farmed yet"
     );
     assert_eq!(
-        status.confirmed_root(),
+        committed.status().confirmed_root(),
         None,
         "a pushed edit's root is a prediction, not evidence"
     );
@@ -211,6 +213,149 @@ fn a_set_and_remove_batch_commits_the_independently_computed_root() -> anyhow::R
             root: expected_root
         },
         "the store's tip anchors exactly the root the schema crate computed"
+    );
+    Ok(())
+}
+
+/// A host's own content store: it holds the DPB body bytes it was handed, and serves the slots in
+/// them — which is exactly what dig-app does with the bytes a mint seeds and an edit returns.
+///
+/// It holds BYTES, not slots, deliberately. A double that stashed the pairs would keep working even
+/// if `commit_edit` returned bytes that did not decode, which is the failure this whole ticket is
+/// about.
+struct HostStore(std::cell::RefCell<Vec<u8>>);
+
+impl HostStore {
+    fn holding(body: Vec<u8>) -> Self {
+        Self(std::cell::RefCell::new(body))
+    }
+
+    fn persist(&self, body: &[u8]) {
+        *self.0.borrow_mut() = body.to_vec();
+    }
+}
+
+impl ProfileContentSource for HostStore {
+    type Error = String;
+
+    fn fetch_profile_slots(
+        &self,
+        _store_launcher_id: chia_protocol::Bytes32,
+        root: [u8; 32],
+    ) -> Result<Vec<(u16, Vec<u8>)>, Self::Error> {
+        let held = self.0.borrow();
+        let body = VerifiedBody::open(&held, AnchoredRoot::from_chain_read(root))
+            .map_err(|e| format!("the host holds no body under this root: {e}"))?;
+        Ok(body
+            .profile()
+            .iter()
+            .map(|(slot, value)| (slot.0, value.encode()))
+            .collect())
+    }
+}
+
+/// **THE ROUND TRIP: mint a profile, read its body back, edit it, read the edited body back.**
+///
+/// This is the property the DPB adoption exists to create, and every step of it was impossible
+/// before: the mint discarded its seed body, so a fresh profile had no readable content and a first
+/// edit had nothing to read; `commit_edit` discarded the body it committed a root to, so after an
+/// edit nobody held the preimage of what the chain now anchored.
+///
+/// The host here is a real store of BYTES, so each read is served from the artifact the previous
+/// step handed back — never from a fixture written by this test. A wrong or undecodable body cannot
+/// be papered over by the assertions, because the next read simply fails.
+#[test]
+fn a_minted_profile_round_trips_through_an_edit_and_back() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let editor = account.profile_editor();
+
+    // 1. The mint's own seed body — rebuilt deterministically from the seed the profile was minted
+    //    with, which is the only thing that makes a freshly minted profile readable at all.
+    let host = HostStore::holding(seeded_profile().body_bytes()?);
+
+    // 2. Read it back. The read verifies these bytes against the root the CHAIN anchored, so this
+    //    passing is the statement that the seed body is the preimage of the minted root.
+    let minted = dig_account::read_profile(&anchor, &chain, &host)?;
+    assert_eq!(minted.root(), seeded_profile().root()?);
+    assert_eq!(minted.body_bytes(), seeded_profile().body_bytes()?);
+    assert_eq!(minted.fields().display_name(), Some("ada"));
+    assert_eq!(minted.fields().avatar_image(), None);
+
+    // 3. Edit it, and persist the bytes the edit says its root commits to.
+    let expected_root = schema_profile_after_the_edit().build_root()?;
+    let committed = editor.commit_edit(
+        ProfileIx::ROOT,
+        &anchor,
+        &the_edit(),
+        &chain,
+        &host,
+        &chain,
+        &simulator_network(),
+    )?;
+    assert_eq!(committed.root(), expected_root);
+    assert_ne!(
+        committed.body_bytes(),
+        minted.body_bytes(),
+        "an edit that returned the body it READ would satisfy every root assertion below"
+    );
+    host.persist(committed.body_bytes());
+    chain.farm()?;
+
+    // 4. Read the EDITED body back, verified against the root now on chain. The bytes the edit
+    //    returned are the only thing the host holds, so this read can only pass if they are the
+    //    preimage of the root the spend anchored.
+    let edited = dig_account::read_profile(&anchor, &chain, &host)?;
+    assert_eq!(edited.root(), expected_root);
+    assert_eq!(edited.body_bytes(), committed.body_bytes());
+    assert_eq!(edited.fields().bio(), Some("writes notes"));
+    assert_eq!(edited.fields().xch_address(), Some("xch1tip"));
+    assert_eq!(
+        edited.fields().get(ProfileSlot::Location),
+        None,
+        "a removal is a real deletion, and the round trip must show it gone"
+    );
+
+    // 5. A second lap, carrying an INLINE avatar image: the slot that makes a profile editor able to
+    //    show a picture without a second fetch, proven through the same read-it-back discipline.
+    const AVATAR: &str = "data:image/png;base64,iVBORw0KGgo=";
+    let with_image = editor.commit_edit(
+        ProfileIx::ROOT,
+        &anchor,
+        &ProfileEdit::new().set_avatar_image(AVATAR),
+        &chain,
+        &host,
+        &chain,
+        &simulator_network(),
+    )?;
+    host.persist(with_image.body_bytes());
+    chain.farm()?;
+
+    let with_avatar = dig_account::read_profile(&anchor, &chain, &host)?;
+    assert_eq!(with_avatar.fields().avatar_image(), Some(AVATAR));
+    assert_eq!(
+        with_avatar.fields().bio(),
+        Some("writes notes"),
+        "an edit advances the whole body; it must not drop the slots it did not name"
+    );
+
+    // 6. And clearing it is a real deletion, read back the same way.
+    let cleared = editor.commit_edit(
+        ProfileIx::ROOT,
+        &anchor,
+        &ProfileEdit::new().clear_avatar_image(),
+        &chain,
+        &host,
+        &chain,
+        &simulator_network(),
+    )?;
+    host.persist(cleared.body_bytes());
+    chain.farm()?;
+
+    assert_eq!(
+        dig_account::read_profile(&anchor, &chain, &host)?
+            .fields()
+            .avatar_image(),
+        None
     );
     Ok(())
 }
@@ -317,7 +462,7 @@ fn a_rejected_push_leaves_the_recorded_root_unchanged() -> anyhow::Result<()> {
 
     // The rejection is recoverable: with the mempool answering again, the same batch commits.
     chain.stop_rejecting();
-    let status = editor.commit_edit(
+    let recovered = editor.commit_edit(
         ProfileIx::ROOT,
         &anchor,
         &the_edit(),
@@ -327,8 +472,8 @@ fn a_rejected_push_leaves_the_recorded_root_unchanged() -> anyhow::Result<()> {
         &simulator_network(),
     )?;
     assert_eq!(
-        status,
-        EditStatus::Pushed {
+        recovered.status(),
+        &EditStatus::Pushed {
             new_root: would_be_root
         },
         "a rejection is a fact about one push, not a dead profile"
@@ -381,16 +526,18 @@ fn an_unanswered_push_reports_an_unknown_fate() -> anyhow::Result<()> {
     // Retrying is safe and is the documented recovery: the driver re-reads chain first.
     chain.resume_delivering_pushes();
     assert_eq!(
-        editor.commit_edit(
-            ProfileIx::ROOT,
-            &anchor,
-            &the_edit(),
-            &chain,
-            &SeededContent,
-            &chain,
-            &simulator_network(),
-        )?,
-        EditStatus::Pushed {
+        editor
+            .commit_edit(
+                ProfileIx::ROOT,
+                &anchor,
+                &the_edit(),
+                &chain,
+                &SeededContent,
+                &chain,
+                &simulator_network(),
+            )?
+            .status(),
+        &EditStatus::Pushed {
             new_root: would_be_root
         }
     );

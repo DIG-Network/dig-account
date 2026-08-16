@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1573,9 +1573,9 @@ dependencies = [
 
 [[package]]
 name = "dig-social-profile"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "602669a449a6b36a5565901640d17084ce7af327062adf8217e978f347da2a73"
+checksum = "80244160b8e00e8c3362773e3b0f5732de527aef4d361470f10d17fd50a09588"
 dependencies = [
  "chia-protocol",
  "chia-sdk-utils",
@@ -1583,6 +1583,7 @@ dependencies = [
  "dig-identity 0.7.0",
  "dig-smt",
  "dig-store",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
 ]
 
