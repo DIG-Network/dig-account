@@ -47,6 +47,21 @@ impl ProfileFields {
         self.get(ProfileSlot::XchAddress)
     }
 
+    /// The avatar image as an RFC 2397 data URL, if the profile publishes one inline.
+    ///
+    /// Distinct from the `dig://` reference at [`ProfileSlot::Avatar`]: this is the image itself,
+    /// committed to by the same root as every other slot, so a pane can render it with no second
+    /// fetch. Returned verbatim and UNVALIDATED — a value that is not a renderable data URL is
+    /// inert, and it is the rendering surface's job to refuse it.
+    pub fn avatar_image(&self) -> Option<&str> {
+        self.get(ProfileSlot::AvatarImage)
+    }
+
+    /// The banner image as an RFC 2397 data URL, if published inline. See [`Self::avatar_image`].
+    pub fn banner_image(&self) -> Option<&str> {
+        self.get(ProfileSlot::BannerImage)
+    }
+
     /// Every published slot and its text, in schema-id order.
     pub fn iter(&self) -> impl Iterator<Item = (ProfileSlot, &str)> {
         self.0.iter().map(|(slot, text)| (*slot, text.as_str()))

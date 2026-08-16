@@ -1276,9 +1276,9 @@ the journal and pushes a SECOND bundle that can land alongside the first.
 
 Server-controlled text MUST be length-bounded before it reaches an error message.
 
-## 6C. The profile-edit seam (read, stage, commit)
+## 6D. The profile-edit seam (read, stage, commit)
 
-### 6C.1 Shape (normative)
+### 6D.1 Shape (normative)
 
 A profile that has been minted publishes a sparse merkle tree of SLOTS; editing it advances that tree's
 root by recreating the profile's dig-store singleton. The crate exposes this as three separable steps, and
@@ -1288,24 +1288,38 @@ they MUST stay separable: a host renders a form, previews the result offline, an
 * `ProfileEdit` — a set-and-remove batch, built offline, committing nothing.
 * `UnlockedAccount::profile_editor() -> ProfileEditor`, whose `commit_edit` builds, signs and pushes.
 
-The public vocabulary of this seam is the crate's OWN. `ProfileSlot` is a closed enum over the eight
+The public vocabulary of this seam is the crate's OWN. `ProfileSlot` is a closed enum over the ten
 standard person-facing slots (display name `0x0001`, bio `0x0002`, avatar `0x0003`, banner `0x0004`,
-pronouns `0x0005`, location `0x0006`, links `0x0007`, XCH address `0x0008`); values cross the boundary as
-`String`; roots cross it as `[u8; 32]`. No `dig-social-profile` type appears in this seam's public API
+pronouns `0x0005`, location `0x0006`, links `0x0007`, XCH address `0x0008`, inline avatar image `0x0020`,
+inline banner image `0x0021`); values cross the boundary as `String`; roots cross it as `[u8; 32]`; bodies
+cross it as `Vec<u8>`. No `dig-social-profile` type appears in this seam's public API
 (§10). Slot encoding, tree building and root computation are consumed from that crate and MUST NOT be
 re-implemented here — they are a byte contract with golden vectors.
 
-Custom slots, ecosystem-extension slots, encrypted slots, image upload, and batching across profiles are
-out of scope. A slot outside the standard set is PRESERVED untouched through an edit — it is part of the
+The two inline image slots carry an RFC 2397 data URL (`ProfileEdit::set_avatar_image` /
+`clear_avatar_image` and the banner pair; `ProfileFields::avatar_image` / `banner_image` read them). They
+are UTF-8 text slots like every other, so the image is committed to by the SAME root as the rest of the
+body and needs no second fetch; a value that is not a renderable data URL is inert, and the rendering
+surface MUST refuse it. The body format's size bounds apply, so an oversized image is refused at commit
+time rather than pushed on chain.
+
+Custom slots, ecosystem-extension slots, encrypted slots, image UPLOAD to external storage, and batching
+across profiles are out of scope. A slot outside the standard set is PRESERVED untouched through an edit — it is part of the
 body the new root is computed over — but it cannot be named, set or removed through this seam.
 
-### 6C.2 The read is bound to chain (normative)
+### 6D.2 The read is bound to chain (normative)
 
 A store commits a root on chain; the slot values that hash to it live off chain. `ProfileContentSource` is
 the host-supplied reader for that body, and it is UNTRUSTED: `read_profile` resolves the store's CURRENT
 root by walking the store singleton's lineage from its launcher to its tip and re-parsing the tip's
 creating spend, then re-hashes whatever the content source returned and REFUSES anything that does not
-equal that root (`EditError::StaleOrTamperedContent`). A coin MUST NOT be accepted as the store because its
+equal that root (`EditError::StaleOrTamperedContent`).
+
+The body is accepted by exactly ONE rule set — `dig-social-profile`'s DPB acceptance
+(`VerifiedBody::from_pairs`) — which is the same rule set the bytes this crate WRITES must satisfy. This
+crate MUST NOT carry a second acceptance check: a reader and a writer that could disagree about which
+bodies are well-formed is a differential. `ProfileSnapshot::body_bytes()` returns the canonical DPB bytes
+the chain's root commits to. A coin MUST NOT be accepted as the store because its
 puzzle hash matches — that value is attacker-chosen.
 
 A source that cannot answer is `EditError::ContentUnavailable`, never an empty profile. A published slot
@@ -1313,7 +1327,7 @@ holding a non-text value, and a slot this seam does not name, are omitted from `
 stringified. An absent slot and a slot published as `""` are DISTINCT: `ProfileFields::get` returns `None`
 for the first and `Some("")` for the second.
 
-### 6C.3 The edit batch (normative)
+### 6D.3 The edit batch (normative)
 
 `ProfileEdit` describes the profile's NEXT STATE, not a keystroke log: at most one change survives per
 slot, and it is the last one applied. `remove` is a real deletion — the advanced root is the root the
@@ -1325,7 +1339,7 @@ signed, or pushed: committing it would pay to re-commit the root the store alrea
 `SCHEMA_VERSION` MUST be refused; `ProfileSlot` cannot express it, and the commit boundary asserts it
 regardless.
 
-### 6C.4 Commit status: pushed is not confirmed (normative)
+### 6D.4 Commit status: pushed is not confirmed (normative)
 
 `EditStatus` has NO variant meaning "done" on the strength of a push. An accepted push (including
 `AlreadyInMempool`) yields `EditStatus::Pushed { new_root }`, where `new_root` is a PREDICTION;
@@ -1337,11 +1351,21 @@ The two failure answers MUST NOT be collapsed. A mempool that DECLINED has answe
 the outcome is known, and the store's committed root is unchanged. A chain that could not be asked leaves
 the outcome UNKNOWN — `EditError::ChainUnreachable` — and the bundle may still confirm.
 
+`commit_edit` returns a `CommittedEdit`: the `EditStatus` AND the canonical DPB body bytes the new root
+commits to. Returning the status alone is NOT sufficient — the spend anchors a commitment whose preimage
+would otherwise exist nowhere, leaving the profile unreadable and its next edit with nothing to read. The
+caller MUST persist those bytes and serve them from its `ProfileContentSource`. The bytes are returned on
+the already-confirmed path too, so a retry yields the artifact rather than only a verdict.
+
+The MINT path has the same obligation, and satisfies it deterministically: `ProfileSeed::body_bytes()`
+rebuilds the seed body the store launch's root commits to, from the seed the caller already holds.
+`ProfileSeed::root()` is defined in terms of it, so the root and the body can never disagree.
+
 `commit_edit` is safe to call again on either. It reads chain FIRST, and when the profile's current root
 already equals the root the batch would commit it returns `Confirmed` without building or pushing anything.
 So a retry after an unanswered push re-reads rather than re-spends.
 
-### 6C.5 The signing gate (normative)
+### 6D.5 The signing gate (normative)
 
 The store's metadata is replaced WHOLESALE by the update spend, so every other field — label, description,
 size bucket, program hash — MUST be carried forward and only the root advanced.

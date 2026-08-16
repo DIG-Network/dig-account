@@ -81,6 +81,39 @@ impl ProfileEdit {
         self.set(ProfileSlot::XchAddress, address)
     }
 
+    /// Publish `data_url` as the avatar image, INLINE in the profile body (slot `0x0020`).
+    ///
+    /// `data_url` is an RFC 2397 data URL (`data:image/png;base64,...`). It rides in the body the
+    /// new root commits to, so the image is anchored by the same root as every other slot and a
+    /// reader needs no second fetch to render it.
+    ///
+    /// Not validated here, for [`Self::with_xch_address`]'s reason: an unrenderable value is inert.
+    /// It is bounded, though — the body format refuses a slot over 1.4 MB and a body over 4 MiB, so
+    /// an oversized image is refused at commit time with [`EditError::Format`](super::EditError::Format)
+    /// rather than being pushed on chain.
+    #[must_use]
+    pub fn set_avatar_image(self, data_url: impl Into<String>) -> Self {
+        self.set(ProfileSlot::AvatarImage, data_url)
+    }
+
+    /// Stop publishing the inline avatar image — a real deletion, exactly as [`Self::remove`].
+    #[must_use]
+    pub fn clear_avatar_image(self) -> Self {
+        self.remove(ProfileSlot::AvatarImage)
+    }
+
+    /// Publish `data_url` as the banner image, INLINE (slot `0x0021`). See [`Self::set_avatar_image`].
+    #[must_use]
+    pub fn set_banner_image(self, data_url: impl Into<String>) -> Self {
+        self.set(ProfileSlot::BannerImage, data_url)
+    }
+
+    /// Stop publishing the inline banner image.
+    #[must_use]
+    pub fn clear_banner_image(self) -> Self {
+        self.remove(ProfileSlot::BannerImage)
+    }
+
     /// Whether this batch changes nothing.
     ///
     /// [`ProfileEditor`](super::ProfileEditor) refuses an empty batch rather than pushing a spend

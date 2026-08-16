@@ -11,7 +11,7 @@
 
 use dig_chainsource_interface::ChainSource;
 use dig_merkle::{DataStore, DigDataStoreMetadata};
-use dig_social_profile::{Profile as SchemaProfile, Value};
+use dig_social_profile::{Profile as SchemaProfile, SlotId, Value, VerifiedBody};
 
 use crate::registry::ProfileAnchor;
 
@@ -36,8 +36,8 @@ use super::slot::ProfileSlot;
 pub struct ProfileSnapshot {
     /// The store's current on-chain committed root, read from chain (never from the content source).
     root: [u8; 32],
-    /// The full published body, verified to hash to `root`.
-    content: SchemaProfile,
+    /// The full published body, verified to hash to `root`, together with its canonical DPB bytes.
+    body: VerifiedBody,
     /// The standard slots of `content`, projected into this crate's vocabulary.
     fields: ProfileFields,
 }
@@ -53,9 +53,17 @@ impl ProfileSnapshot {
         &self.fields
     }
 
+    /// The canonical DPB body bytes the chain's root commits to.
+    ///
+    /// This is the artifact a host persists or serves: the exact bytes that hash to
+    /// [`root`](Self::root). Plain bytes, so no dependency type crosses this API.
+    pub fn body_bytes(&self) -> &[u8] {
+        self.body.as_bytes()
+    }
+
     /// The verified body, for building an edit on top of it. Crate-private: it is a dependency type.
     pub(crate) fn content(&self) -> &SchemaProfile {
-        &self.content
+        self.body.profile()
     }
 }
 
@@ -87,18 +95,17 @@ where
         .fetch_profile_slots(anchor.store_launcher_id(), root)
         .map_err(|e| EditError::ContentUnavailable(e.to_string()))?;
 
-    let body = decode_profile(&slots)?;
-    let rebuilt = body
-        .build_root()
-        .map_err(|e| EditError::Format(format!("profile root: {e}")))?;
-    if rebuilt != root {
+    let body = assemble_body(&slots)?;
+    // The ONE thing the body format cannot know: which root the CHAIN says this store commits. The
+    // acceptance of the body itself already happened inside `VerifiedBody`; this binds it to chain.
+    if body.root() != root {
         return Err(EditError::StaleOrTamperedContent);
     }
 
     Ok(ProfileSnapshot {
         root,
-        fields: project_standard_slots(&body),
-        content: body,
+        fields: project_standard_slots(body.profile()),
+        body,
     })
 }
 
@@ -128,15 +135,22 @@ where
     dig_merkle::hydrate(&creating_spend).map_err(|e| EditError::Format(format!("store tip: {e}")))
 }
 
-/// Rebuild the schema body from the `(slot id, encoded value)` pairs the content source returned.
-fn decode_profile(slots: &[(u16, Vec<u8>)]) -> EditResult<SchemaProfile> {
-    let mut body = SchemaProfile::new();
+/// Assemble the DPB body from the `(slot id, encoded value)` pairs the content source returned.
+///
+/// The pairs are decoded and handed straight to [`VerifiedBody::from_pairs`], which applies the
+/// format's whole acceptance rule set — ascending unique slots, the slot/body size bounds,
+/// non-emptiness — and computes the root over them. Nothing is re-implemented here, so this seam
+/// cannot accept a body a DPB reader would refuse.
+fn assemble_body(slots: &[(u16, Vec<u8>)]) -> EditResult<VerifiedBody> {
+    let mut pairs = Vec::with_capacity(slots.len());
     for (id, encoded) in slots {
         let value = Value::decode(encoded)
             .map_err(|e| EditError::Format(format!("slot {id:#06x}: {e}")))?;
-        body.set(dig_social_profile::SlotId(*id), value);
+        pairs.push((SlotId(*id), value));
     }
-    Ok(body)
+    // `from_pairs` requires ascending, unique slots; a source is free to answer in any order.
+    pairs.sort_by_key(|(slot, _)| slot.0);
+    VerifiedBody::from_pairs(pairs).map_err(|e| EditError::Format(format!("profile body: {e}")))
 }
 
 /// Project the standard, person-facing slots of `body` into this crate's vocabulary.

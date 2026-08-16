@@ -4,8 +4,9 @@
 //!
 //! - [`read_profile`] returns what the profile publishes NOW, verified against chain.
 //! - [`ProfileEdit`] is a set-and-remove batch, built offline, committing nothing.
-//! - [`ProfileEditor::commit_edit`] turns one into a signed, pushed spend and reports
-//!   [`EditStatus`], which distinguishes a push from a confirmation.
+//! - [`ProfileEditor::commit_edit`] turns one into a signed, pushed spend and reports a
+//!   [`CommittedEdit`]: an [`EditStatus`], which distinguishes a push from a confirmation, and the
+//!   body bytes the new root commits to — the artifact the host persists and serves back.
 //!
 //! Splitting them is what lets a host render a form, preview the result, and only then spend. A
 //! single call that took a form and returned a profile would either block for minutes or claim a
@@ -40,7 +41,7 @@ mod read;
 mod slot;
 
 pub use batch::ProfileEdit;
-pub use commit::{EditStatus, ProfileEditor};
+pub use commit::{CommittedEdit, EditStatus, ProfileEditor};
 pub use content::ProfileContentSource;
 pub use error::{EditError, EditResult};
 pub use fields::ProfileFields;
