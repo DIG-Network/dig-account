@@ -94,9 +94,10 @@ impl MintNetwork {
 
     /// The `AGG_SIG_ME` constants this network signs under.
     ///
-    /// `pub(super)`: the store-launch half of a profile mint gates on the SAME domain, and reading
-    /// it from here is what stops the two halves drifting onto different constants.
-    pub(super) fn constants(&self) -> &AggSigConstants {
+    /// `pub(crate)`: the store-launch half of a profile mint AND the profile-edit seam
+    /// ([`crate::edit`]) both gate on the SAME domain, and reading it from here is what stops them
+    /// drifting onto different constants.
+    pub(crate) fn constants(&self) -> &AggSigConstants {
         &self.constants
     }
 }

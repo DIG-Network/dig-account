@@ -10,6 +10,7 @@ use std::sync::Arc;
 use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
 use zeroize::Zeroizing;
 
+use crate::edit::ProfileEditor;
 use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
@@ -134,6 +135,15 @@ impl UnlockedAccount {
     /// (`SPEC.md` §6A.2).
     pub fn profile_minter(&self) -> ProfileMinter {
         ProfileMinter::new(self.seed.clone(), self.residency.clone())
+    }
+
+    /// An editor for the profiles this account already owns.
+    ///
+    /// [`ProfileEditor`] observes this unlock's [`Residency`] for [`profile_minter`](Self::profile_minter)'s
+    /// reason: committing an edit recreates a store singleton on chain, so it stops the moment the
+    /// account relocks rather than at the next unlock check.
+    pub fn profile_editor(&self) -> ProfileEditor {
+        ProfileEditor::new(self.seed.clone(), self.residency.clone())
     }
 
     /// The per-profile data-encryption key (DEK) for profile `ix` — 32 bytes, derived from the seed

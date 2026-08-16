@@ -44,6 +44,7 @@
 pub mod auth;
 pub mod chain_confirm;
 pub mod constants;
+pub mod edit;
 pub mod error;
 pub mod id;
 pub mod keys;
@@ -66,6 +67,10 @@ pub use chain_confirm::{
     confirm_all_spendable_by_name, confirm_spendable_by_name, UnconfirmedInput,
 };
 pub use constants::MAINNET_ADDRESS_PREFIX;
+pub use edit::{
+    read_profile, EditError, EditResult, EditStatus, ProfileContentSource, ProfileEdit,
+    ProfileEditor, ProfileFields, ProfileSlot, ProfileSnapshot,
+};
 pub use error::{AccountError, Result};
 pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;

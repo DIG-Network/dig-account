@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -70,7 +70,7 @@ dig-merkle = "0.6"
 # `[u8; 32]` root (`ProfileSeed`), so no chia type crosses it. Nothing else from this crate may be
 # used — in particular NOT `IdentityProfile::mint_from_did`, which cannot mint a DID-rooted store
 # (see `mint::store_launch`).
-dig-social-profile = "0.4"
+dig-social-profile = "0.5"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.36.1"
 # The `serde` feature is required: coin ids and launcher ids are persisted in the profile
@@ -114,6 +114,10 @@ serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
 chia-sdk-test = "0.34"
+# The schema crate, in TESTS only: the edit seam's acceptance is that the root it commits equals the
+# one dig-social-profile computes from the same slots, and only a direct call can state that
+# independently of the wrapper under test.
+dig-social-profile = "0.5"
 # Test-only: the consensus ErrorCode enum, so the orphaned-secondary test can pin its refusal to
 # AssertCoinAnnouncementFailed specifically. A bare is_err() there would be satisfied by a signature
 # failure and would leave the input binding untested. Pinned to the version chia-sdk-test 0.34

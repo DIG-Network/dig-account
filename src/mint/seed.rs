@@ -17,6 +17,12 @@
 //! cannot construct an `AccountStore` at all without naming a `dig-session` trait and implementing
 //! it; that binds far harder than an error variant, which a caller can ignore.
 //!
+//! The narrowing has started: [`ProfileSlot`](crate::edit::ProfileSlot) is that owned slot-id newtype,
+//! and the profile-EDIT seam ([`crate::edit`]) names slots with it rather than adding a tenth leak.
+//! `with_utf8` keeps taking a `SlotId` because the slot ladder is open and a host adopting a
+//! newly-standardised slot must not wait for a release of this crate — so this site is a deliberate
+//! remainder, not an oversight.
+//!
 //! Together they are why a dependency bump on those crates is BREAKING for consumers, and why
 //! 0.13.0 is the correct release: for a `0.x` crate Cargo treats the minor position as the major, so
 //! 0.12 -> 0.13 IS the breaking bump. Widening this surface makes it worse; narrowing it (an owned
