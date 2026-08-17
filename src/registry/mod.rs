@@ -31,9 +31,9 @@ pub mod journal;
 pub mod registry;
 pub mod visibility;
 
-pub use active::{ActiveProfile, ActiveSwitch};
+pub use active::{ActiveProfile, ActiveSwitch, ProfileEndOutcome};
 pub use anchor::ProfileAnchor;
-pub use entry::ProfileEntry;
+pub use entry::{ProfileEnd, ProfileEntry};
 pub use journal::{
     ConfirmedStoreRecord, MintStage, MintedDidRecord, PendingMintRecord, PendingStoreLaunchRecord,
     ProfileMintInProgress,

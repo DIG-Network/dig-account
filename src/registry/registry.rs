@@ -3,9 +3,9 @@
 use crate::error::{AccountError, Result};
 use crate::id::ProfileIx;
 use crate::mint::{ConfirmedStore, MintedDid, MAX_MINT_FEE_MOJOS};
-use crate::registry::active::{ActiveProfile, ActiveSwitch};
+use crate::registry::active::{ActiveProfile, ActiveSwitch, ProfileEndOutcome};
 use crate::registry::anchor::ProfileAnchor;
-use crate::registry::entry::ProfileEntry;
+use crate::registry::entry::{ProfileEnd, ProfileEntry};
 use crate::registry::journal::{MintStage, ProfileMintInProgress};
 use crate::registry::visibility::ProfileVisibility;
 
@@ -97,9 +97,22 @@ impl ProfileRegistry {
         &self.entries
     }
 
-    /// The confirmed profiles a host should offer in its lists.
+    /// The confirmed profiles a host should offer in its lists: live AND not locally hidden.
+    ///
+    /// Liveness is checked here, not only visibility, because a host that listed an ended profile
+    /// would be asserting a fact about the chain that is false (dig_ecosystem#3067).
     pub fn shown(&self) -> impl Iterator<Item = &ProfileEntry> {
-        self.entries.iter().filter(|entry| entry.is_shown())
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_live() && entry.is_shown())
+    }
+
+    /// Every profile that still exists on chain, ordered by index.
+    ///
+    /// Distinct from [`entries`](Self::entries), which includes ended profiles so a host can still
+    /// render what the account used to be.
+    pub fn live(&self) -> impl Iterator<Item = &ProfileEntry> {
+        self.entries.iter().filter(|entry| entry.is_live())
     }
 
     /// The confirmed profile at `ix`, if any.
@@ -203,6 +216,9 @@ impl ProfileRegistry {
         let Some(entry) = self.entries.iter_mut().find(|entry| entry.ix() == ix) else {
             return Err(AccountError::ProfileNotFound(ix));
         };
+        if !entry.is_live() {
+            return Err(AccountError::ProfileEnded(ix));
+        }
         entry.set_visibility(ProfileVisibility::Shown);
 
         let switch = ActiveSwitch {
@@ -233,6 +249,46 @@ impl ProfileRegistry {
         self.entry_mut(ix).set_visibility(v);
         self.expect_valid();
         Ok(())
+    }
+
+    /// Record that `ix` ENDED on chain at `at_height` — both of its singletons melted, and the melts
+    /// confirmed by a chain read (dig_ecosystem#3067).
+    ///
+    /// The entry is kept and marked ended rather than deleted, so the account can still say what it
+    /// used to be. If `ix` was the ACTIVE profile the slot moves to the lowest-indexed remaining live
+    /// profile, or is cleared when none remains — which is the state an account whose ONLY profile was
+    /// deleted lands in, and the one the public surface previously had no way to express at all.
+    ///
+    /// Idempotent: recording an end on an already-ended profile changes nothing and returns `None`,
+    /// so a host retrying after a crash mid-ceremony cannot move the active slot a second time.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::ProfileNotFound`] if `ix` names no confirmed profile, and
+    /// [`AccountError::ProfileEndHeightZero`] if `at_height` is 0 — a height of 0 is what an
+    /// unconfirmed read looks like, and this record may only ever be written from a CONFIRMED melt.
+    pub fn record_melted(&mut self, ix: ProfileIx, at_height: u32) -> Result<ProfileEndOutcome> {
+        let end = ProfileEnd::at(at_height)?;
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.ix() == ix) else {
+            return Err(AccountError::ProfileNotFound(ix));
+        };
+        if !entry.is_live() {
+            return Ok(ProfileEndOutcome::AlreadyEnded);
+        }
+        entry.end(end);
+
+        if self.active != Some(ix) {
+            self.expect_valid();
+            return Ok(ProfileEndOutcome::Recorded);
+        }
+
+        let successor = self.live().next().map(ProfileEntry::ix);
+        self.active = successor;
+        self.expect_valid();
+        Ok(match successor {
+            Some(to) => ProfileEndOutcome::ActiveMoved(ActiveSwitch { from: Some(ix), to }),
+            None => ProfileEndOutcome::NoLiveProfileRemains,
+        })
     }
 
     /// Set (or clear, with `None`) the local label of `ix`.
@@ -422,17 +478,28 @@ impl ProfileRegistry {
             }
         }
 
-        match (self.active, self.entries.is_empty()) {
-            (None, false) => return Err("entries are present but no profile is active".to_string()),
+        // Invariant 2 is stated over the LIVE entries, not all of them: an account whose every
+        // profile has ended has nothing it could honestly point at, and inventing an active slot
+        // there would claim a profile the chain has retired is still in use (dig_ecosystem#3067).
+        match (self.active, self.live().next().is_none()) {
+            (None, false) => {
+                return Err("live entries are present but no profile is active".to_string())
+            }
             (Some(ix), true) => {
                 return Err(format!(
-                    "profile {ix} is active but the registry has no confirmed profile"
+                    "profile {ix} is active but the registry has no live profile"
                 ))
             }
             (Some(ix), false) => {
                 let Some(entry) = self.get(ix) else {
                     return Err(format!("the active index {ix} names no confirmed profile"));
                 };
+                if !entry.is_live() {
+                    return Err(format!(
+                        "the active profile {ix} has ended on chain, so every surface reading it \
+                         would assert a profile that no longer exists"
+                    ));
+                }
                 if !entry.is_shown() {
                     return Err(format!(
                         "the active profile {ix} is hidden, which would list nothing while the \
@@ -1160,5 +1227,217 @@ mod tests {
                 "with entries but no active index",
             );
         }
+    }
+}
+
+/// **A melted profile can be FORGOTTEN as live** (dig_ecosystem#3067).
+///
+/// Before this, `ProfileRegistry` could record and hide a profile but never end one, so after
+/// dig-app's delete control melted both singletons the registry kept listing a profile the chain had
+/// retired. The account whose ONLY profile was melted was the state with no remedy at all: it could
+/// not be hidden (it was active) and there was nothing to switch to.
+#[cfg(test)]
+mod ended_profile_tests {
+    use super::*;
+    use crate::mint::fixtures::bound_mint;
+
+    /// A registry holding confirmed profiles at each of `ixs`, the first of them active.
+    fn registry_with(ixs: &[u32]) -> ProfileRegistry {
+        let mut registry = ProfileRegistry::empty();
+        for (n, ix) in ixs.iter().enumerate() {
+            let (did, store) = bound_mint(n as u8 + 1);
+            registry
+                .record_minted(ProfileIx(*ix), &did, &store, None)
+                .expect("a confirmed mint records");
+        }
+        registry
+    }
+
+    /// The single-profile account — the state #3067 named as having no remedy.
+    ///
+    /// Ending it must leave NO active profile rather than an active slot pointing at a profile whose
+    /// DID no longer resolves.
+    #[test]
+    fn ending_an_accounts_only_profile_leaves_it_with_no_active_profile() {
+        let mut registry = registry_with(&[0]);
+        assert!(
+            registry.active().is_some(),
+            "the fixture starts with an active profile"
+        );
+
+        let outcome = registry
+            .record_melted(ProfileIx(0), 5_000_000)
+            .expect("a confirmed melt records");
+
+        assert_eq!(outcome, ProfileEndOutcome::NoLiveProfileRemains);
+        assert!(
+            registry.active().is_none(),
+            "an account whose every profile ended has no profile it could honestly point at"
+        );
+        assert_eq!(
+            registry.shown().count(),
+            0,
+            "an ended profile leaves the lists"
+        );
+        assert_eq!(registry.live().count(), 0);
+    }
+
+    /// The MULTI-profile account: ending the active one moves the slot rather than clearing it, and
+    /// the move is reported because the user did not choose it.
+    ///
+    /// This is the case that distinguishes "the active slot is maintained" from "the active slot is
+    /// merely cleared" — a registry that only ever cleared would pass the test above and strand a
+    /// user who still has profiles left.
+    #[test]
+    fn ending_the_active_profile_moves_the_slot_to_a_remaining_live_one() {
+        let mut registry = registry_with(&[0, 1]);
+        let _ = registry
+            .set_active(ProfileIx(0))
+            .expect("profile 0 is active");
+
+        let outcome = registry
+            .record_melted(ProfileIx(0), 5_000_000)
+            .expect("a confirmed melt records");
+
+        assert_eq!(
+            outcome,
+            ProfileEndOutcome::ActiveMoved(ActiveSwitch {
+                from: Some(ProfileIx(0)),
+                to: ProfileIx(1),
+            })
+        );
+        assert_eq!(registry.active().map(ActiveProfile::ix), Some(ProfileIx(1)));
+    }
+
+    /// Ending a NON-active profile leaves the active slot exactly where it was — the truthful control
+    /// for the two tests above, which would both pass a registry that cleared the slot indiscriminately.
+    #[test]
+    fn ending_a_non_active_profile_does_not_disturb_the_active_slot() {
+        let mut registry = registry_with(&[0, 1]);
+        let _ = registry
+            .set_active(ProfileIx(0))
+            .expect("profile 0 is active");
+
+        let outcome = registry
+            .record_melted(ProfileIx(1), 5_000_000)
+            .expect("a confirmed melt records");
+
+        assert_eq!(outcome, ProfileEndOutcome::Recorded);
+        assert_eq!(registry.active().map(ActiveProfile::ix), Some(ProfileIx(0)));
+        assert_eq!(registry.live().count(), 1);
+    }
+
+    /// An ended profile cannot be made active again. Without this, un-hiding or re-selecting would
+    /// resurrect a dead profile on screen — the resurrection #3067 called out for the hide workaround.
+    #[test]
+    fn an_ended_profile_cannot_be_made_active_again() {
+        let mut registry = registry_with(&[0, 1]);
+        let _ = registry.record_melted(ProfileIx(1), 5_000_000).unwrap();
+
+        let err = registry
+            .set_active(ProfileIx(1))
+            .expect_err("a profile the chain retired must not become active");
+        assert!(
+            matches!(err, AccountError::ProfileEnded(ProfileIx(1))),
+            "{err:?}"
+        );
+    }
+
+    /// The record is kept, not deleted: the DID string is still the right answer to what the account
+    /// used to be, and the height gives a host something honest to draw.
+    #[test]
+    fn an_ended_profile_keeps_its_did_and_records_the_height_it_ended_at() {
+        let mut registry = registry_with(&[0, 1]);
+        let did = registry
+            .get(ProfileIx(1))
+            .unwrap()
+            .anchor()
+            .did()
+            .to_string();
+
+        let _ = registry.record_melted(ProfileIx(1), 5_000_123).unwrap();
+
+        let entry = registry
+            .get(ProfileIx(1))
+            .expect("the record survives the end");
+        assert_eq!(entry.anchor().did(), did);
+        assert_eq!(entry.ended().map(ProfileEnd::at_height), Some(5_000_123));
+        assert!(!entry.is_live());
+    }
+
+    /// Height 0 is what an UNCONFIRMED read looks like, so admitting it would store a submission as a
+    /// confirmation — the same rule the mint anchors enforce. Pinned from both sides: 0 is refused and
+    /// 1, the lowest real height, is accepted.
+    #[test]
+    fn an_end_at_height_zero_is_refused_and_the_first_real_height_is_accepted() {
+        let mut registry = registry_with(&[0, 1]);
+
+        let err = registry
+            .record_melted(ProfileIx(1), 0)
+            .expect_err("height 0 is not evidence of a confirmed melt");
+        assert!(matches!(err, AccountError::ProfileEndHeightZero), "{err:?}");
+        assert!(
+            registry.get(ProfileIx(1)).unwrap().is_live(),
+            "a refused end must leave the entry untouched, not half-written"
+        );
+
+        let _ = registry
+            .record_melted(ProfileIx(1), 1)
+            .expect("height 1 is a real height and must be accepted");
+    }
+
+    /// Recording an end twice is a no-op, so a host retrying after a crash mid-ceremony cannot move
+    /// the active slot a second time and strand the user on a third profile they never chose.
+    #[test]
+    fn recording_an_end_twice_changes_nothing() {
+        let mut registry = registry_with(&[0, 1, 2]);
+        let _ = registry.set_active(ProfileIx(0)).unwrap();
+        let _ = registry.record_melted(ProfileIx(0), 5_000_000).unwrap();
+        let after_first = registry.active().map(ActiveProfile::ix);
+
+        let outcome = registry.record_melted(ProfileIx(0), 5_000_999).unwrap();
+
+        assert_eq!(outcome, ProfileEndOutcome::AlreadyEnded);
+        assert_eq!(registry.active().map(ActiveProfile::ix), after_first);
+        assert_eq!(
+            registry
+                .get(ProfileIx(0))
+                .unwrap()
+                .ended()
+                .map(ProfileEnd::at_height),
+            Some(5_000_000),
+            "the FIRST confirmed height stands; a retry must not overwrite it"
+        );
+    }
+
+    /// A registry whose only profile has ended round-trips through JSON, and its no-active-profile
+    /// state survives the load. A file is untrusted input, so the invariants are checked on the
+    /// deserialize path too — an end that only held in memory would be undone by a restart.
+    #[test]
+    fn an_account_with_no_live_profile_round_trips_through_json() {
+        let mut registry = registry_with(&[0]);
+        let _ = registry.record_melted(ProfileIx(0), 5_000_000).unwrap();
+
+        let loaded = ProfileRegistry::from_json(&registry.to_json().unwrap())
+            .expect("a registry with no live profile is a legal state, not a corrupt file");
+
+        assert!(loaded.active().is_none());
+        assert_eq!(loaded.entries().len(), 1, "the ended record is still there");
+        assert_eq!(loaded.live().count(), 0);
+    }
+
+    /// A hand-edited file that marks the ACTIVE profile as ended is refused on load: it would leave
+    /// every identity surface reading an active profile the chain has retired.
+    #[test]
+    fn a_file_whose_active_profile_has_ended_is_refused_on_load() {
+        let mut registry = registry_with(&[0, 1]);
+        let _ = registry.set_active(ProfileIx(0)).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.to_json().unwrap()).unwrap();
+
+        json["entries"][0]["ended"] = serde_json::json!({ "at_height": 5_000_000 });
+
+        ProfileRegistry::from_json(&json.to_string())
+            .expect_err("an active profile that has ended is not a loadable state");
     }
 }
