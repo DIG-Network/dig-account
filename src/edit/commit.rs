@@ -30,7 +30,7 @@ use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use dig_chainsource_interface::ChainSource;
 use dig_merkle::{required_signatures, DataStore, DigDataStoreMetadata, Owner, RequiredSignature};
 use dig_social_profile::slot::standard::SCHEMA_VERSION;
-use dig_social_profile::{SlotEdit, VerifiedBody};
+use dig_social_profile::{Profile, SlotEdit, VerifiedBody};
 
 use crate::id::ProfileIx;
 use crate::keys::wallet_key::WalletKey;
@@ -259,6 +259,102 @@ impl ProfileEditor {
         }
     }
 
+    /// Publish `profile` WHOLESALE at `anchor` — no prior read, no delta.
+    ///
+    /// # When a delta is impossible
+    ///
+    /// [`commit_edit`](Self::commit_edit) applies a change ON TOP of the body it reads back, which
+    /// requires that body to still exist somewhere. A profile whose body bytes are lost is therefore
+    /// stuck permanently: its root is a commitment to content nobody holds, so there is no base to
+    /// edit and no sequence of edits that can produce one. This entry point is how such a profile is
+    /// made whole again — the caller supplies the content it wants published, and the store's root
+    /// advances to commit exactly that.
+    ///
+    /// # This OVERWRITES. It is the point, and it is the hazard
+    ///
+    /// The published root commits to `profile` and nothing else. Whatever the previous root committed
+    /// to — including slots this profile does not carry — is no longer what the store anchors.
+    ///
+    /// **This call can be made with an effectively empty profile, and will publish it.** A profile
+    /// carrying only its schema version is a valid profile, so a caller that hands one over erases a
+    /// healthy profile's published content. Nothing here can distinguish that from a deliberate
+    /// reset, because both arrive as the same argument. A surface offering this MUST NOT present an
+    /// unreadable body as an empty draft the user then "saves": the person believes they preserved
+    /// what they could not see, and the spend proves them wrong permanently.
+    ///
+    /// The one content rule enforced here is the schema version, without which the published body is
+    /// not a profile at all.
+    ///
+    /// # Money
+    ///
+    /// On [`MintNetwork::mainnet`] this spends real XCH: the store singleton is recreated on chain.
+    /// A profile whose root the store ALREADY anchors returns [`Confirmed`](EditStatus::Confirmed)
+    /// without building or pushing anything — so a caller that lost the answer to a push retries by
+    /// calling again, exactly as with [`commit_edit`](Self::commit_edit). That check compares against
+    /// the CHAIN's current root rather than against a body snapshot, which is the only form of it
+    /// available when the body cannot be read — and the only form that means anything here.
+    ///
+    /// # Errors
+    ///
+    /// [`EditError::Refused`] for a profile without its schema version, or a spend the pre-signing
+    /// gate does not allow. [`EditError::Rejected`] when the mempool DECLINED the bundle.
+    /// [`EditError::ChainUnreachable`] when the chain could not answer, where the outcome is UNKNOWN.
+    /// [`EditError::Locked`] once the account has relocked.
+    //
+    // Six arguments, each a distinct authority (see `commit_edit`). There is deliberately no
+    // `ProfileContentSource`: not reading the old body is the whole capability, and taking a reader
+    // it must ignore would invite a future edit to start consulting it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct authority"
+    )]
+    pub fn publish_profile<C, P>(
+        &self,
+        ix: ProfileIx,
+        anchor: &ProfileAnchor,
+        profile: &Profile,
+        chain: &C,
+        publisher: &P,
+        network: &MintNetwork,
+    ) -> EditResult<CommittedEdit>
+    where
+        C: ChainSource + ?Sized,
+        P: SpendPublisher + ?Sized,
+    {
+        reject_profile_without_schema_version(profile)?;
+
+        let wallet = self.live_wallet_key(ix)?;
+
+        // Encoded before anything is read or built, so a profile that cannot be published costs the
+        // user neither a chain round-trip nor a spend.
+        let next_body = VerifiedBody::from_profile(profile)
+            .map_err(|e| EditError::Format(format!("published profile body: {e}")))?;
+        let new_root = next_body.root();
+        let body = next_body.as_bytes().to_vec();
+
+        let store = resolve_store_tip(anchor, chain)?;
+        let anchored: [u8; 32] = store.info.metadata.root_hash.into();
+        if anchored == new_root {
+            return Ok(CommittedEdit {
+                status: EditStatus::Confirmed { root: new_root },
+                body,
+            });
+        }
+
+        let bundle = self.build_and_sign_update(anchor, &wallet, new_root, chain, network)?;
+
+        match publisher
+            .push(&bundle)
+            .map_err(|e| EditError::ChainUnreachable(e.to_string()))?
+        {
+            PushOutcome::Accepted | PushOutcome::AlreadyInMempool => Ok(CommittedEdit {
+                status: EditStatus::Pushed { new_root },
+                body,
+            }),
+            PushOutcome::Rejected { reason } => Err(EditError::Rejected(reason)),
+        }
+    }
+
     /// Build the store-recreation spend anchoring `new_root`, GATE it, and sign it.
     ///
     /// Building and signing are ONE step on purpose, for the store launch's reason: a helper that
@@ -326,6 +422,21 @@ impl ProfileEditor {
             ix,
         ))
     }
+}
+
+/// Refuse a whole-profile publish that carries no schema version.
+///
+/// [`reject_protected_removals`] states the same invariant for the delta path, where the slot can
+/// only be removed. Here it can simply be absent — a `Profile` built from scratch carries whatever
+/// its author put in it — so the absolute path must assert the slot's PRESENCE rather than the
+/// absence of a removal. A body without it is not a profile any reader can interpret.
+fn reject_profile_without_schema_version(profile: &Profile) -> EditResult<()> {
+    if profile.get(SCHEMA_VERSION).is_none() {
+        return Err(EditError::Refused(
+            "a published profile may not be without its schema version".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a batch asking to remove a slot a published profile may not be without.
