@@ -16,6 +16,9 @@ pub mod autosend;
 pub mod cat_transfer;
 pub mod clock;
 pub mod enforcer;
+/// Test-only builders for a REAL terminal singleton melt (the profile-deletion spend).
+#[cfg(test)]
+pub(crate) mod melt_fixture;
 pub mod money_signer;
 pub mod policy;
 pub mod summary;

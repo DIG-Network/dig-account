@@ -36,7 +36,7 @@ coinset-push = ["dep:ureq"]
 # The canonical money signer + independent spend verification live in dig-wallet-backend's `client`
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
-dig-wallet-backend = { version = "0.27", default-features = false, features = ["client"] }
+dig-wallet-backend = { version = "0.28", default-features = false, features = ["client"] }
 dig-session = "0.6"
 dig-identity = "0.6"
 dig-keystore = "0.8"
