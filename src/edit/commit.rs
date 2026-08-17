@@ -424,14 +424,25 @@ impl ProfileEditor {
     }
 }
 
-/// Refuse a whole-profile publish that carries no schema version.
+/// Refuse a whole-profile publish that carries no *readable* schema version.
 ///
 /// [`reject_protected_removals`] states the same invariant for the delta path, where the slot can
 /// only be removed. Here it can simply be absent — a `Profile` built from scratch carries whatever
 /// its author put in it — so the absolute path must assert the slot's PRESENCE rather than the
 /// absence of a removal. A body without it is not a profile any reader can interpret.
+///
+/// # Presence is the wrong question; readability is the right one
+///
+/// This asks [`Profile::schema_version`] rather than [`Profile::get`], because the two disagree on
+/// exactly the case that matters. `get` answers `Some` for a slot holding ANY `Value`, while
+/// `schema_version` answers `Some` only for a `Value::U16`. A profile carrying
+/// `SCHEMA_VERSION = Value::Utf8("not-a-version")` therefore satisfies presence and is unreadable by
+/// every reader — published, anchored on chain, and interpretable by nobody.
+///
+/// The distinction is the guard's whole point: this exists so an unreadable body cannot be
+/// published, and a wrongly-typed version is unreadable in precisely the way an absent one is.
 fn reject_profile_without_schema_version(profile: &Profile) -> EditResult<()> {
-    if profile.get(SCHEMA_VERSION).is_none() {
+    if profile.schema_version().is_none() {
         return Err(EditError::Refused(
             "a published profile may not be without its schema version".into(),
         ));

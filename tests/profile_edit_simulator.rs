@@ -933,3 +933,48 @@ fn publishing_a_profile_without_its_schema_version_is_refused() -> anyhow::Resul
     );
     Ok(())
 }
+
+/// **A schema version of the wrong TYPE is refused exactly as an absent one is.**
+///
+/// The sibling test above covers absence. This covers the case a presence check cannot see, and the
+/// two are kept apart deliberately: a guard asking `get(SCHEMA_VERSION).is_none()` passes the
+/// sibling and fails here, so only the pair distinguishes "the slot is there" from "a reader can
+/// interpret it".
+///
+/// The distinction is not academic. `Profile::schema_version` answers `Some` only for a
+/// `Value::U16`, so a profile carrying `Value::Utf8` here satisfies presence and is readable by
+/// nobody — and this is the ABSOLUTE publish path, which overwrites whatever the root committed to.
+/// Admitting one would anchor an uninterpretable body on chain over content that may have been fine.
+#[test]
+fn publishing_a_profile_whose_schema_version_is_the_wrong_type_is_refused() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let pushes_before = chain.push_attempts();
+
+    let mut wrong_type = SchemaProfile::default();
+    wrong_type.set(standard::DISPLAY_NAME, Value::Utf8("ada".into()));
+    // Present, so a `get(..).is_none()` guard is satisfied — and unreadable, so every reader fails.
+    wrong_type.set(
+        standard::SCHEMA_VERSION,
+        Value::Utf8("not-a-version".into()),
+    );
+
+    let refusal = account.profile_editor().publish_profile(
+        ProfileIx::ROOT,
+        &anchor,
+        &wrong_type,
+        &chain,
+        &chain,
+        &simulator_network(),
+    );
+
+    assert!(
+        matches!(refusal, Err(EditError::Refused(_))),
+        "a schema version nothing can read is not a schema version: {refusal:?}"
+    );
+    assert_eq!(
+        chain.push_attempts(),
+        pushes_before,
+        "a refused publish never reaches the publisher"
+    );
+    Ok(())
+}
