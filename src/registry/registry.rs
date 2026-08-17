@@ -458,7 +458,10 @@ impl ProfileRegistry {
     ///   bookkeeping: `DidConfirmedStoreNotLaunched` tells the resume path to launch the store from
     ///   THAT record's DID coin, so a file that could redirect it would redirect a spend. Bounding
     ///   the fee beside an unchecked identity would be an asymmetry, not a scope boundary.
-    /// - **No confirmation height is 0**, for anchors and journalled DIDs alike. No coin is created
+    /// - **No confirmation height is 0**, for anchors, journalled DIDs and recorded ENDS alike
+    ///   (`ProfileEnd` derives `Deserialize`, so a file reaches the field without passing
+    ///   `ProfileEnd::at`, and this is where the constructor and the deserializer agree). No
+    ///   coin is created
     ///   in the genesis block, so a `0` is fabricated — the same reasoning
     ///   [`MintedDid::from_confirmed`](crate::mint::MintedDid::from_confirmed) applies to live
     ///   evidence, applied to the file that outlives it. Unlike fabrication in general this one IS
@@ -529,6 +532,12 @@ impl ProfileRegistry {
                 return Err(format!(
                     "profile {ix}'s store_confirmed_height is 0, which no on-chain confirmation \
                      can produce; ConfirmedStore::from_confirmed refuses it"
+                ));
+            }
+            if entry.ended().is_some_and(|end| end.at_height() == 0) {
+                return Err(format!(
+                    "profile {ix}'s end height is 0, which no confirmed melt can produce; \
+                     ProfileEnd::at refuses it"
                 ));
             }
         }
@@ -1439,5 +1448,41 @@ mod ended_profile_tests {
 
         ProfileRegistry::from_json(&json.to_string())
             .expect_err("an active profile that has ended is not a loadable state");
+    }
+
+    /// A registry whose only profile has ended, as JSON, with the end height rewritten to
+    /// `at_height`. The profile is the ONLY one and no profile is active, so the sole invariant the
+    /// end height could trip is the one under test — an active-slot rejection cannot stand in for it.
+    fn json_with_end_height(at_height: u32) -> String {
+        let mut registry = registry_with(&[0]);
+        let _ = registry.record_melted(ProfileIx(0), 5_000_000).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_str(&registry.to_json().unwrap()).unwrap();
+
+        json["entries"][0]["ended"] = serde_json::json!({ "at_height": at_height });
+        json.to_string()
+    }
+
+    /// **Regression: height 0 was enforced on the WRITE path only.** `ProfileEnd` derives
+    /// `Deserialize`, so a file reaches the field without passing `ProfileEnd::at` — before this
+    /// check a registry stating `"ended": {"at_height": 0}` loaded clean, and an unconfirmed melt
+    /// read as a confirmed one. SPEC.md §2.4.5 states the rejection as a MUST.
+    #[test]
+    fn a_file_whose_end_height_is_zero_is_refused_on_load() {
+        let error = ProfileRegistry::from_json(&json_with_end_height(0))
+            .expect_err("height 0 is what an unconfirmed melt read looks like");
+
+        assert!(
+            matches!(&error, AccountError::RegistryInvariant(why) if why.contains("end height is 0")),
+            "the load must fail on the END height rather than another invariant, got {error:?}"
+        );
+    }
+
+    /// The control for the rejection above: height 1 is the lowest honest end height and must still
+    /// load, so the refusal is the `0` and not a rule against recording an end at all.
+    #[test]
+    fn a_file_whose_end_height_is_the_first_block_after_genesis_loads() {
+        ProfileRegistry::from_json(&json_with_end_height(1))
+            .expect("the first block after genesis is an honest end height");
     }
 }
