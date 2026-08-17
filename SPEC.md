@@ -1493,3 +1493,5 @@ Conformance for §2.0 and the phrase API MUST prove, using TWO accounts with unr
 - Key derivations conform to the Chia canonical wallet path (§3.2) and the DIG identity/DEK contracts in
   `dig-identity` / `dig-session` / `dig-constants`.
 
+
+<!-- loop/3068: melt custody-gate measurement in progress -->
