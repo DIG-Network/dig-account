@@ -793,3 +793,188 @@ fn a_relocked_account_cannot_commit() -> anyhow::Result<()> {
     assert_eq!(chain.push_attempts(), pushes_before);
     Ok(())
 }
+
+/// **A profile whose body is LOST is republishable from scratch.**
+///
+/// This is the state a real user reached: the chain anchors a root, and the bytes that hash to it
+/// exist nowhere. Every delta path is structurally impossible there — `commit_edit` begins by reading
+/// the body it must apply the change on top of, and there is no body — so the profile is stuck
+/// forever unless content can be published ABSOLUTELY.
+///
+/// The test states both halves against the SAME unreadable host, which is what makes it evidence
+/// rather than a demonstration: the delta path fails, the absolute path succeeds, and the difference
+/// is the API rather than the fixture. It then reads the republished profile back through the normal
+/// verified read, so the new root really is the preimage of the bytes handed back.
+#[test]
+fn a_profile_whose_body_is_lost_can_be_republished_whole() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let editor = account.profile_editor();
+
+    // The user's situation exactly: the chain has a root, nobody holds its preimage.
+    let lost = HostStore::holding(Vec::new());
+    assert!(
+        matches!(
+            editor.commit_edit(
+                ProfileIx::ROOT,
+                &anchor,
+                &the_edit(),
+                &chain,
+                &lost,
+                &chain,
+                &simulator_network(),
+            ),
+            Err(EditError::ContentUnavailable(_))
+        ),
+        "the delta path must be impossible here, or the absolute path proves nothing"
+    );
+
+    let mut rebuilt = SchemaProfile::with_schema_v2();
+    rebuilt.set(standard::DISPLAY_NAME, Value::Utf8("ada".into()));
+    rebuilt.set(standard::BIO, Value::Utf8("rebuilt from memory".into()));
+    let expected_root = rebuilt.build_root()?;
+
+    let published = editor.publish_profile(
+        ProfileIx::ROOT,
+        &anchor,
+        &rebuilt,
+        &chain,
+        &chain,
+        &simulator_network(),
+    )?;
+    assert_eq!(published.root(), expected_root);
+    lost.persist(published.body_bytes());
+    chain.farm()?;
+
+    let read_back = dig_account::read_profile(&anchor, &chain, &lost)?;
+    assert_eq!(read_back.root(), expected_root);
+    assert_eq!(read_back.fields().display_name(), Some("ada"));
+    assert_eq!(read_back.fields().bio(), Some("rebuilt from memory"));
+    assert_eq!(
+        read_back.fields().get(ProfileSlot::Location),
+        None,
+        "an absolute publish commits exactly the profile given, not a merge with what came before"
+    );
+    Ok(())
+}
+
+/// **Republishing the root the store already anchors spends nothing.**
+///
+/// The delta path's already-there check reads the body; without one, the only honest form of the
+/// same guard compares against the CHAIN's current root. Losing it would make a retry after an
+/// unanswered push pay to re-commit the root it already has.
+#[test]
+fn republishing_the_root_already_on_chain_never_reaches_the_publisher() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let editor = account.profile_editor();
+
+    // The profile as MINTED — so its root is the one the chain already anchors.
+    let mut as_minted = SchemaProfile::with_schema_v2();
+    as_minted.set(standard::DISPLAY_NAME, Value::Utf8("ada".into()));
+    as_minted.set(standard::BIO, Value::Utf8("counts things".into()));
+    as_minted.set(standard::LOCATION, Value::Utf8("london".into()));
+    assert_eq!(
+        as_minted.build_root()?,
+        seeded_profile().root()?,
+        "the fixture must reproduce the MINTED root, or this test cannot see the guard"
+    );
+
+    let pushes_before = chain.push_attempts();
+    let published = editor.publish_profile(
+        ProfileIx::ROOT,
+        &anchor,
+        &as_minted,
+        &chain,
+        &chain,
+        &simulator_network(),
+    )?;
+
+    assert_eq!(
+        published.status(),
+        &EditStatus::Confirmed {
+            root: seeded_profile().root()?
+        },
+        "a root the chain already anchors is confirmed, not pushed"
+    );
+    assert_eq!(
+        chain.push_attempts(),
+        pushes_before,
+        "re-publishing what is already on chain must not spend"
+    );
+    Ok(())
+}
+
+/// **A profile without its schema version is refused before any chain read or spend.**
+///
+/// The delta path can only ever REMOVE that slot, so it checks for a removal; the absolute path
+/// receives a whole profile in which the slot can simply be absent, and a body without it is not a
+/// profile any reader can interpret.
+#[test]
+fn publishing_a_profile_without_its_schema_version_is_refused() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let pushes_before = chain.push_attempts();
+
+    let mut no_schema = SchemaProfile::default();
+    no_schema.set(standard::DISPLAY_NAME, Value::Utf8("ada".into()));
+
+    let refusal = account.profile_editor().publish_profile(
+        ProfileIx::ROOT,
+        &anchor,
+        &no_schema,
+        &chain,
+        &chain,
+        &simulator_network(),
+    );
+
+    assert!(matches!(refusal, Err(EditError::Refused(_))));
+    assert_eq!(
+        chain.push_attempts(),
+        pushes_before,
+        "a refused publish never reaches the publisher"
+    );
+    Ok(())
+}
+
+/// **A schema version of the wrong TYPE is refused exactly as an absent one is.**
+///
+/// The sibling test above covers absence. This covers the case a presence check cannot see, and the
+/// two are kept apart deliberately: a guard asking `get(SCHEMA_VERSION).is_none()` passes the
+/// sibling and fails here, so only the pair distinguishes "the slot is there" from "a reader can
+/// interpret it".
+///
+/// The distinction is not academic. `Profile::schema_version` answers `Some` only for a
+/// `Value::U16`, so a profile carrying `Value::Utf8` here satisfies presence and is readable by
+/// nobody — and this is the ABSOLUTE publish path, which overwrites whatever the root committed to.
+/// Admitting one would anchor an uninterpretable body on chain over content that may have been fine.
+#[test]
+fn publishing_a_profile_whose_schema_version_is_the_wrong_type_is_refused() -> anyhow::Result<()> {
+    let (account, chain, anchor) = a_minted_profile()?;
+    let pushes_before = chain.push_attempts();
+
+    let mut wrong_type = SchemaProfile::default();
+    wrong_type.set(standard::DISPLAY_NAME, Value::Utf8("ada".into()));
+    // Present, so a `get(..).is_none()` guard is satisfied — and unreadable, so every reader fails.
+    wrong_type.set(
+        standard::SCHEMA_VERSION,
+        Value::Utf8("not-a-version".into()),
+    );
+
+    let refusal = account.profile_editor().publish_profile(
+        ProfileIx::ROOT,
+        &anchor,
+        &wrong_type,
+        &chain,
+        &chain,
+        &simulator_network(),
+    );
+
+    assert!(
+        matches!(refusal, Err(EditError::Refused(_))),
+        "a schema version nothing can read is not a schema version: {refusal:?}"
+    );
+    assert_eq!(
+        chain.push_attempts(),
+        pushes_before,
+        "a refused publish never reaches the publisher"
+    );
+    Ok(())
+}

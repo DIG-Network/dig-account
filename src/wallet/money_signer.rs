@@ -618,4 +618,88 @@ mod tests {
                 .expect("the spend must require the golden money key's signature");
         assert!(chia_bls::verify(&signature, &golden_pk, &message));
     }
+
+    /// **A profile deletion the wallet OWNS actually signs.**
+    ///
+    /// Deleting a profile terminally spends singletons this very wallet controls, and the signing
+    /// core refuses any bundle whose reviewed summary does not name every lineage the bytes destroy.
+    /// So this is the whole capability in one assertion: a real dig-merkle melt of a singleton owned
+    /// by the golden money key goes in, and a verifying aggregate signature comes out.
+    ///
+    /// It is deliberately an OWNED melt. The gate's own fixtures melt a singleton curried over a
+    /// foreign key, which proves the refusal and leaves the happy path unexercised — and a happy path
+    /// nobody has run is exactly where a fail-closed comparison bites a legitimate user.
+    #[test]
+    fn a_melt_of_a_singleton_this_wallet_owns_signs_and_verifies() {
+        let coin_spends =
+            crate::wallet::melt_fixture::store_melt_owned_by(money_key().public_key(), 0x11);
+
+        let signature = sign(&coin_spends)
+            .expect("a melt of a singleton this wallet owns must be signable end to end");
+
+        let mut allocator = clvmr::Allocator::new();
+        let constants = AggSigConstants::new(Bytes32::new(live_core().agg_sig_me_extra_data()));
+        let pairs: Vec<(PublicKey, Vec<u8>)> =
+            SdkRequiredSignature::from_coin_spends(&mut allocator, &coin_spends, &constants)
+                .unwrap()
+                .into_iter()
+                .map(|item| match item {
+                    SdkRequiredSignature::Bls(bls) => (bls.public_key, bls.message()),
+                    SdkRequiredSignature::Secp(_) => panic!("unexpected secp"),
+                })
+                .collect();
+        assert!(!pairs.is_empty(), "a melt requires a signature");
+        assert!(
+            aggregate_verify(&signature, pairs.iter().map(|(pk, m)| (pk, m.as_slice()))),
+            "the aggregate must verify over the melt's own required signatures"
+        );
+        assert!(
+            pairs.iter().any(|(pk, _)| *pk == money_key().public_key()),
+            "the destroyed singleton must be owned by the wallet's canonical money key"
+        );
+    }
+
+    /// **The control that makes the test above evidence rather than coincidence.**
+    ///
+    /// Signing renders the reviewed summary from the approval's OWN coin spends, so it can never
+    /// disagree with them — which means the melt test alone cannot show the destroyed-lineage
+    /// comparison is being satisfied rather than skipped.
+    ///
+    /// So the claim here is the melt's OWN summary with exactly ONE difference: the destroyed
+    /// lineages are removed. Every other field — the fee above all — still matches the bytes, so the
+    /// refusal can only come from the melt comparison. Substituting a whole different bundle's
+    /// summary instead would trip the fee check first and prove nothing about destruction.
+    #[test]
+    fn signing_refuses_a_melt_whose_reviewed_summary_omits_the_destroyed_singleton() {
+        use dig_wallet_backend::types::UnsignedSpend;
+
+        let melt = crate::wallet::melt_fixture::store_melt_owned_by(money_key().public_key(), 0x11);
+        let signer = signer();
+        let core = live_core();
+
+        let mut claim = core
+            .reviewable_summary(&melt)
+            .expect("the melt's own summary renders");
+        assert!(
+            !claim.melted_singletons.is_empty(),
+            "the melt's honest summary must name a destroyed singleton, or removing one is a no-op \
+             and this test cannot fail"
+        );
+        claim.melted_singletons.clear();
+
+        let unsigned = UnsignedSpend {
+            coin_spends: melt.clone(),
+            required_signatures: LocalMoneySigner::required_signatures(&core, &melt)
+                .expect("the melt's required signatures extract"),
+            summary: claim,
+        };
+
+        let refusal = signer
+            .sign_unsigned(&core, &unsigned)
+            .expect_err("a melt the reviewed summary never named must not be signed");
+        assert!(
+            refusal.to_string().contains("destroyed singletons"),
+            "the refusal must name the destruction it could not find in the claim: {refusal}"
+        );
+    }
 }

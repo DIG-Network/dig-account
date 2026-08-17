@@ -182,6 +182,21 @@ pub struct SpendSummary {
     pub recipients: Vec<SpendRecipient>,
     /// The farmer fee, in mojos.
     pub fee: u64,
+    /// The coin id — lowercase hex — of every singleton this spend permanently DESTROYS.
+    ///
+    /// # Why destruction is a field and not a line
+    ///
+    /// Every other effect a summary describes moves value to a destination, so it can be said as a
+    /// recipient line. A melt has no destination: it creates no coin, and the singleton's lone mojo
+    /// leaves only through the fee. Modelled as a recipient it would need an address that does not
+    /// exist; modelled as a fee it is a rounding error one mojo wide, which is exactly how a melt of
+    /// the user's DID could be appended to an ordinary send and confirmed as that send.
+    ///
+    /// The hex form matches `dig-wallet-backend`'s
+    /// [`TransactionSummary::melted_singletons`](dig_wallet_backend::types::TransactionSummary), the
+    /// multiset the signing gate compares its own derivation against — so a consumer reading this
+    /// field is reading the same names the signature is checked on.
+    pub melted_singletons: Vec<String>,
 }
 
 impl SpendSummary {
@@ -199,7 +214,37 @@ impl SpendSummary {
             tier,
             recipients,
             fee,
+            melted_singletons: Vec::new(),
         }
+    }
+
+    /// The same display-only summary, additionally naming the singletons a spend DESTROYS.
+    ///
+    /// Kept separate from [`new`](Self::new) so that adding destruction to the model did not silently
+    /// change what an existing caller's three arguments mean: a caller that has never heard of a melt
+    /// keeps describing a spend that melts nothing, which is true of every spend it could build.
+    /// Carries no authority, for the reasons [`new`](Self::new) documents.
+    pub fn melting(
+        tier: SpendTier,
+        recipients: Vec<SpendRecipient>,
+        fee: u64,
+        melted_singletons: Vec<String>,
+    ) -> Self {
+        Self {
+            tier,
+            recipients,
+            fee,
+            melted_singletons,
+        }
+    }
+
+    /// Whether this spend permanently destroys a singleton — a DID, a dig-store, a profile.
+    ///
+    /// Consulted by the tier so destruction always reaches a human, and worth consulting on any
+    /// surface that decides how much friction a spend deserves: a melt's mojo value says nothing
+    /// about what it costs the person.
+    pub fn destroys_singletons(&self) -> bool {
+        !self.melted_singletons.is_empty()
     }
 
     /// Re-derive a summary straight from `coin_spends`, tagging it with `tier`.
@@ -245,6 +290,15 @@ impl SpendSummary {
                 .chain(effect.protocol_sink.iter().map(protocol_structure_line))
                 .collect(),
             fee: effect.fee,
+            // Carried straight from the driver's own re-derivation, in the driver's own order and
+            // hex form. Nothing is filtered here: an entry dropped at this layer would be a
+            // destruction the human never sees, and the signing gate would then refuse the bundle
+            // for naming fewer lineages than the bytes destroy.
+            melted_singletons: effect
+                .melted_singletons
+                .iter()
+                .map(|coin_id| hex::encode(coin_id.as_ref()))
+                .collect(),
         }
     }
 
@@ -376,7 +430,13 @@ impl fmt::Display for SpendSummary {
                 }
             }
         }
-        write!(f, " (fee {} XCH)", format_xch(self.fee))
+        write!(f, " (fee {} XCH)", format_xch(self.fee))?;
+        // Said LAST and said plainly. A destruction stated only as a fee is the sentence a person
+        // reads as "a send", so it gets its own clause naming each lineage that ends here.
+        for coin_id in &self.melted_singletons {
+            write!(f, " — destroys singleton {coin_id} permanently")?;
+        }
+        Ok(())
     }
 }
 
@@ -565,6 +625,13 @@ impl DerivedSpend {
         let native_total_mojos = summary.checked_native_total_mojos()?;
         summary.tier = SpendTier::classify(policy, native_total_mojos);
         if summary.tier == SpendTier::AutoSend && summary.moves_non_native_assets() {
+            summary.tier = SpendTier::Confirm;
+        }
+        // Destruction is not a value any mojo limit can bound. A melt spends the singleton's single
+        // mojo, so an allowance sees a spend of one mojo and would auto-send the end of the user's
+        // identity without ever asking. What the spend COSTS and what it DESTROYS are different
+        // questions, and only the second one is being answered here.
+        if summary.tier == SpendTier::AutoSend && summary.destroys_singletons() {
             summary.tier = SpendTier::Confirm;
         }
         Ok(Self {
@@ -943,5 +1010,168 @@ mod tests {
         assert_eq!(summary.fee, 10);
         // native total 610 <= 1000 allowance -> auto-send.
         assert_eq!(summary.tier, SpendTier::AutoSend);
+    }
+}
+
+/// **A spend whose entire effect is DESTRUCTION must say so.**
+///
+/// Every other authorizable act moves value to a destination, so until a melt could be verified at
+/// all this summary had no vocabulary for one — a melt rendered as a fee one mojo larger, and a melt
+/// of the user's DID appended to an ordinary send was reviewable as that send. The tests here pin
+/// the two properties that close it: the destroyed lineage is NAMED in the summary a human approves,
+/// and a spend that destroys anything can never be auto-sent.
+#[cfg(test)]
+mod melting_a_singleton_is_named_not_charged {
+    use super::*;
+    use crate::id::ProfileIx;
+    use crate::keys::wallet_key::WalletKey;
+    use crate::wallet::melt_fixture::{melted_coin_id_hex, store_melt_owned_by};
+    use crate::wallet::policy::HotWallet;
+
+    /// The wallet's own money key — so every fixture below melts a singleton this wallet controls,
+    /// which is the case a user deleting their own profile actually performs.
+    fn money_key() -> WalletKey {
+        WalletKey::from_seed_at(&[0x42u8; 32], ProfileIx::ROOT)
+    }
+
+    /// A policy whose allowance is far larger than a melt's one destroyed mojo — the fixture that
+    /// makes the auto-send test below load-bearing. Under a tight allowance a melt would tier
+    /// `Confirm` on its amount alone, and the test would pass with the rule deleted.
+    fn generous_hot_wallet() -> CustodyPolicy {
+        CustodyPolicy::Hot(HotWallet {
+            auto_send_limit: 1_000_000,
+        })
+    }
+
+    /// **The destroyed singleton is named in the summary.** Without this the person confirming sees
+    /// only a fee, and `dig-wallet-backend`'s signing gate — which compares the destroyed multiset —
+    /// refuses the bundle outright, so profile deletion cannot sign at all.
+    #[test]
+    fn a_melt_names_the_singleton_it_destroys() {
+        let coin_spends = store_melt_owned_by(money_key().public_key(), 0x11);
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm)
+            .expect("a terminal singleton melt is a verifiable spend");
+
+        assert_eq!(
+            summary.melted_singletons,
+            vec![melted_coin_id_hex(&coin_spends)],
+            "the summary must name the lineage this spend ends"
+        );
+        assert!(
+            summary.recipients.is_empty(),
+            "a melt creates no coin, so it can never be reviewed as a payment"
+        );
+    }
+
+    /// **Two melts are two entries.** A profile deletion ends BOTH of a profile's singletons, and a
+    /// summary that named only one would let the second be destroyed unreviewed — the original
+    /// defect, one lineage smaller. A single-melt fixture cannot see a `first()`-shaped bug.
+    #[test]
+    fn a_deletion_that_ends_two_singletons_names_both() {
+        let key = money_key().public_key();
+        let first = store_melt_owned_by(key, 0x11);
+        let second = store_melt_owned_by(key, 0x22);
+        let both: Vec<CoinSpend> = first.iter().chain(second.iter()).cloned().collect();
+
+        let summary = SpendSummary::from_coin_spends(&both, SpendTier::Confirm)
+            .expect("two terminal melts in one bundle are verifiable");
+
+        let mut named = summary.melted_singletons.clone();
+        let mut expected = vec![melted_coin_id_hex(&first), melted_coin_id_hex(&second)];
+        named.sort();
+        expected.sort();
+        assert_eq!(named, expected, "both destroyed lineages must be named");
+        assert_ne!(
+            expected[0], expected[1],
+            "the fixture must melt two DIFFERENT singletons, or it cannot see a dropped entry"
+        );
+    }
+
+    /// **A spend that destroys a singleton is never auto-sent**, however small its mojo total.
+    ///
+    /// The allowance here is a million mojos and the melt spends one, so the amount rule alone would
+    /// wave it through: the escalation can only come from the destruction itself. The control is the
+    /// send below, which is auto-sent under the SAME policy — so this test fails when the melt rule
+    /// is removed, and not merely when the allowance is misconfigured.
+    #[test]
+    fn a_melt_is_confirmed_by_a_human_even_when_its_value_fits_the_allowance() {
+        let coin_spends = store_melt_owned_by(money_key().public_key(), 0x11);
+        let summary = SpendSummary::classified(&coin_spends, &generous_hot_wallet())
+            .expect("a terminal singleton melt is a verifiable spend");
+
+        assert!(
+            summary.native_total_mojos() <= 1_000_000,
+            "the fixture must fit the allowance, or the escalation proves nothing"
+        );
+        assert_eq!(
+            summary.tier,
+            SpendTier::Confirm,
+            "destruction is not a value a limit can bound; it always reaches a human"
+        );
+    }
+
+    /// The control for the test above: an ordinary send of the same trivial value under the same
+    /// policy IS auto-sent. Without it, "the melt was confirmed" is indistinguishable from "this
+    /// policy confirms everything".
+    #[test]
+    fn an_ordinary_send_of_the_same_value_under_the_same_policy_is_auto_sent() {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        let key = money_key();
+        let mut ctx = SpendContext::new();
+        let coin = Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), 1_000);
+        let conditions = Conditions::new()
+            .create_coin(Bytes32::new([7u8; 32]), 1, Memos::None)
+            .create_coin(key.puzzle_hash(), 999, Memos::None);
+        StandardLayer::new(key.public_key())
+            .spend(&mut ctx, coin, conditions)
+            .expect("the control spend is well-formed");
+
+        let summary = SpendSummary::classified(&ctx.take(), &generous_hot_wallet())
+            .expect("an ordinary send is a verifiable spend");
+        assert_eq!(
+            summary.tier,
+            SpendTier::AutoSend,
+            "the control must be auto-sent, or the melt escalation above is vacuous"
+        );
+    }
+
+    /// **The rendered line says a singleton is destroyed.** The gate can refuse a melt the summary
+    /// omits, but a consumer rendering only recipients and the fee still shows a person "a send" —
+    /// the destruction named in the data and absent from the screen.
+    #[test]
+    fn the_rendered_summary_says_the_spend_destroys_a_singleton() {
+        let coin_spends = store_melt_owned_by(money_key().public_key(), 0x11);
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm)
+            .expect("a terminal singleton melt is a verifiable spend");
+
+        let rendered = summary.to_string();
+        assert!(
+            rendered.contains("destroys"),
+            "the melt must be stated, not left to a fee: {rendered}"
+        );
+        assert!(
+            rendered.contains(&melted_coin_id_hex(&coin_spends)),
+            "the destroyed lineage must be identified: {rendered}"
+        );
+    }
+
+    /// A spend that destroys nothing renders no destruction clause — so the clause above is
+    /// evidence of the melt rather than boilerplate every summary carries.
+    #[test]
+    fn an_ordinary_send_renders_no_destruction_clause() {
+        let rendered = SpendSummary::new(
+            SpendTier::Confirm,
+            vec![SpendRecipient::to_address("xch1abc", 600, None::<String>)],
+            10,
+        )
+        .to_string();
+        assert!(
+            !rendered.contains("destroys"),
+            "a send must not claim to destroy anything: {rendered}"
+        );
     }
 }

@@ -440,7 +440,8 @@ vetted `client` seam, and dig-account only wires it to the canonical money key. 
 `AccountError::Spend`.
 
 `SpendSummary` is the structured, independently re-derived effect of a spend the confirm ceremony renders:
-`{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id, destination}>, fee }`. It is built
+`{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id, destination}>, fee,
+melted_singletons: Vec<String> }`. It is built
 from the coin spends alone via `dig-wallet-backend`'s `client::verify::derive_summary` (never an
 engine-supplied claim); `SpendTier` (`AutoSend` / `Confirm` / `Vault`) classifies the spend under the
 profile's `CustodyPolicy`.
@@ -452,6 +453,25 @@ own). A CAT amount MUST be rendered as its BASE UNITS, said in those words besid
 NOT be divided by any factor: a recipient carries an asset id, not a precision, and CATs do not agree on
 one, so applying $DIG's three decimals would be confidently wrong for every other CAT. A line MUST NOT
 mix units it does not name.
+
+#### 5.2.1 Destruction MUST be named, never charged
+
+A spend that permanently DESTROYS a singleton — a DID, a dig-store, a profile — MUST name every
+destroyed coin id in `SpendSummary::melted_singletons`, as lowercase hex, exactly as
+`dig-wallet-backend`'s re-derivation reports it. A melt creates no coin and moves the singleton's lone
+mojo only through the fee, so a summary without this field describes the end of a user's identity as a
+fee one mojo larger — the shape in which a melt can be appended to an ordinary send and confirmed as
+that send.
+
+`Display` MUST state the destruction as its own clause naming each destroyed coin id, and MUST NOT state
+one for a spend that destroys nothing. Any consumer rendering a confirm surface MUST render this field;
+rendering only recipients and the fee shows a person a send.
+
+A spend for which `SpendSummary::destroys_singletons()` holds MUST NOT be classified `AutoSend`: what a
+spend costs and what it destroys are different questions, and no mojo limit answers the second.
+
+`dig-wallet-backend`'s signing core compares the destroyed multiset against its own derivation and
+refuses any mismatch, so a builder that omits an entry cannot sign at all.
 
 ### 5.3 Domain-separation tags
 
@@ -683,6 +703,9 @@ limit. Persisting the ledger is tracked separately.
    be decided by exactly one arm of a wildcard-free match, so (a) a `SpendTier` variant added later is a
    compile error rather than a variant inheriting some other tier's decision, and (b) no two guards can
    produce the same outcome for one tier — which would leave the narrower rule pinned by nothing.
+3a. **Destruction.** A spend naming any `melted_singletons` entry MUST be classified `Confirm` rather
+   than `AutoSend` (§5.2.1), before any bound is consulted. A melt spends one mojo, so every allowance
+   would otherwise wave through the permanent end of a DID or a dig-store.
 4. **Global switch.** `AutoSendPolicy::enabled == false` implies `RequiresConfirmation` for everything.
 5. **Op class.** `SpendOpClass::Undeclared` implies `RequiresConfirmation`: no intent was declared, so no
    configured bound applies and the answer belongs to the human. It MUST NOT be a refusal — a request
@@ -1316,7 +1339,9 @@ they MUST stay separable: a host renders a form, previews the result offline, an
 
 * `read_profile(anchor, chain, content) -> ProfileSnapshot` — what the profile publishes now.
 * `ProfileEdit` — a set-and-remove batch, built offline, committing nothing.
-* `UnlockedAccount::profile_editor() -> ProfileEditor`, whose `commit_edit` builds, signs and pushes.
+* `UnlockedAccount::profile_editor() -> ProfileEditor`, whose `commit_edit` builds, signs and pushes a
+  DELTA over the profile's published body, and whose `publish_profile` commits a whole profile with no
+  prior read (§6D.4a).
 
 The public vocabulary of this seam is the crate's OWN. `ProfileSlot` is a closed enum over the ten
 standard person-facing slots (display name `0x0001`, bio `0x0002`, avatar `0x0003`, banner `0x0004`,
@@ -1394,6 +1419,27 @@ rebuilds the seed body the store launch's root commits to, from the seed the cal
 `commit_edit` is safe to call again on either. It reads chain FIRST, and when the profile's current root
 already equals the root the batch would commit it returns `Confirmed` without building or pushing anything.
 So a retry after an unanswered push re-reads rather than re-spends.
+
+### 6D.4a Absolute publish — recovering a profile whose body is lost (normative)
+
+`ProfileEditor::publish_profile` commits a WHOLE `Profile` at a store, reading only the chain. It exists
+because a delta is impossible once a body is gone: `commit_edit` applies its batch on top of the body it
+reads back, so a profile whose bytes exist nowhere has no base to edit and no sequence of edits that can
+produce one. It MUST NOT read the profile's content, and MUST NOT take a `ProfileContentSource` — not
+reading the old body IS the capability.
+
+The published root MUST commit to exactly the profile supplied. It is an OVERWRITE, never a merge: slots
+the supplied profile does not carry are no longer anchored. It therefore MAY be called with an
+effectively empty profile and MUST publish it — nothing at this layer can distinguish a deliberate reset
+from an accident, because both arrive as the same argument. A surface offering this MUST NOT present an
+unreadable body as an empty draft a user then saves.
+
+A profile without its schema version MUST be refused (`EditError::Refused`) before any chain read or
+spend; a body without it is not a profile a reader can interpret.
+
+Retry-safety is preserved in the only form available without a body: when the store's CURRENT on-chain
+root already equals the root the profile would commit, `publish_profile` MUST return `Confirmed` without
+building or pushing anything.
 
 ### 6D.5 The signing gate (normative)
 
