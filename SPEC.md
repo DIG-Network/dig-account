@@ -156,7 +156,7 @@ resume parents its store launch from.
 2. **A confirmed height MUST NOT be zero.** No coin is created in block 0, so a zero is fabricated by
    construction — `MintedDid::from_confirmed` and `ConfirmedStore::from_confirmed` both refuse it, and a
    file MUST NOT be able to smuggle it past them. Applies to both halves of an anchor and to journalled
-   records.
+   records, and to a recorded profile END (§2.4.5).
 3. **A journalled `store_fee` MUST NOT exceed `MAX_MINT_FEE_MOJOS`**, on construction and on load. A
    resumed phase B spends the journalled fee with no phase-A context to re-validate against, so the file
    — not an argument — is the path that would otherwise hand an unbounded fee to a farmer.
@@ -172,31 +172,6 @@ any key deriving at that index, and coins at that address stay spendable. Visibi
 express deletion and the enum MUST NOT grow a variant for it: a profile ends on the CHAIN, by melting its
 singletons, and that fact is recorded separately (§2.4.5). Hiding an ended profile would leave the record
 resurrectable by un-hiding it.
-
-#### 2.4.5 The end of a profile (normative)
-
-A profile ENDS when both of its singletons — the DID and the dig-store — have been melted and both melts
-CONFIRMED by a chain read. `ProfileRegistry::record_melted(ix, at_height)` is the only way to record it,
-and a host MUST call it only from a confirmed read, never from an accepted submission.
-
-- **The entry is KEPT, marked ended — never deleted.** A profile that ended is a different fact from a
-  profile that never existed, and only one of those can be said with an absence. The DID string remains
-  the correct answer to what the account used to be.
-- **`at_height` MUST NOT be zero** (`ProfileEndHeightZero`), for the same reason a confirmed mint height
-  may not be: zero is what an unconfirmed read looks like.
-- **An ended profile MUST NOT be active, MUST NOT appear in `shown()`, and MUST NOT be re-activated**
-  (`set_active` returns `ProfileEnded`). When the ended profile WAS active the slot moves to the
-  lowest-indexed remaining live profile, or is CLEARED when none remains — an account whose only profile
-  was deleted legitimately has no active profile, and `ProfileEndOutcome` names which of those happened
-  so a host can disclose a switch the user did not choose.
-- **Recording an end is IDEMPOTENT.** A second call returns `AlreadyEnded`, changes nothing, and MUST NOT
-  overwrite the first confirmed height — a host retrying after a crash mid-ceremony must not move the
-  active slot twice.
-- **The field is OMITTED while a profile is live**, never serialized as `null`, so a file this version
-  writes stays byte-identical for a live profile and an older dig-account still loads it. An older reader
-  MUST refuse a file containing an ENDED entry (its `deny_unknown_fields` does so), which is the
-  fail-closed outcome: a version with no concept of deletion would otherwise present a retired profile as
-  live.
 
 #### 2.4.3 The mint journal
 
@@ -254,6 +229,33 @@ TRUST PREDICATE. The direct-launch shape that writes the memos is not available 
 it requires an odd-amount `CREATE_COIN` from the DID coin, which a singleton may not emit (§6B.1). A
 consumer MUST resolve a profile store from its DID, and MUST NOT rely on a launcher-memo scan finding
 one.
+
+#### 2.4.5 The end of a profile (normative)
+
+A profile ENDS when both of its singletons — the DID and the dig-store — have been melted and both melts
+CONFIRMED by a chain read. `ProfileRegistry::record_melted(ix, at_height)` is the only way to record it,
+and a host MUST call it only from a confirmed read, never from an accepted submission.
+
+- **The entry is KEPT, marked ended — never deleted.** A profile that ended is a different fact from a
+  profile that never existed, and only one of those can be said with an absence. The DID string remains
+  the correct answer to what the account used to be.
+- **`at_height` MUST NOT be zero** (`ProfileEndHeightZero`), for the same reason a confirmed mint height
+  may not be: zero is what an unconfirmed read looks like. `ProfileEnd` derives `Deserialize`, so `check`
+  MUST re-assert this on load exactly as it does for the anchor heights (§2.4.1a rule 2); otherwise a file
+  reaches the field without passing the constructor.
+- **An ended profile MUST NOT be active, MUST NOT appear in `shown()`, and MUST NOT be re-activated**
+  (`set_active` returns `ProfileEnded`). When the ended profile WAS active the slot moves to the
+  lowest-indexed remaining live profile, or is CLEARED when none remains — an account whose only profile
+  was deleted legitimately has no active profile, and `ProfileEndOutcome` names which of those happened
+  so a host can disclose a switch the user did not choose.
+- **Recording an end is IDEMPOTENT.** A second call returns `AlreadyEnded`, changes nothing, and MUST NOT
+  overwrite the first confirmed height — a host retrying after a crash mid-ceremony must not move the
+  active slot twice.
+- **The field is OMITTED while a profile is live**, never serialized as `null`, so a file this version
+  writes stays byte-identical for a live profile and an older dig-account still loads it. An older reader
+  MUST refuse a file containing an ENDED entry (its `deny_unknown_fields` does so), which is the
+  fail-closed outcome: a version with no concept of deletion would otherwise present a retired profile as
+  live.
 
 ## 3. Key derivation (byte-contracts — additive, back-compatible forever)
 
@@ -1522,4 +1524,3 @@ Conformance for §2.0 and the phrase API MUST prove, using TWO accounts with unr
   `dig-identity` / `dig-session` / `dig-constants`.
 
 
-<!-- loop/3068: melt custody-gate measurement in progress -->
