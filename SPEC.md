@@ -1339,7 +1339,9 @@ they MUST stay separable: a host renders a form, previews the result offline, an
 
 * `read_profile(anchor, chain, content) -> ProfileSnapshot` — what the profile publishes now.
 * `ProfileEdit` — a set-and-remove batch, built offline, committing nothing.
-* `UnlockedAccount::profile_editor() -> ProfileEditor`, whose `commit_edit` builds, signs and pushes.
+* `UnlockedAccount::profile_editor() -> ProfileEditor`, whose `commit_edit` builds, signs and pushes a
+  DELTA over the profile's published body, and whose `publish_profile` commits a whole profile with no
+  prior read (§6D.4a).
 
 The public vocabulary of this seam is the crate's OWN. `ProfileSlot` is a closed enum over the ten
 standard person-facing slots (display name `0x0001`, bio `0x0002`, avatar `0x0003`, banner `0x0004`,
@@ -1417,6 +1419,27 @@ rebuilds the seed body the store launch's root commits to, from the seed the cal
 `commit_edit` is safe to call again on either. It reads chain FIRST, and when the profile's current root
 already equals the root the batch would commit it returns `Confirmed` without building or pushing anything.
 So a retry after an unanswered push re-reads rather than re-spends.
+
+### 6D.4a Absolute publish — recovering a profile whose body is lost (normative)
+
+`ProfileEditor::publish_profile` commits a WHOLE `Profile` at a store, reading only the chain. It exists
+because a delta is impossible once a body is gone: `commit_edit` applies its batch on top of the body it
+reads back, so a profile whose bytes exist nowhere has no base to edit and no sequence of edits that can
+produce one. It MUST NOT read the profile's content, and MUST NOT take a `ProfileContentSource` — not
+reading the old body IS the capability.
+
+The published root MUST commit to exactly the profile supplied. It is an OVERWRITE, never a merge: slots
+the supplied profile does not carry are no longer anchored. It therefore MAY be called with an
+effectively empty profile and MUST publish it — nothing at this layer can distinguish a deliberate reset
+from an accident, because both arrive as the same argument. A surface offering this MUST NOT present an
+unreadable body as an empty draft a user then saves.
+
+A profile without its schema version MUST be refused (`EditError::Refused`) before any chain read or
+spend; a body without it is not a profile a reader can interpret.
+
+Retry-safety is preserved in the only form available without a body: when the store's CURRENT on-chain
+root already equals the root the profile would commit, `publish_profile` MUST return `Confirmed` without
+building or pushing anything.
 
 ### 6D.5 The signing gate (normative)
 
