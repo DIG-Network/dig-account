@@ -38,6 +38,21 @@ pub enum AccountError {
     #[error("the active profile {0} cannot be hidden from lists")]
     ActiveProfileCannotBeHidden(ProfileIx),
 
+    /// The profile has ENDED on chain — both of its singletons were melted — so it cannot be made
+    /// active, and no host may present it as a live profile.
+    ///
+    /// The entry is deliberately KEPT rather than deleted: its DID string remains the right answer
+    /// to "what did this account used to be", and an absence cannot say that a profile ended.
+    #[error("profile {0} has ended on the blockchain and cannot be made active")]
+    ProfileEnded(ProfileIx),
+
+    /// A profile end was recorded at height 0, which no on-chain confirmation can produce.
+    ///
+    /// Recording one would let a submission masquerade as a confirmation — the same rule the mint
+    /// anchors enforce (`SPEC.md` §2.4).
+    #[error("a profile end at height 0 is not evidence of a confirmed melt")]
+    ProfileEndHeightZero,
+
     /// A mint is already journalled at this index.
     ///
     /// Beginning a second one would re-mint a DID that may already be paid for, orphaning the

@@ -1,8 +1,47 @@
 //! [`ProfileEntry`] — one confirmed profile as the registry holds it.
 
+use crate::error::{AccountError, Result};
 use crate::id::ProfileIx;
 use crate::registry::anchor::ProfileAnchor;
 use crate::registry::visibility::ProfileVisibility;
+
+/// The on-chain END of a profile: both of its singletons melted, proven by a chain read
+/// (dig_ecosystem#3067).
+///
+/// # Why an END and not a deletion
+///
+/// A profile that ended is a different fact from a profile that never existed, and only one of them
+/// can be said with an absence. The DID string of an ended profile is still the correct answer to
+/// "what did this account used to be", every reference to it elsewhere is still legitimately
+/// unresolvable, and a host has something honest to draw — *"ended on the blockchain in block N"* —
+/// instead of a profile that silently vanished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileEnd {
+    /// The height at which the LAST of the two melts was confirmed.
+    at_height: u32,
+}
+
+impl ProfileEnd {
+    /// Record an end confirmed at `at_height`.
+    ///
+    /// # Errors
+    ///
+    /// [`AccountError::ProfileEndHeightZero`] — height 0 is what an unconfirmed read looks like, and
+    /// admitting it would let a mere submission be stored as a confirmation. The mint anchors refuse
+    /// a zero height for the same reason.
+    pub(crate) fn at(at_height: u32) -> Result<Self> {
+        if at_height == 0 {
+            return Err(AccountError::ProfileEndHeightZero);
+        }
+        Ok(Self { at_height })
+    }
+
+    /// The height at which the profile's last singleton melt was confirmed.
+    pub fn at_height(self) -> u32 {
+        self.at_height
+    }
+}
 
 /// One confirmed profile: the HD index its keys derive at, the on-chain anchor that proves it
 /// exists, and the two purely local decorations (a label and a list visibility).
@@ -31,6 +70,18 @@ pub struct ProfileEntry {
     /// the field and were all shown.
     #[serde(default)]
     visibility: ProfileVisibility,
+    /// The on-chain end of this profile, once both singletons have been melted and the melts
+    /// confirmed. Absent in older records, which all predate deletion and are therefore live.
+    ///
+    /// **Omitted entirely while the profile is live**, not written as `null`. Every reader of this
+    /// struct is `deny_unknown_fields`, so a file this version writes must stay byte-identical for a
+    /// live profile or an older dig-account refuses to load a registry it fully understands
+    /// (`a_registry_written_before_the_chia_0_36_migration_still_round_trips_byte_identically`
+    /// caught exactly that). An older reader encountering an ENDED entry does refuse the load — and
+    /// that is the fail-closed answer, because a version with no concept of deletion would otherwise
+    /// present a retired profile as live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ended: Option<ProfileEnd>,
 }
 
 impl ProfileEntry {
@@ -42,6 +93,7 @@ impl ProfileEntry {
             anchor,
             label,
             visibility: ProfileVisibility::Shown,
+            ended: None,
         }
     }
 
@@ -66,8 +118,28 @@ impl ProfileEntry {
     }
 
     /// Whether this profile is offered in the host's lists.
+    ///
+    /// Visibility is a purely LOCAL preference and says nothing about whether the profile still
+    /// exists on chain — check [`is_live`](Self::is_live) for that. The registry's own
+    /// [`shown`](crate::registry::ProfileRegistry::shown) requires both.
     pub fn is_shown(&self) -> bool {
         self.visibility == ProfileVisibility::Shown
+    }
+
+    /// The on-chain end of this profile, or `None` while it still exists.
+    pub fn ended(&self) -> Option<ProfileEnd> {
+        self.ended
+    }
+
+    /// Whether this profile still exists on chain.
+    pub fn is_live(&self) -> bool {
+        self.ended.is_none()
+    }
+
+    /// Record the on-chain end. Crate-private so the registry stays the single writer and can move
+    /// the active slot off an ended profile in the same operation.
+    pub(crate) fn end(&mut self, end: ProfileEnd) {
+        self.ended = Some(end);
     }
 
     /// Set the local label. Crate-private so the registry stays the single writer.

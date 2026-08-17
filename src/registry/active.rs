@@ -69,6 +69,31 @@ pub struct ActiveSwitch {
     pub to: ProfileIx,
 }
 
+/// What happened to the active slot when a profile ENDED on chain (dig_ecosystem#3067).
+///
+/// # Why this is not an [`ActiveSwitch`]
+///
+/// A switch always names a destination, because switching to nothing is not a switch. Ending the
+/// account's LAST profile leaves no destination at all, and that state — a real one, reached by
+/// deleting an only profile — is exactly what the registry previously had no way to express. Naming
+/// the four outcomes separately keeps `ActiveSwitch::to` an honest `ProfileIx` rather than an
+/// `Option` every existing caller would have to unwrap for a case that cannot happen to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a host MUST disclose an active-profile change the user did not choose"]
+pub enum ProfileEndOutcome {
+    /// The ended profile was not the active one; the active slot did not move.
+    Recorded,
+    /// The ended profile WAS active, and the slot moved to the lowest-indexed remaining live
+    /// profile. The user did not choose this switch, so a host must say it happened.
+    ActiveMoved(ActiveSwitch),
+    /// The ended profile WAS active and NO live profile remains: the account now has no active
+    /// profile at all. Every identity surface must stop claiming one.
+    NoLiveProfileRemains,
+    /// The profile had already ended. Nothing changed — recording an end twice is a no-op, so a
+    /// host retrying after a crash mid-ceremony cannot move the active slot a second time.
+    AlreadyEnded,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
