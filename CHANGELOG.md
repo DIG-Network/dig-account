@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-08-18
+
+### Features
+- **wallet:** Name the NFT a spend moves and who gets it, and never auto-send one (#24)
+
 ## [0.18.0] - 2026-08-17
 
 ### Features
