@@ -48,6 +48,7 @@ pub mod edit;
 pub mod error;
 pub mod id;
 pub mod keys;
+pub mod melt;
 pub mod mint;
 pub mod model;
 pub mod profile_mint;

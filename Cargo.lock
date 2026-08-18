@@ -1363,7 +1363,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1379,7 +1379,7 @@ dependencies = [
  "clvmr",
  "dig-chainsource-interface",
  "dig-constants",
- "dig-did",
+ "dig-did 0.7.0",
  "dig-identity 0.6.0",
  "dig-ipc-protocol",
  "dig-keystore",
@@ -1442,6 +1442,23 @@ name = "dig-did"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a233870755265212b5f17700d067d31b6c93d4b598a213cffc23215196ee299"
+dependencies = [
+ "chia-protocol",
+ "chia-puzzle-types",
+ "chia-puzzles",
+ "chia-sdk-utils",
+ "chia-wallet-sdk",
+ "clvm-traits 0.36.1",
+ "clvm-utils",
+ "dig-chainsource-interface",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "dig-did"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49e7ac5054f7dc9753922f7eb0d550f94b84ab487b989d80a30dfdb45fa12f90"
 dependencies = [
  "chia-protocol",
  "chia-puzzle-types",
@@ -1579,7 +1596,7 @@ checksum = "80244160b8e00e8c3362773e3b0f5732de527aef4d361470f10d17fd50a09588"
 dependencies = [
  "chia-protocol",
  "chia-sdk-utils",
- "dig-did",
+ "dig-did 0.6.0",
  "dig-identity 0.7.0",
  "dig-smt",
  "dig-store",

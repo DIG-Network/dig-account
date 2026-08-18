@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -45,7 +45,18 @@ dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
 # spend bundle; it supplies the funding coin, signs what dig-did reports, and broadcasts.
-dig-did = "0.6"
+# 0.7 is the first release carrying `dig_did::melt`, without which a profile cannot be deleted at
+# all: the DID half of the deletion has no builder before it. Its dependency set is the same chia
+# 0.36.1 / chia-wallet-sdk 0.34 family this crate already resolves, so the bump costs no second
+# subtree.
+#
+# It DOES resolve a second dig-did LINE, because dig-social-profile 0.6 pins ^0.6 and no later
+# release exists. That is tolerable only because the dig-social-profile boundary is narrow by
+# construction — slots go in, a plain `[u8; 32]` root comes out — so no dig-did type crosses it and
+# the two lines can never meet. Re-check that with `cargo tree -i dig-did@0.6.0` after any bump; if
+# a dig-did type ever DOES cross that boundary, the second line becomes a byte-drift hazard and
+# dig-social-profile must be released onto ^0.7 first.
+dig-did = "0.7"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.

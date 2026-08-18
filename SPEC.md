@@ -1485,6 +1485,62 @@ derived only after the residency is confirmed live, so a relocked account produc
 The §908 boundary binds unchanged: `SpendPublisher` takes an ALREADY-SIGNED bundle, and a node implementing
 it can broadcast and can never sign.
 
+## 6E. The profile-melt seam (deleting a profile)
+
+A profile is TWO singletons — a DID and a DID-rooted dig-store — so ending one spends TWO coins in ONE
+bundle. `ProfileMelter`, obtained from `UnlockedAccount::profile_melter()`, is the only code path that
+builds such a bundle. The mint's one-funding-coin rule (§6A) and the edit's one-recreated-singleton rule
+(§6D) are unchanged and remain in force for those seams; the melt seam states its own rule for its own act.
+
+### 6E.1 The pre-signing gate
+
+Before any signature exists, `gate_profile_melt` MUST hold:
+
+1. The bundle spends **exactly two** coins.
+2. Those two coin ids, compared as a SET, equal the DID tip coin and the store tip coin the profile's own
+   `ProfileAnchor` resolved to. A third spend, a substituted coin, and the same singleton twice are each
+   refused (`MeltError::Refused`).
+3. Every signature requirement is a BLS `AGG_SIG_ME` under THIS profile's own wallet key. An
+   `AGG_SIG_UNSAFE` requirement, or one under any other key, is refused.
+
+Control of each singleton is established before its spend is built: `dig_did::melt` refuses unless the
+owner key curries to the DID's own inner puzzle hash, and the store half is cleared by the same
+store-identity gate the edit seam applies (owner puzzle hash is this profile's wallet, launcher id is the
+one the anchor names, delegated-puzzle set empty).
+
+### 6E.2 Both tips are re-read BY NAME before either melt is built
+
+A singleton lineage walk follows recreations until it reaches a coin with no children, and a MELTED
+singleton's last coin has no children either — so a walk returns the coin a previous deletion already
+spent. Each tip is therefore re-read by coin id (`chain_confirm`, §6.x). A record calling the coin spent
+is proof the profile has already ended (`MeltError::NoDid` / `MeltError::NoStore`); any other disagreement
+leaves its state UNKNOWN (`MeltError::ChainUnreachable`) and MUST NOT be reported as deleted.
+
+### 6E.3 Deletion is irreversible, and the consent surface MUST name it
+
+`preview_deletion` performs every chain read and every refusal the signing path performs and stops one
+statement before the signature, returning a `DeletionPreview` that NAMES: the `did:chia:` identifier that
+becomes permanently unresolvable, both launcher ids, both tip coin ids, and the mojos destroyed. The
+preview and the signed bundle are derived from the SAME built-and-gated plan, so they cannot describe
+different destructions. A host MUST NOT present a deletion as a value delta alone: two destroyed mojos are
+indistinguishable from dust, and the destruction is the thing being consented to.
+
+The melted amount is UNRECOVERABLE by construction. The singleton top layer permits at most one odd-amount
+`CREATE_COIN` and the melt condition `(51 () -113)` — itself odd — occupies it; a second odd output makes
+the puzzle fail and an even output cannot carry an odd amount. The amount becomes an implicit fee to the
+farmer: one mojo per conventional singleton. No refund path exists or can exist.
+
+### 6E.4 Status
+
+`MeltStatus::Pushed { did_coin_id, store_coin_id }` reports mempool acceptance and proves nothing: both
+singletons are still alive. `melt_status` reads BOTH coins by name and returns
+`MeltStatus::Confirmed { at_height }` — the LATER of the two spent heights — only when both are spent. One
+of two melts confirming is a HALF-deleted profile and MUST NOT read as confirmed. Only a `Confirmed` height
+may be written to `ProfileRegistry::record_melted`, which the host does; the melt seam never touches the
+registry.
+
+The §908 boundary binds unchanged: `SpendPublisher` takes an ALREADY-SIGNED bundle.
+
 ## 7. The injected UI/auth-provider seam (host boundary)
 
 The host harness implements `AuthProvider`: `collect_factors(UnlockRequest) -> AuthFactors` (the unlock
@@ -1597,5 +1653,6 @@ Conformance for §2.0 and the phrase API MUST prove, using TWO accounts with unr
   normative contract.
 - Key derivations conform to the Chia canonical wallet path (§3.2) and the DIG identity/DEK contracts in
   `dig-identity` / `dig-session` / `dig-constants`.
+
 
 
