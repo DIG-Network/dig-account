@@ -441,7 +441,7 @@ vetted `client` seam, and dig-account only wires it to the canonical money key. 
 
 `SpendSummary` is the structured, independently re-derived effect of a spend the confirm ceremony renders:
 `{ tier: SpendTier, recipients: Vec<SpendRecipient{address, amount_mojos, asset_id, destination}>, fee,
-melted_singletons: Vec<String> }`. It is built
+melted_singletons: Vec<String>, nft_operations: Vec<String> }`. It is built
 from the coin spends alone via `dig-wallet-backend`'s `client::verify::derive_summary` (never an
 engine-supplied claim); `SpendTier` (`AutoSend` / `Confirm` / `Vault`) classifies the spend under the
 profile's `CustodyPolicy`.
@@ -472,6 +472,32 @@ spend costs and what it destroys are different questions, and no mojo limit answ
 
 `dig-wallet-backend`'s signing core compares the destroyed multiset against its own derivation and
 refuses any mismatch, so a builder that omits an entry cannot sign at all.
+
+#### 5.2.2 An NFT act MUST be named with its OWNER, never priced
+
+A spend that TRANSFERS or MINTS an NFT MUST name every such act in `SpendSummary::nft_operations`,
+as the canonical sentence `dig-wallet-backend`'s `NftOperation::describe` produces — `transfer nft1… to
+xch1…`, `mint nft1… owned by xch1…`. An NFT act nets ~0 XCH: a transfer re-homes the singleton's lone
+mojo to itself and a mint creates one worth a mojo, so an act described by value alone is a dust
+payment on the screen and an asset gone on chain.
+
+The sentence MUST name the OWNER the NFT ends up with, and MUST come from that one function rather than
+from a locally-worded copy. Neither act is identified by its `nft1…` alone: a transfer's whole effect IS
+the change of owner, and a mint's launcher id is a function of the FUNDING COIN, so it is byte-identical
+whoever ends up holding the NFT — an owner-blind sentence renders a hijack and an honest act the same
+(NC-14). Rendering and the signing gate's comparison MUST share the one function, or a person can
+approve a sentence the gate never checked.
+
+`Display` MUST state each act as its own clause, and MUST NOT state one for a spend that touches no NFT.
+Any consumer rendering a confirm surface MUST render this field.
+
+A spend for which `SpendSummary::moves_nfts()` holds MUST NOT be classified `AutoSend`, at any tier and
+under any allowance. A mojo-denominated limit cannot bound an NFT's value, and the ~0 XCH a transfer
+nets falls under every threshold a person could configure — including the smallest one they would set
+precisely to keep valuable things out of the auto-send class.
+
+`dig-wallet-backend`'s signing core compares the NFT multiset against its own derivation and refuses any
+mismatch, so a builder that omits an act cannot sign at all.
 
 ### 5.3 Domain-separation tags
 
@@ -706,6 +732,9 @@ limit. Persisting the ledger is tracked separately.
 3a. **Destruction.** A spend naming any `melted_singletons` entry MUST be classified `Confirm` rather
    than `AutoSend` (§5.2.1), before any bound is consulted. A melt spends one mojo, so every allowance
    would otherwise wave through the permanent end of a DID or a dig-store.
+3b. **NFT movement.** A spend naming any `nft_operations` entry MUST be classified `Confirm` rather
+   than `AutoSend` (§5.2.2), before any bound is consulted. A transfer nets ~0 XCH, so every allowance
+   would otherwise wave through the handover of an asset.
 4. **Global switch.** `AutoSendPolicy::enabled == false` implies `RequiresConfirmation` for everything.
 5. **Op class.** `SpendOpClass::Undeclared` implies `RequiresConfirmation`: no intent was declared, so no
    configured bound applies and the answer belongs to the human. It MUST NOT be a refusal — a request
