@@ -14,6 +14,7 @@ use crate::edit::ProfileEditor;
 use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
+use crate::melt::ProfileMelter;
 use crate::profile_mint::ProfileMinter;
 use crate::session_residency::Residency;
 use crate::signer::ProfileSigner;
@@ -144,6 +145,17 @@ impl UnlockedAccount {
     /// account relocks rather than at the next unlock check.
     pub fn profile_editor(&self) -> ProfileEditor {
         ProfileEditor::new(self.seed.clone(), self.residency.clone())
+    }
+
+    /// A melter for DELETING profiles this account owns.
+    ///
+    /// Deletion is irreversible: it destroys both of a profile's singletons, and neither can ever be
+    /// recreated. [`ProfileMelter`] observes this unlock's [`Residency`] for
+    /// [`profile_editor`](Self::profile_editor)'s reason, with more at stake — a deletion signed
+    /// after the account relocked would be an irreversible act authorized by a session the user had
+    /// already ended.
+    pub fn profile_melter(&self) -> ProfileMelter {
+        ProfileMelter::new(self.seed.clone(), self.residency.clone())
     }
 
     /// The per-profile data-encryption key (DEK) for profile `ix` — 32 bytes, derived from the seed

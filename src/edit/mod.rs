@@ -47,3 +47,10 @@ pub use error::{EditError, EditResult};
 pub use fields::ProfileFields;
 pub use read::{read_profile, ProfileSnapshot};
 pub use slot::ProfileSlot;
+
+// Crate-internal, for the melt seam (`crate::melt`). Deleting a profile destroys the very store an
+// edit recreates, so it must authenticate the store tip and establish ownership of it by exactly the
+// same rules — a second walk or a second ownership rule here would be a second answer that could
+// drift from this one, on the path where being wrong signs away someone else's singleton.
+pub(crate) use commit::gate_store_identity;
+pub(crate) use read::resolve_store_tip;

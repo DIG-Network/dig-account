@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-08-18
+
+### Features
+- **melt:** Make profile deletion expressible: build, gate, preview and sign a two-singleton melt (#25)
+
 ## [0.19.0] - 2026-08-18
 
 ### Features

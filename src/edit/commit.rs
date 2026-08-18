@@ -494,7 +494,7 @@ fn reject_protected_removals(edit: &ProfileEdit) -> EditResult<()> {
 ///
 /// The mint seam never needed this rule because it derives the owner LOCALLY; the edit seam is the
 /// first code here to take a store's identity from chain, so it is the first that must check it.
-fn gate_store_identity(
+pub(crate) fn gate_store_identity(
     wallet: &WalletKey,
     expected_launcher_id: Bytes32,
     store: &DataStore<DigDataStoreMetadata>,
