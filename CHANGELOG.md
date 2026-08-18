@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.20.0] - 2026-08-18
 
 ### Features
-- **melt:** Make profile deletion expressible: build, gate, preview and sign a two-singleton melt (#25)
+- **melt:** Make profile deletion expressible (#25)
 
 ## [0.19.0] - 2026-08-18
 
