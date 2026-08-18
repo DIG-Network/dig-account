@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
