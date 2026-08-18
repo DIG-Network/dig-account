@@ -1254,3 +1254,227 @@ mod melting_a_singleton_is_named_not_charged {
         );
     }
 }
+
+/// **An NFT act is worth ~0 XCH, so it must be NAMED — value alone cannot describe it.**
+///
+/// A transfer re-homes the singleton's lone mojo to itself; a mint creates one worth a mojo. Neither
+/// moves a recipient line or a fee by anything a person would notice, so a summary that only prices
+/// a spend shows the same screen for "give away your asset" and "spend dust". The tests here pin the
+/// three properties that close it: the act is NAMED with its NEW OWNER, the rendered line says so,
+/// and an NFT act can never be auto-sent.
+#[cfg(test)]
+mod an_nft_act_is_named_not_priced {
+    use super::*;
+    use crate::id::ProfileIx;
+    use crate::keys::wallet_key::WalletKey;
+    use crate::wallet::nft_fixture::{
+        launcher_id, nft_mint_to, nft_transfer_to, RECIPIENT_PUZZLE_HASH,
+    };
+    use crate::wallet::policy::HotWallet;
+
+    /// A SECOND destination, so an owner-blind sentence is observable: two acts on the SAME NFT
+    /// differing only in who ends up with it must not read the same.
+    const OTHER_OWNER: Bytes32 = Bytes32::new([0x3e; 32]);
+
+    /// The wallet's own money key — every fixture below acts on an NFT this wallet can sign for.
+    fn money_key() -> WalletKey {
+        WalletKey::from_seed_at(&[0x42u8; 32], ProfileIx::ROOT)
+    }
+
+    /// Bech32, through the same encoder the sentence itself is built with.
+    fn address(hash: Bytes32, prefix: &str) -> String {
+        chia_wallet_sdk::utils::Address::new(hash, prefix.to_string())
+            .encode()
+            .expect("a 32-byte hash encodes")
+    }
+
+    /// A policy whose allowance dwarfs an NFT act's few mojos — the fixture that makes the auto-send
+    /// test load-bearing. Under a tight allowance the act would tier `Confirm` on its amount alone
+    /// and the test would pass with the rule deleted.
+    fn generous_hot_wallet() -> CustodyPolicy {
+        CustodyPolicy::Hot(HotWallet {
+            auto_send_limit: 1_000_000,
+        })
+    }
+
+    /// **A transfer names the NFT and the owner it moves to.** Without the name the person confirms
+    /// a dust amount while an asset leaves; without the owner, an engine could substitute its own p2
+    /// hash for the one the person chose and still render a byte-identical sentence.
+    #[test]
+    fn a_transfer_names_the_nft_and_the_owner_it_moves_to() {
+        let key = money_key().public_key();
+        let coin_spends = nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44);
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm)
+            .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        let nft = address(launcher_id(key, money_key().puzzle_hash(), 0x44), "nft");
+        let new_owner = address(RECIPIENT_PUZZLE_HASH, "xch");
+
+        assert!(
+            summary
+                .nft_operations
+                .contains(&format!("transfer {nft} to {new_owner}")),
+            "the summary must name the NFT and where it goes, got {:?}",
+            summary.nft_operations
+        );
+    }
+
+    /// **The OWNER is load-bearing, not decoration (NC-14).** Two transfers of the SAME NFT to two
+    /// different people share a launcher id, so a sentence naming only the `nft1…` is byte-identical
+    /// for both — the human approving one would be approving either. This fails the moment the owner
+    /// stops being part of the sentence the summary carries.
+    #[test]
+    fn two_transfers_of_the_same_nft_to_different_owners_read_differently() {
+        let key = money_key().public_key();
+        let honest = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("the honest transfer is verifiable");
+        let elsewhere = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, OTHER_OWNER, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("the re-homed transfer is verifiable");
+
+        assert_eq!(
+            honest.native_total_mojos(),
+            elsewhere.native_total_mojos(),
+            "the two fixtures must move the same value, or the destination is not what \
+             distinguishes them"
+        );
+        assert_ne!(
+            honest.nft_operations, elsewhere.nft_operations,
+            "two transfers of one NFT to different owners must not read the same"
+        );
+    }
+
+    /// **The same, for a mint.** A mint's launcher id is a function of the FUNDING COIN alone, so it
+    /// is byte-identical whoever ends up owning the new NFT: a mint to the user and a mint to an
+    /// attacker are the same `nft1…`. Holding the funding coin constant is what makes that visible.
+    #[test]
+    fn two_mints_of_the_same_launcher_to_different_owners_read_differently() {
+        let key = money_key().public_key();
+        let to_recipient = SpendSummary::from_coin_spends(
+            &nft_mint_to(key, RECIPIENT_PUZZLE_HASH, 0x55),
+            SpendTier::Confirm,
+        )
+        .expect("the first mint is verifiable");
+        let to_other = SpendSummary::from_coin_spends(
+            &nft_mint_to(key, OTHER_OWNER, 0x55),
+            SpendTier::Confirm,
+        )
+        .expect("the second mint is verifiable");
+
+        assert_eq!(
+            launcher_id(key, RECIPIENT_PUZZLE_HASH, 0x55),
+            launcher_id(key, OTHER_OWNER, 0x55),
+            "the fixture must mint ONE launcher id to two owners, or the owner is not what \
+             distinguishes the sentences"
+        );
+        assert_ne!(
+            to_recipient.nft_operations, to_other.nft_operations,
+            "two mints of the same launcher id to different owners must not read the same"
+        );
+    }
+
+    /// **An NFT act is never auto-sent**, however small its mojo total.
+    ///
+    /// The allowance is a million mojos and the transfer moves a handful, so the amount rule alone
+    /// would wave it through: the escalation can only come from the NFT act. The control below is
+    /// auto-sent under the SAME policy, so this fails when the rule is removed rather than when the
+    /// allowance is merely tight.
+    #[test]
+    fn an_nft_transfer_is_confirmed_by_a_human_even_when_its_value_fits_the_allowance() {
+        let coin_spends = nft_transfer_to(money_key().public_key(), RECIPIENT_PUZZLE_HASH, 0x44);
+        let summary = SpendSummary::classified(&coin_spends, &generous_hot_wallet())
+            .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        assert!(
+            summary.native_total_mojos() <= 1_000_000,
+            "the fixture must fit the allowance, or the escalation proves nothing"
+        );
+        assert_eq!(
+            summary.tier,
+            SpendTier::Confirm,
+            "an NFT's value is not a figure a mojo limit can bound; it always reaches a human"
+        );
+    }
+
+    /// The control for the test above: an ordinary send of the same trivial value under the same
+    /// policy IS auto-sent. Without it, "the transfer was confirmed" is indistinguishable from "this
+    /// policy confirms everything".
+    #[test]
+    fn an_ordinary_send_of_the_same_value_under_the_same_policy_is_auto_sent() {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        let key = money_key();
+        let mut ctx = SpendContext::new();
+        let coin = Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), 1_000);
+        StandardLayer::new(key.public_key())
+            .spend(
+                &mut ctx,
+                coin,
+                Conditions::new()
+                    .create_coin(Bytes32::new([7u8; 32]), 4, Memos::None)
+                    .create_coin(key.puzzle_hash(), 996, Memos::None),
+            )
+            .expect("the control spend is well-formed");
+
+        let summary = SpendSummary::classified(&ctx.take(), &generous_hot_wallet())
+            .expect("an ordinary send is a verifiable spend");
+        assert_eq!(
+            summary.tier,
+            SpendTier::AutoSend,
+            "the control must be auto-sent, or the NFT escalation above is vacuous"
+        );
+    }
+
+    /// **The rendered line names the act.** The signing gate can refuse an NFT act the summary
+    /// omits, but a consumer rendering only recipients and the fee still shows a person four dust
+    /// payments — the transfer named in the data and absent from the screen.
+    #[test]
+    fn the_rendered_summary_names_the_nft_act_and_its_new_owner() {
+        let key = money_key().public_key();
+        let summary = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        let rendered = summary.to_string();
+        assert!(
+            rendered.contains("transfer nft1")
+                && rendered.contains(&address(RECIPIENT_PUZZLE_HASH, "xch")),
+            "the act must be stated, not left to four dust lines: {rendered}"
+        );
+    }
+
+    /// A spend that touches no NFT states nothing — the clause is an act's own, never boilerplate a
+    /// reader learns to skip.
+    #[test]
+    fn an_ordinary_send_states_no_nft_act() {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        let key = money_key();
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(key.public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), 1_000),
+                Conditions::new().create_coin(Bytes32::new([7u8; 32]), 1_000, Memos::None),
+            )
+            .expect("the control spend is well-formed");
+
+        let summary = SpendSummary::from_coin_spends(&ctx.take(), SpendTier::Confirm)
+            .expect("an ordinary send is a verifiable spend");
+        assert!(summary.nft_operations.is_empty());
+        assert!(!summary.to_string().contains("nft1"));
+    }
+}

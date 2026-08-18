@@ -702,4 +702,130 @@ mod tests {
             "the refusal must name the destruction it could not find in the claim: {refusal}"
         );
     }
+
+    /// **An NFT act the reviewed summary never named cannot be signed.**
+    ///
+    /// This is the fail-closed half of #3077, and the reason populating `nft_operations` is not
+    /// optional: `dig-wallet-backend` 0.29.0 compares the NFT multiset it derives from the bytes
+    /// against the one the summary claims, so a builder that omits the act signs NOTHING at all.
+    ///
+    /// The claim here is the transfer's OWN summary with exactly ONE difference — the NFT acts are
+    /// removed. Every other field, the fee above all, still matches the bytes, so the refusal can
+    /// only come from the NFT comparison. Substituting a whole different bundle's summary would trip
+    /// the fee check first and prove nothing about the NFT.
+    #[test]
+    fn signing_refuses_an_nft_transfer_whose_reviewed_summary_omits_the_operation() {
+        use crate::wallet::nft_fixture::{nft_transfer_to, RECIPIENT_PUZZLE_HASH};
+        use dig_wallet_backend::types::UnsignedSpend;
+
+        let transfer = nft_transfer_to(money_key().public_key(), RECIPIENT_PUZZLE_HASH, 0x44);
+        let signer = signer();
+        let core = live_core();
+
+        let mut claim = core
+            .reviewable_summary(&transfer)
+            .expect("the transfer's own summary renders");
+        assert!(
+            !claim.nft_operations.is_empty(),
+            "the transfer's honest summary must name an NFT act, or removing one is a no-op and \
+             this test cannot fail"
+        );
+        claim.nft_operations.clear();
+
+        let unsigned = UnsignedSpend {
+            coin_spends: transfer.clone(),
+            required_signatures: LocalMoneySigner::required_signatures(&core, &transfer)
+                .expect("the transfer's required signatures extract"),
+            summary: claim,
+        };
+
+        let refusal = signer
+            .sign_unsigned(&core, &unsigned)
+            .expect_err("an NFT act the reviewed summary never named must not be signed");
+        assert!(
+            refusal.to_string().contains("NFT operations"),
+            "the refusal must name the act it could not find in the claim: {refusal}"
+        );
+    }
+
+    /// The control: the SAME transfer, with its honest summary, DOES sign.
+    ///
+    /// Without it, the refusal above is indistinguishable from "this signer cannot sign an NFT
+    /// transfer at all" — which is precisely the state the crate was in before 0.29.0, and precisely
+    /// the state a summary that silently dropped the acts would leave it in.
+    #[test]
+    fn the_same_nft_transfer_with_its_honest_summary_signs() {
+        use dig_wallet_backend::types::UnsignedSpend;
+
+        use crate::wallet::nft_fixture::{nft_transfer_to, RECIPIENT_PUZZLE_HASH};
+
+        let transfer = nft_transfer_to(money_key().public_key(), RECIPIENT_PUZZLE_HASH, 0x44);
+        let signer = signer();
+        let core = live_core();
+
+        let unsigned = UnsignedSpend {
+            coin_spends: transfer.clone(),
+            required_signatures: LocalMoneySigner::required_signatures(&core, &transfer)
+                .expect("the transfer's required signatures extract"),
+            summary: core
+                .reviewable_summary(&transfer)
+                .expect("the transfer's own summary renders"),
+        };
+
+        let signed = signer
+            .sign_unsigned(&core, &unsigned)
+            .expect("an NFT transfer whose summary names it must sign");
+        assert_eq!(
+            signed.bundle.coin_spends, transfer,
+            "the signed bundle must be the very bytes reviewed"
+        );
+    }
+    /// The MINT half of the same property: a mint the summary names signs, and the same mint with
+    /// the act removed does not.
+    ///
+    /// Both halves ride in one test because the mint's fixture is the interesting part — its eve
+    /// spend is UNSIGNED, so the only signature the wallet contributes is over the funding coin, and
+    /// a gate that read the owner from the eve solution would be validating a value nothing signs.
+    /// The act is nonetheless named, and named with its owner (NC-14).
+    #[test]
+    fn an_nft_mint_signs_when_named_and_is_refused_when_not() {
+        use crate::wallet::nft_fixture::{nft_mint_to, RECIPIENT_PUZZLE_HASH};
+        use dig_wallet_backend::types::UnsignedSpend;
+
+        let mint = nft_mint_to(money_key().public_key(), RECIPIENT_PUZZLE_HASH, 0x55);
+        let signer = signer();
+        let core = live_core();
+        let honest = core
+            .reviewable_summary(&mint)
+            .expect("the mint's own summary renders");
+        assert!(
+            honest
+                .nft_operations
+                .iter()
+                .any(|op| op.starts_with("mint ")),
+            "the mint's honest summary must name the mint: {:?}",
+            honest.nft_operations
+        );
+
+        let unsigned = |summary| UnsignedSpend {
+            coin_spends: mint.clone(),
+            required_signatures: LocalMoneySigner::required_signatures(&core, &mint)
+                .expect("the mint's required signatures extract"),
+            summary,
+        };
+
+        signer
+            .sign_unsigned(&core, &unsigned(honest.clone()))
+            .expect("an NFT mint whose summary names it must sign");
+
+        let mut omitted = honest;
+        omitted.nft_operations.clear();
+        let refusal = signer
+            .sign_unsigned(&core, &unsigned(omitted))
+            .expect_err("a mint the reviewed summary never named must not be signed");
+        assert!(
+            refusal.to_string().contains("NFT operations"),
+            "the refusal must name the act it could not find: {refusal}"
+        );
+    }
 }
