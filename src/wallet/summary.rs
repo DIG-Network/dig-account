@@ -197,6 +197,28 @@ pub struct SpendSummary {
     /// multiset the signing gate compares its own derivation against — so a consumer reading this
     /// field is reading the same names the signature is checked on.
     pub melted_singletons: Vec<String>,
+    /// One canonical sentence per NFT lifecycle act this spend performs — `"transfer nft1… to
+    /// xch1…"`, `"mint nft1… owned by xch1…"`.
+    ///
+    /// # Why an NFT act is a field and not a recipient line
+    ///
+    /// A transfer re-homes the singleton's lone mojo to itself, so it nets ~0 XCH: it moves no
+    /// recipient line and no fee by anything a person could notice. Rendered as value alone, giving
+    /// away an asset and confirming a dust amount are the same screen.
+    ///
+    /// # Why the OWNER is inside the sentence
+    ///
+    /// Neither act is identified by its `nft1…` alone. A transfer's whole effect IS the change of
+    /// owner, and a mint's launcher id is a function of the FUNDING COIN, so it is byte-identical
+    /// whoever ends up holding the NFT — a mint to the user and a mint to an attacker would otherwise
+    /// render the same sentence (NC-14, dig_ecosystem#3079).
+    ///
+    /// The strings are produced by
+    /// [`NftOperation::describe`](dig_wallet_backend::client::NftOperation::describe) — the SAME
+    /// function `dig-wallet-backend`'s signing gate compares its own derivation against. Rendering
+    /// and comparison share one function on purpose: derived separately they could drift, and a
+    /// person would then approve a sentence the gate never checked.
+    pub nft_operations: Vec<String>,
 }
 
 impl SpendSummary {
@@ -215,6 +237,7 @@ impl SpendSummary {
             recipients,
             fee,
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
         }
     }
 
@@ -235,7 +258,20 @@ impl SpendSummary {
             recipients,
             fee,
             melted_singletons,
+            nft_operations: Vec::new(),
         }
+    }
+
+    /// The same display-only summary, additionally naming the NFT acts a spend performs.
+    ///
+    /// A builder rather than a fourth positional argument because destruction and NFT movement are
+    /// independent: one spend can do both, neither, or either, and a constructor per combination
+    /// would grow with every effect a summary learns to name. Carries no authority, for the reasons
+    /// [`new`](Self::new) documents.
+    #[must_use]
+    pub fn with_nft_operations(mut self, nft_operations: Vec<String>) -> Self {
+        self.nft_operations = nft_operations;
+        self
     }
 
     /// Whether this spend permanently destroys a singleton — a DID, a dig-store, a profile.
@@ -247,17 +283,22 @@ impl SpendSummary {
         !self.melted_singletons.is_empty()
     }
 
+    /// Whether this spend transfers or mints an NFT.
+    ///
+    /// Consulted by the tier for the same reason [`destroys_singletons`](Self::destroys_singletons)
+    /// is: a transfer nets ~0 XCH, so its mojo total says nothing at all about what it costs the
+    /// person — and every mojo allowance is above zero.
+    pub fn moves_nfts(&self) -> bool {
+        !self.nft_operations.is_empty()
+    }
+
     /// Re-derive a summary straight from `coin_spends`, tagging it with `tier`.
     ///
     /// Counts every created coin that leaves — see the module docs for why hinted-vs-un-hinted is not
     /// a distinction a custody summary may rely on. Fail-closed: a coin-spend set the driver cannot
     /// fully account for is refused, before any custody decision or signature exists.
     pub fn from_coin_spends(coin_spends: &[CoinSpend], tier: SpendTier) -> Result<Self> {
-        Ok(Self::from_effect(
-            &derive_effect(coin_spends)?,
-            coin_spends,
-            tier,
-        ))
+        Self::from_effect(&derive_effect(coin_spends)?, coin_spends, tier)
     }
 
     /// Re-derive a summary from `coin_spends` and classify its [`SpendTier`] under `policy`.
@@ -276,7 +317,16 @@ impl SpendSummary {
     /// Everything else is counted, including every wrapper layer's hash, because value sent there has
     /// left the spender's control. Protocol-structure commitments are counted too, named rather than
     /// addressed (see the module docs for both rules).
-    fn from_effect(effect: &SpendEffect, coin_spends: &[CoinSpend], tier: SpendTier) -> Self {
+    ///
+    /// Fallible only because an NFT act's canonical sentence is bech32-encoded, and an id that
+    /// cannot be encoded has no honest name. That is refused rather than dropped: an NFT act missing
+    /// from the summary is one the human cannot refuse, so silence here would be the exact failure
+    /// this field exists to prevent.
+    fn from_effect(
+        effect: &SpendEffect,
+        coin_spends: &[CoinSpend],
+        tier: SpendTier,
+    ) -> Result<Self> {
         let returns_to_spender = p2_destinations(coin_spends);
         let leaves_to_an_address = effect
             .outputs
@@ -284,7 +334,20 @@ impl SpendSummary {
             .filter(|output| !returns_to_spender.contains(&output.puzzle_hash))
             .map(address_line);
 
-        Self {
+        // Rendered through the dependency's OWN `describe`, never a second sentence built here: the
+        // signing gate compares against that function's output, so a locally-worded copy would be a
+        // sentence the human approves and the gate never checks.
+        let nft_operations = effect
+            .nft_operations
+            .iter()
+            .map(|operation| {
+                operation.describe().map_err(|e| {
+                    AccountError::Spend(format!("cannot name an NFT this spend acts on: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
             tier,
             recipients: leaves_to_an_address
                 .chain(effect.protocol_sink.iter().map(protocol_structure_line))
@@ -299,7 +362,8 @@ impl SpendSummary {
                 .iter()
                 .map(|coin_id| hex::encode(coin_id.as_ref()))
                 .collect(),
-        }
+            nft_operations,
+        })
     }
 
     /// The total NATIVE value the spend moves (XCH recipient amounts plus fee), in mojos — the figure
@@ -435,6 +499,13 @@ impl fmt::Display for SpendSummary {
         // reads as "a send", so it gets its own clause naming each lineage that ends here.
         for coin_id in &self.melted_singletons {
             write!(f, " — destroys singleton {coin_id} permanently")?;
+        }
+        // Said for the same reason destruction is: a transfer nets ~0 XCH, so a line reporting only
+        // value would show a person a dust amount while they hand over an asset. The sentence names
+        // the NFT AND the owner it ends up with, because neither act is identified by the `nft1…`
+        // alone (NC-14).
+        for operation in &self.nft_operations {
+            write!(f, " — {operation}")?;
         }
         Ok(())
     }
@@ -621,7 +692,7 @@ impl DerivedSpend {
         let effect = derive_effect(coin_spends)?;
         // Tiered `Confirm` first — the stricter of the two hot tiers, so a bug that skipped the
         // classification below would fail safe — then immediately classified for real.
-        let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm);
+        let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm)?;
         let native_total_mojos = summary.checked_native_total_mojos()?;
         summary.tier = SpendTier::classify(policy, native_total_mojos);
         if summary.tier == SpendTier::AutoSend && summary.moves_non_native_assets() {
@@ -632,6 +703,14 @@ impl DerivedSpend {
         // identity without ever asking. What the spend COSTS and what it DESTROYS are different
         // questions, and only the second one is being answered here.
         if summary.tier == SpendTier::AutoSend && summary.destroys_singletons() {
+            summary.tier = SpendTier::Confirm;
+        }
+        // The same argument, for a transfer of control rather than an end of one. A transfer moves
+        // the singleton's lone mojo to itself and nets ~0 XCH, so it falls under EVERY threshold a
+        // person could configure — including the smallest one they would set precisely to keep
+        // valuable things out of the auto-send class. A mojo-denominated limit cannot bound an NFT's
+        // value, so it never gets to answer the question.
+        if summary.tier == SpendTier::AutoSend && summary.moves_nfts() {
             summary.tier = SpendTier::Confirm;
         }
         Ok(Self {

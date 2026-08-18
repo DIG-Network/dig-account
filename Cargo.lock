@@ -1616,9 +1616,9 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet-backend"
-version = "0.28.0"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "696fc7e0470001717dec8d8c47b2a58a85ed5e8441efc12b684ff1688718a7bb"
+checksum = "9aca7e76edf8acd58f967d5c0279d2002590330cd31554b1fd9c433141f48d74"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",
