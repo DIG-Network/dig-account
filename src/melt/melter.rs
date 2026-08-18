@@ -20,6 +20,7 @@ use chia_bls::Signature;
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_wallet_sdk::driver::SpendContext;
 use dig_chainsource_interface::ChainSource;
+use dig_did::DidTip;
 use dig_merkle::{required_signatures, Owner, RequiredSignature};
 
 use crate::chain_confirm::{confirm_spendable_by_name, UnconfirmedInput};
@@ -65,10 +66,14 @@ impl ProfileMelter {
     /// content its store anchored is no longer anchored by anything. There is no undo at any layer.
     ///
     /// A surface calling this MUST have NAMED that destruction to the person first, and a value
-    /// delta is not that naming. The summary the money path renders for this bundle carries BOTH
-    /// destroyed singletons in its `melted_singletons` and reads as destructive, which is what
-    /// keeps a deletion off the auto-send path — two destroyed mojos would otherwise sit inside any
-    /// sane allowance and be spent without a human ever seeing it.
+    /// delta is not that naming: two destroyed mojos sit inside any sane allowance and would be
+    /// spent without a human ever seeing them. [`preview_deletion`](Self::preview_deletion) is that
+    /// naming, and it is the SAME build this signs.
+    ///
+    /// It is not the money path's naming. Like the mint and the edit, a deletion signs the spends
+    /// this module built directly — it never travels through the send enforcer, so no allowance is
+    /// consulted and no summary is rendered for this bundle. The consent surface is the only thing
+    /// standing between a person and the destruction.
     ///
     /// # The melted mojo is gone, and no refund is possible
     ///
@@ -209,6 +214,7 @@ impl ProfileMelter {
         let tip = dig_did::walk_did_lineage_to_tip(chain, anchor.launcher_id())
             .map_err(|e| MeltError::ChainUnreachable(format!("DID lineage: {e}")))?
             .ok_or(MeltError::NoDid)?;
+        pin_did_tip_to_anchor(&tip, anchor, chain)?;
         let did_coin = tip.coin;
         require_still_alive(did_coin, chain, MeltError::NoDid)?;
         let mut ctx = SpendContext::new();
@@ -357,6 +363,64 @@ where
     }
 }
 
+/// Refuse unless `tip` is genuinely a state of the DID singleton this profile's anchor NAMES.
+///
+/// # A lineage walk yields source-chosen data, and this is where a person pays for it
+///
+/// [`dig_did::walk_did_lineage_to_tip`] proves only that the coins a source returned are internally
+/// consistent — that the tip is a genuine singleton successor OF ITS OWN PARENT SPEND. It never
+/// compares the tip back to the launcher it was asked about, and dig-did's own docs record that even
+/// that comparison would be insufficient, because the `launcher_id` curried into a tip is
+/// attacker-chosen. So the tip is source-chosen data until something pins it.
+///
+/// Nothing downstream can pin it. [`gate_profile_melt`] identifies the DID half by an id derived
+/// from the substituted coin itself, so it compares the lineage to itself and passes; `dig_did::melt`
+/// gates only that the OWNER key curries to the tip's inner puzzle hash, and a profile's key is the
+/// standard Chia derivation, so a second DID the same person controls — a Chia DID, an NFT-owner
+/// DID — clears it. The preview meanwhile renders the ANCHOR's identifier. Unpinned, a person reads
+/// "this deletes did:chia:<their profile>" and permanently melts a different singleton, and no
+/// attacker is required: a lagging or simply wrong source produces the same outcome.
+///
+/// # Why this is not the mint's coin-id pin
+///
+/// The mint pins the same call by comparing the tip to a coin id it recorded itself
+/// (`mint::profile`). That value cannot be used here: the anchor's `did_coin_id` is the DID coin the
+/// STORE LAUNCH spent, so by the time a profile can be deleted it is long gone, and pinning to it
+/// would refuse every honest deletion. The value that survives every recreation is the LAUNCHER, so
+/// the tip is authenticated back to one instead — the parent-spend walk
+/// [`dig_did::prove_lineage`] performs, which is the same guard dig-did applies to its own
+/// money-critical address resolution.
+fn pin_did_tip_to_anchor<C>(tip: &DidTip, anchor: &ProfileAnchor, chain: &C) -> MeltResult<()>
+where
+    C: ChainSource,
+{
+    let proof =
+        dig_did::prove_lineage(tip.coin.coin_id(), &tip.did(), chain).map_err(
+            |error| match error {
+                dig_did::DidError::Chain(reason) => {
+                    MeltError::ChainUnreachable(format!("DID lineage proof: {reason}"))
+                }
+                other => MeltError::Refused(format!(
+                "the chain resolves this profile's DID to tip coin {}, which does not authenticate \
+                 as a genuine state of any singleton ({other})",
+                tip.coin.coin_id()
+            )),
+            },
+        )?;
+
+    if proof.authenticated_launcher() != anchor.launcher_id() {
+        return Err(MeltError::Refused(format!(
+            "the chain resolves this profile's DID lineage to tip coin {}, which descends from \
+             launcher {}, but this profile's anchor names launcher {}; a deletion melts only the \
+             singleton the anchor names",
+            tip.coin.coin_id(),
+            proof.authenticated_launcher(),
+            anchor.launcher_id()
+        )));
+    }
+    Ok(())
+}
+
 /// Translate the shared store read into this seam's vocabulary.
 ///
 /// The read is the edit seam's, because there is exactly one right way to authenticate a store tip
@@ -376,6 +440,17 @@ fn map_store_read_error(error: EditError) -> MeltError {
 /// function is only ever asked about coins a bundle this crate built has spent, so "no record"
 /// means the source could not answer, and answering "not yet" to that would stall a poll forever on
 /// a deletion that had already landed.
+///
+/// # The record must describe the coin that was asked about
+///
+/// A coin id commits to `(parent, puzzle_hash, amount)`, so a record answering to an id cannot
+/// honestly carry different contents — but an aggregating source is several nodes stitched together
+/// and can mis-route a reply ([`UnconfirmedInput::Misrouted`]). Reading a spent height out of
+/// somebody else's record reports a deletion CONFIRMED, and `Confirmed` is the only status
+/// [`ProfileRegistry::record_melted`](crate::registry::ProfileRegistry::record_melted) may be
+/// written from: the registry would forget a profile whose singletons are still alive, which is the
+/// exact outcome this read exists to prevent. So the identity check comes FIRST, exactly as it does
+/// in [`confirm_spendable_by_name`].
 fn spent_height_of<C>(coin_id: Bytes32, chain: &C) -> MeltResult<Option<u32>>
 where
     C: ChainSource + ?Sized,
@@ -389,6 +464,13 @@ where
                  is unknown, not unspent"
             ))
         })?;
+    if record.coin.coin_id() != coin_id {
+        return Err(MeltError::ChainUnreachable(format!(
+            "the chain source answered a request for coin {coin_id} with a record for {}, so this \
+             deletion's state is unknown",
+            record.coin.coin_id()
+        )));
+    }
     Ok(record.spent_height)
 }
 
@@ -402,6 +484,15 @@ where
 /// for a separate act, not a relaxed shared one. The count here is pinned at exactly two AND both
 /// coins are pinned BY NAME to the two singletons this profile's own anchor resolved to, so a third
 /// spend, a substituted coin, or the same singleton twice is refused with the same finality.
+///
+/// # This rule cannot see a substituted SINGLETON, and does not try to
+///
+/// Both coin ids it pins are derived from the very coins the plan resolved, so against a chain
+/// source that answered with someone else's singleton this rule would compare that answer to
+/// itself. That is not a gap in it: identity is established BEFORE the plan exists, by
+/// [`pin_did_tip_to_anchor`] for the DID half and [`gate_store_identity`] for the store half, and
+/// neither check is expressible here because a built bundle no longer carries the launcher it came
+/// from. What this rule owns is the SHAPE of the bundle around those two established coins.
 ///
 /// **Only this profile's own key signs, and only `AGG_SIG_ME`.** An `AGG_SIG_UNSAFE` requirement is
 /// a blank cheque reusable against any coin, and a requirement under another public key asks this
