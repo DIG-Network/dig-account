@@ -20,6 +20,9 @@ pub mod enforcer;
 #[cfg(test)]
 pub(crate) mod melt_fixture;
 pub mod money_signer;
+/// Test-only builders for REAL NFT transfer + mint bundles (dig_ecosystem#3077).
+#[cfg(test)]
+pub(crate) mod nft_fixture;
 pub mod policy;
 pub mod summary;
 pub mod transfer;

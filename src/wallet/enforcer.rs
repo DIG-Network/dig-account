@@ -782,6 +782,56 @@ mod tests {
         gate.recent.lock().unwrap().iter().map(|r| r.mojos).sum()
     }
 
+    // ------------------------------------------------------- NFT acts (#3077, NC-14)
+
+    /// **An NFT act never auto-approves, under ANY tier and ANY allowance.**
+    ///
+    /// The tier rule lives in `DerivedSpend::derive`, but the outcome that matters is one layer out:
+    /// `Approved` carries a [`SpendApproval`] — a signable permission with no human anywhere in the
+    /// path. So the assertion is made HERE, against the maximally permissive policy the gate can be
+    /// given (every op-class limit and the period cap at `u64::MAX`), where nothing but the NFT rule
+    /// itself can produce an escalation.
+    ///
+    /// The transfer moves a handful of mojos, so every one of those limits is satisfied — which is
+    /// exactly the point: an NFT is worth what it is worth, and no mojo-denominated bound has ever
+    /// been able to say so.
+    #[test]
+    fn an_nft_transfer_never_auto_approves_under_a_maximally_permissive_policy() {
+        use crate::wallet::nft_fixture::{nft_transfer_to, RECIPIENT_PUZZLE_HASH};
+
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let coin_spends = nft_transfer_to(spender().public_key(), RECIPIENT_PUZZLE_HASH, 0x44);
+
+        for op_class in [
+            SpendOpClass::SmallSend,
+            SpendOpClass::Tip,
+            SpendOpClass::Rebalance,
+        ] {
+            let escalated = pending(gate.authorize_op(&coin_spends, op_class));
+            assert_eq!(
+                escalated.summary().tier,
+                SpendTier::Confirm,
+                "an NFT transfer declared as {op_class:?} must reach a human"
+            );
+            assert!(
+                !escalated.summary().nft_operations.is_empty(),
+                "the escalated summary must NAME the act, or the human is shown dust"
+            );
+        }
+    }
+
+    /// The control that makes the test above evidence rather than coincidence: an ordinary send of
+    /// the SAME trivial value, under the SAME maximally permissive policy, IS auto-approved.
+    ///
+    /// Without it, "the NFT transfer escalated" is indistinguishable from "this gate escalates
+    /// everything" — and every op class above would pass with the NFT rule deleted.
+    #[test]
+    fn an_ordinary_send_of_the_same_value_under_the_same_policy_auto_approves() {
+        let gate = gate_with(hot_custody(), permissive_auto_send());
+        let coin_spends = spend_paying(&[(third_party().puzzle_hash(), 4)], 0);
+        let _signable = approval(gate.authorize_op(&coin_spends, SpendOpClass::SmallSend));
+    }
+
     // ------------------------------------------------------------- vault tier (#1504)
 
     /// A vault spend never auto-approves, however small it is and however permissive the auto-send

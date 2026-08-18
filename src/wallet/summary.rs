@@ -197,6 +197,28 @@ pub struct SpendSummary {
     /// multiset the signing gate compares its own derivation against — so a consumer reading this
     /// field is reading the same names the signature is checked on.
     pub melted_singletons: Vec<String>,
+    /// One canonical sentence per NFT lifecycle act this spend performs — `"transfer nft1… to
+    /// xch1…"`, `"mint nft1… owned by xch1…"`.
+    ///
+    /// # Why an NFT act is a field and not a recipient line
+    ///
+    /// A transfer re-homes the singleton's lone mojo to itself, so it nets ~0 XCH: it moves no
+    /// recipient line and no fee by anything a person could notice. Rendered as value alone, giving
+    /// away an asset and confirming a dust amount are the same screen.
+    ///
+    /// # Why the OWNER is inside the sentence
+    ///
+    /// Neither act is identified by its `nft1…` alone. A transfer's whole effect IS the change of
+    /// owner, and a mint's launcher id is a function of the FUNDING COIN, so it is byte-identical
+    /// whoever ends up holding the NFT — a mint to the user and a mint to an attacker would otherwise
+    /// render the same sentence (NC-14, dig_ecosystem#3079).
+    ///
+    /// The strings are produced by
+    /// [`NftOperation::describe`](dig_wallet_backend::client::NftOperation::describe) — the SAME
+    /// function `dig-wallet-backend`'s signing gate compares its own derivation against. Rendering
+    /// and comparison share one function on purpose: derived separately they could drift, and a
+    /// person would then approve a sentence the gate never checked.
+    pub nft_operations: Vec<String>,
 }
 
 impl SpendSummary {
@@ -215,6 +237,7 @@ impl SpendSummary {
             recipients,
             fee,
             melted_singletons: Vec::new(),
+            nft_operations: Vec::new(),
         }
     }
 
@@ -235,7 +258,20 @@ impl SpendSummary {
             recipients,
             fee,
             melted_singletons,
+            nft_operations: Vec::new(),
         }
+    }
+
+    /// The same display-only summary, additionally naming the NFT acts a spend performs.
+    ///
+    /// A builder rather than a fourth positional argument because destruction and NFT movement are
+    /// independent: one spend can do both, neither, or either, and a constructor per combination
+    /// would grow with every effect a summary learns to name. Carries no authority, for the reasons
+    /// [`new`](Self::new) documents.
+    #[must_use]
+    pub fn with_nft_operations(mut self, nft_operations: Vec<String>) -> Self {
+        self.nft_operations = nft_operations;
+        self
     }
 
     /// Whether this spend permanently destroys a singleton — a DID, a dig-store, a profile.
@@ -247,17 +283,22 @@ impl SpendSummary {
         !self.melted_singletons.is_empty()
     }
 
+    /// Whether this spend transfers or mints an NFT.
+    ///
+    /// Consulted by the tier for the same reason [`destroys_singletons`](Self::destroys_singletons)
+    /// is: a transfer nets ~0 XCH, so its mojo total says nothing at all about what it costs the
+    /// person — and every mojo allowance is above zero.
+    pub fn moves_nfts(&self) -> bool {
+        !self.nft_operations.is_empty()
+    }
+
     /// Re-derive a summary straight from `coin_spends`, tagging it with `tier`.
     ///
     /// Counts every created coin that leaves — see the module docs for why hinted-vs-un-hinted is not
     /// a distinction a custody summary may rely on. Fail-closed: a coin-spend set the driver cannot
     /// fully account for is refused, before any custody decision or signature exists.
     pub fn from_coin_spends(coin_spends: &[CoinSpend], tier: SpendTier) -> Result<Self> {
-        Ok(Self::from_effect(
-            &derive_effect(coin_spends)?,
-            coin_spends,
-            tier,
-        ))
+        Self::from_effect(&derive_effect(coin_spends)?, coin_spends, tier)
     }
 
     /// Re-derive a summary from `coin_spends` and classify its [`SpendTier`] under `policy`.
@@ -276,7 +317,16 @@ impl SpendSummary {
     /// Everything else is counted, including every wrapper layer's hash, because value sent there has
     /// left the spender's control. Protocol-structure commitments are counted too, named rather than
     /// addressed (see the module docs for both rules).
-    fn from_effect(effect: &SpendEffect, coin_spends: &[CoinSpend], tier: SpendTier) -> Self {
+    ///
+    /// Fallible only because an NFT act's canonical sentence is bech32-encoded, and an id that
+    /// cannot be encoded has no honest name. That is refused rather than dropped: an NFT act missing
+    /// from the summary is one the human cannot refuse, so silence here would be the exact failure
+    /// this field exists to prevent.
+    fn from_effect(
+        effect: &SpendEffect,
+        coin_spends: &[CoinSpend],
+        tier: SpendTier,
+    ) -> Result<Self> {
         let returns_to_spender = p2_destinations(coin_spends);
         let leaves_to_an_address = effect
             .outputs
@@ -284,7 +334,20 @@ impl SpendSummary {
             .filter(|output| !returns_to_spender.contains(&output.puzzle_hash))
             .map(address_line);
 
-        Self {
+        // Rendered through the dependency's OWN `describe`, never a second sentence built here: the
+        // signing gate compares against that function's output, so a locally-worded copy would be a
+        // sentence the human approves and the gate never checks.
+        let nft_operations = effect
+            .nft_operations
+            .iter()
+            .map(|operation| {
+                operation.describe().map_err(|e| {
+                    AccountError::Spend(format!("cannot name an NFT this spend acts on: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
             tier,
             recipients: leaves_to_an_address
                 .chain(effect.protocol_sink.iter().map(protocol_structure_line))
@@ -299,7 +362,8 @@ impl SpendSummary {
                 .iter()
                 .map(|coin_id| hex::encode(coin_id.as_ref()))
                 .collect(),
-        }
+            nft_operations,
+        })
     }
 
     /// The total NATIVE value the spend moves (XCH recipient amounts plus fee), in mojos — the figure
@@ -435,6 +499,13 @@ impl fmt::Display for SpendSummary {
         // reads as "a send", so it gets its own clause naming each lineage that ends here.
         for coin_id in &self.melted_singletons {
             write!(f, " — destroys singleton {coin_id} permanently")?;
+        }
+        // Said for the same reason destruction is: a transfer nets ~0 XCH, so a line reporting only
+        // value would show a person a dust amount while they hand over an asset. The sentence names
+        // the NFT AND the owner it ends up with, because neither act is identified by the `nft1…`
+        // alone (NC-14).
+        for operation in &self.nft_operations {
+            write!(f, " — {operation}")?;
         }
         Ok(())
     }
@@ -621,7 +692,7 @@ impl DerivedSpend {
         let effect = derive_effect(coin_spends)?;
         // Tiered `Confirm` first — the stricter of the two hot tiers, so a bug that skipped the
         // classification below would fail safe — then immediately classified for real.
-        let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm);
+        let mut summary = SpendSummary::from_effect(&effect, coin_spends, SpendTier::Confirm)?;
         let native_total_mojos = summary.checked_native_total_mojos()?;
         summary.tier = SpendTier::classify(policy, native_total_mojos);
         if summary.tier == SpendTier::AutoSend && summary.moves_non_native_assets() {
@@ -632,6 +703,14 @@ impl DerivedSpend {
         // identity without ever asking. What the spend COSTS and what it DESTROYS are different
         // questions, and only the second one is being answered here.
         if summary.tier == SpendTier::AutoSend && summary.destroys_singletons() {
+            summary.tier = SpendTier::Confirm;
+        }
+        // The same argument, for a transfer of control rather than an end of one. A transfer moves
+        // the singleton's lone mojo to itself and nets ~0 XCH, so it falls under EVERY threshold a
+        // person could configure — including the smallest one they would set precisely to keep
+        // valuable things out of the auto-send class. A mojo-denominated limit cannot bound an NFT's
+        // value, so it never gets to answer the question.
+        if summary.tier == SpendTier::AutoSend && summary.moves_nfts() {
             summary.tier = SpendTier::Confirm;
         }
         Ok(Self {
@@ -1173,5 +1252,229 @@ mod melting_a_singleton_is_named_not_charged {
             !rendered.contains("destroys"),
             "a send must not claim to destroy anything: {rendered}"
         );
+    }
+}
+
+/// **An NFT act is worth ~0 XCH, so it must be NAMED — value alone cannot describe it.**
+///
+/// A transfer re-homes the singleton's lone mojo to itself; a mint creates one worth a mojo. Neither
+/// moves a recipient line or a fee by anything a person would notice, so a summary that only prices
+/// a spend shows the same screen for "give away your asset" and "spend dust". The tests here pin the
+/// three properties that close it: the act is NAMED with its NEW OWNER, the rendered line says so,
+/// and an NFT act can never be auto-sent.
+#[cfg(test)]
+mod an_nft_act_is_named_not_priced {
+    use super::*;
+    use crate::id::ProfileIx;
+    use crate::keys::wallet_key::WalletKey;
+    use crate::wallet::nft_fixture::{
+        launcher_id, nft_mint_to, nft_transfer_to, RECIPIENT_PUZZLE_HASH,
+    };
+    use crate::wallet::policy::HotWallet;
+
+    /// A SECOND destination, so an owner-blind sentence is observable: two acts on the SAME NFT
+    /// differing only in who ends up with it must not read the same.
+    const OTHER_OWNER: Bytes32 = Bytes32::new([0x3e; 32]);
+
+    /// The wallet's own money key — every fixture below acts on an NFT this wallet can sign for.
+    fn money_key() -> WalletKey {
+        WalletKey::from_seed_at(&[0x42u8; 32], ProfileIx::ROOT)
+    }
+
+    /// Bech32, through the same encoder the sentence itself is built with.
+    fn address(hash: Bytes32, prefix: &str) -> String {
+        chia_wallet_sdk::utils::Address::new(hash, prefix.to_string())
+            .encode()
+            .expect("a 32-byte hash encodes")
+    }
+
+    /// A policy whose allowance dwarfs an NFT act's few mojos — the fixture that makes the auto-send
+    /// test load-bearing. Under a tight allowance the act would tier `Confirm` on its amount alone
+    /// and the test would pass with the rule deleted.
+    fn generous_hot_wallet() -> CustodyPolicy {
+        CustodyPolicy::Hot(HotWallet {
+            auto_send_limit: 1_000_000,
+        })
+    }
+
+    /// **A transfer names the NFT and the owner it moves to.** Without the name the person confirms
+    /// a dust amount while an asset leaves; without the owner, an engine could substitute its own p2
+    /// hash for the one the person chose and still render a byte-identical sentence.
+    #[test]
+    fn a_transfer_names_the_nft_and_the_owner_it_moves_to() {
+        let key = money_key().public_key();
+        let coin_spends = nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44);
+        let summary = SpendSummary::from_coin_spends(&coin_spends, SpendTier::Confirm)
+            .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        let nft = address(launcher_id(key, money_key().puzzle_hash(), 0x44), "nft");
+        let new_owner = address(RECIPIENT_PUZZLE_HASH, "xch");
+
+        assert!(
+            summary
+                .nft_operations
+                .contains(&format!("transfer {nft} to {new_owner}")),
+            "the summary must name the NFT and where it goes, got {:?}",
+            summary.nft_operations
+        );
+    }
+
+    /// **The OWNER is load-bearing, not decoration (NC-14).** Two transfers of the SAME NFT to two
+    /// different people share a launcher id, so a sentence naming only the `nft1…` is byte-identical
+    /// for both — the human approving one would be approving either. This fails the moment the owner
+    /// stops being part of the sentence the summary carries.
+    #[test]
+    fn two_transfers_of_the_same_nft_to_different_owners_read_differently() {
+        let key = money_key().public_key();
+        let honest = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("the honest transfer is verifiable");
+        let elsewhere = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, OTHER_OWNER, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("the re-homed transfer is verifiable");
+
+        assert_eq!(
+            honest.native_total_mojos(),
+            elsewhere.native_total_mojos(),
+            "the two fixtures must move the same value, or the destination is not what \
+             distinguishes them"
+        );
+        assert_ne!(
+            honest.nft_operations, elsewhere.nft_operations,
+            "two transfers of one NFT to different owners must not read the same"
+        );
+    }
+
+    /// **The same, for a mint.** A mint's launcher id is a function of the FUNDING COIN alone, so it
+    /// is byte-identical whoever ends up owning the new NFT: a mint to the user and a mint to an
+    /// attacker are the same `nft1…`. Holding the funding coin constant is what makes that visible.
+    #[test]
+    fn two_mints_of_the_same_launcher_to_different_owners_read_differently() {
+        let key = money_key().public_key();
+        let to_recipient = SpendSummary::from_coin_spends(
+            &nft_mint_to(key, RECIPIENT_PUZZLE_HASH, 0x55),
+            SpendTier::Confirm,
+        )
+        .expect("the first mint is verifiable");
+        let to_other = SpendSummary::from_coin_spends(
+            &nft_mint_to(key, OTHER_OWNER, 0x55),
+            SpendTier::Confirm,
+        )
+        .expect("the second mint is verifiable");
+
+        assert_eq!(
+            launcher_id(key, RECIPIENT_PUZZLE_HASH, 0x55),
+            launcher_id(key, OTHER_OWNER, 0x55),
+            "the fixture must mint ONE launcher id to two owners, or the owner is not what \
+             distinguishes the sentences"
+        );
+        assert_ne!(
+            to_recipient.nft_operations, to_other.nft_operations,
+            "two mints of the same launcher id to different owners must not read the same"
+        );
+    }
+
+    /// **An NFT act is never auto-sent**, however small its mojo total.
+    ///
+    /// The allowance is a million mojos and the transfer moves a handful, so the amount rule alone
+    /// would wave it through: the escalation can only come from the NFT act. The control below is
+    /// auto-sent under the SAME policy, so this fails when the rule is removed rather than when the
+    /// allowance is merely tight.
+    #[test]
+    fn an_nft_transfer_is_confirmed_by_a_human_even_when_its_value_fits_the_allowance() {
+        let coin_spends = nft_transfer_to(money_key().public_key(), RECIPIENT_PUZZLE_HASH, 0x44);
+        let summary = SpendSummary::classified(&coin_spends, &generous_hot_wallet())
+            .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        assert!(
+            summary.native_total_mojos() <= 1_000_000,
+            "the fixture must fit the allowance, or the escalation proves nothing"
+        );
+        assert_eq!(
+            summary.tier,
+            SpendTier::Confirm,
+            "an NFT's value is not a figure a mojo limit can bound; it always reaches a human"
+        );
+    }
+
+    /// The control for the test above: an ordinary send of the same trivial value under the same
+    /// policy IS auto-sent. Without it, "the transfer was confirmed" is indistinguishable from "this
+    /// policy confirms everything".
+    #[test]
+    fn an_ordinary_send_of_the_same_value_under_the_same_policy_is_auto_sent() {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        let key = money_key();
+        let mut ctx = SpendContext::new();
+        let coin = Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), 1_000);
+        StandardLayer::new(key.public_key())
+            .spend(
+                &mut ctx,
+                coin,
+                Conditions::new()
+                    .create_coin(Bytes32::new([7u8; 32]), 4, Memos::None)
+                    .create_coin(key.puzzle_hash(), 996, Memos::None),
+            )
+            .expect("the control spend is well-formed");
+
+        let summary = SpendSummary::classified(&ctx.take(), &generous_hot_wallet())
+            .expect("an ordinary send is a verifiable spend");
+        assert_eq!(
+            summary.tier,
+            SpendTier::AutoSend,
+            "the control must be auto-sent, or the NFT escalation above is vacuous"
+        );
+    }
+
+    /// **The rendered line names the act.** The signing gate can refuse an NFT act the summary
+    /// omits, but a consumer rendering only recipients and the fee still shows a person four dust
+    /// payments — the transfer named in the data and absent from the screen.
+    #[test]
+    fn the_rendered_summary_names_the_nft_act_and_its_new_owner() {
+        let key = money_key().public_key();
+        let summary = SpendSummary::from_coin_spends(
+            &nft_transfer_to(key, RECIPIENT_PUZZLE_HASH, 0x44),
+            SpendTier::Confirm,
+        )
+        .expect("a canonical sdk NFT transfer is a verifiable spend");
+
+        let rendered = summary.to_string();
+        assert!(
+            rendered.contains("transfer nft1")
+                && rendered.contains(&address(RECIPIENT_PUZZLE_HASH, "xch")),
+            "the act must be stated, not left to four dust lines: {rendered}"
+        );
+    }
+
+    /// A spend that touches no NFT states nothing — the clause is an act's own, never boilerplate a
+    /// reader learns to skip.
+    #[test]
+    fn an_ordinary_send_states_no_nft_act() {
+        use chia_protocol::Coin;
+        use chia_puzzle_types::Memos;
+        use chia_wallet_sdk::driver::SpendContext;
+        use chia_wallet_sdk::types::Conditions;
+
+        let key = money_key();
+        let mut ctx = SpendContext::new();
+        StandardLayer::new(key.public_key())
+            .spend(
+                &mut ctx,
+                Coin::new(Bytes32::new([1u8; 32]), key.puzzle_hash(), 1_000),
+                Conditions::new().create_coin(Bytes32::new([7u8; 32]), 1_000, Memos::None),
+            )
+            .expect("the control spend is well-formed");
+
+        let summary = SpendSummary::from_coin_spends(&ctx.take(), SpendTier::Confirm)
+            .expect("an ordinary send is a verifiable spend");
+        assert!(summary.nft_operations.is_empty());
+        assert!(!summary.to_string().contains("nft1"));
     }
 }
