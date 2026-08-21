@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-08-21
+
+### Chores
+- **deps:** Adopt dig-keystore 0.9.0 and dig-session 0.7.0 (#27)
+
 ## [0.20.0] - 2026-08-18
 
 ### Features
