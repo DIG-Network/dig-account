@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -37,9 +37,9 @@ coinset-push = ["dep:ureq"]
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
 dig-wallet-backend = { version = "0.29", default-features = false, features = ["client"] }
-dig-session = "0.6"
+dig-session = "0.7"
 dig-identity = "0.6"
-dig-keystore = "0.8"
+dig-keystore = "0.9"
 dig-constants = "0.10"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact

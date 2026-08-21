@@ -43,6 +43,19 @@ pub enum AccountStoreError {
     Session(#[from] dig_session::SessionError),
 
     /// A raw backend I/O / keystore error (list, delete, existence check).
+    ///
+    /// The `{0}` interpolation is load-bearing rather than cosmetic:
+    /// `KeystoreError` is `#[non_exhaustive]` and its catalog grows, so
+    /// forwarding the inner `Display` is what keeps a refusal this crate has
+    /// never heard of legible instead of collapsing it into one indistinct
+    /// "backend error". dig-keystore 0.9 added two such refusals, and both are
+    /// about the keystore ROOT directory rather than any single account blob:
+    /// `InsecurePermissions` (a group- or world-accessible root, which on a
+    /// mount that ignores Unix modes reports mode `511` and cannot be tightened
+    /// by `chmod`) and `UnsafeRoot` (a symlinked root, so the path that was
+    /// checked is not the path written to). Neither is transient, so a caller
+    /// MUST NOT present them as retryable, and neither should be read as
+    /// account corruption: no account is damaged, the root is simply refused.
     #[error("keystore backend error: {0}")]
     Backend(#[from] dig_keystore::KeystoreError),
 }
