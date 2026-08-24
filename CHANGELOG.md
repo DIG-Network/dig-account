@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.22.0] - 2026-08-24
+
+### Features
+- **registry:** Identity uniqueness, index exhaustion, anchor pairing and chain re-verification (#36)
+
 ## [0.21.0] - 2026-08-21
 
 ### Chores
