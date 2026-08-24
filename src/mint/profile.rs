@@ -56,6 +56,8 @@ use crate::registry::journal::{
     MintStage, MintedDidRecord, PendingMintRecord, PendingStoreLaunchRecord,
 };
 use crate::registry::ProfileRegistry;
+use crate::wallet::reservation::{select_and_reserve, CoinReservations};
+use crate::wallet::transfer::MAX_RESERVATION_ATTEMPTS;
 
 /// Where a profile mint stands. Every variant names exactly what has been PROVEN on chain.
 ///
@@ -142,7 +144,7 @@ impl ProfileMinter {
         clippy::too_many_arguments,
         reason = "each argument is a distinct authority"
     )]
-    pub fn begin_profile_mint<C, P>(
+    pub fn begin_profile_mint<'r, C, P>(
         &self,
         registry: &mut ProfileRegistry,
         ix: ProfileIx,
@@ -151,6 +153,7 @@ impl ProfileMinter {
         publisher: &P,
         network: &MintNetwork,
         options: &MintOptions,
+        reservations: &'r CoinReservations<'r>,
     ) -> MintResult<ProfileMintStatus>
     where
         C: ChainSource,
@@ -158,7 +161,14 @@ impl ProfileMinter {
     {
         // Computed before anything is built, so a seed that cannot be committed costs nothing.
         let seed_root = seed.root()?;
-        let (bundle, pending) = self.prepare_did_mint(ix, chain, network, options)?;
+        // The coin guard is carried, never discarded. A profile mint is a two-phase ceremony and
+        // phase B re-selects its own funding coin, so the caller has no use for the handle after
+        // this call returns — but between here and the push there is a journal write that can fail,
+        // and dropping the guard there is exactly what must happen. Letting the TTL cover that case
+        // instead would strand the coin over a mint that was never journalled and never pushed, and
+        // a caller retrying would strand a different one each time.
+        let (bundle, pending, held) =
+            self.prepare_did_mint(ix, chain, network, options, reservations)?;
         let did_coin_id = pending.did_coin_id();
 
         registry
@@ -173,10 +183,18 @@ impl ProfileMinter {
             .map_err(|e| MintError::Journal(e.to_string()))?;
 
         if let Err(error) = push(publisher, &bundle) {
+            // The coins follow the SAME rule as the HD index beside them, and for the same reason: a
+            // definitive no means the bundle is dead and the hold guards nothing, while any other
+            // error leaves the outcome unknown and the hold must stand until the TTL rather than let
+            // a second bundle spend an input the first may already have consumed.
             release_index_on_a_definitive_no(registry, ix, &error);
+            if !matches!(error, MintError::Rejected(_)) {
+                let _ = held.commit();
+            }
             return Err(error);
         }
 
+        let _ = held.commit();
         Ok(ProfileMintStatus::DidPending { did_coin_id })
     }
 
@@ -191,13 +209,14 @@ impl ProfileMinter {
     /// no profile seed (see [`ProfileMintInProgress::seed_root`](crate::registry::ProfileMintInProgress::seed_root)).
     /// [`MintError::ChainUnreachable`] leaves the mint exactly where it was — the outcome is unknown,
     /// never a failure to restart from.
-    pub fn advance_profile_mint<C, P>(
+    pub fn advance_profile_mint<'r, C, P>(
         &self,
         registry: &mut ProfileRegistry,
         ix: ProfileIx,
         chain: &C,
         publisher: &P,
         network: &MintNetwork,
+        reservations: &'r CoinReservations<'r>,
     ) -> MintResult<ProfileMintStatus>
     where
         C: ChainSource,
@@ -210,7 +229,7 @@ impl ProfileMinter {
 
             // The DID exists and the store does not. This is the ONE transition that spends.
             ProfileMintStatus::DidConfirmedStoreNotLaunched(did) => {
-                self.launch_store(registry, ix, &did, chain, publisher, network)
+                self.launch_store(registry, ix, &did, chain, publisher, network, reservations)
             }
 
             settled => Ok(settled),
@@ -283,7 +302,14 @@ impl ProfileMinter {
     /// tip — never read from the journal, which holds none and could not vouch for it if it did.
     /// Its IDENTITY is the opposite: the tip must be the exact coin id this mint recorded, or the
     /// launch is refused. Chain answers what the coin looks like; the journal decides which coin.
-    fn launch_store<C, P>(
+    // Seven authorities plus the reservation set. Bundling them into a config struct would hide
+    // `publisher` and the journalled fee - the two that MOVE MONEY - among the ones that do not,
+    // which is the wrong thing to make less visible at a call site.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is a distinct authority"
+    )]
+    fn launch_store<'r, C, P>(
         &self,
         registry: &mut ProfileRegistry,
         ix: ProfileIx,
@@ -291,6 +317,7 @@ impl ProfileMinter {
         chain: &C,
         publisher: &P,
         network: &MintNetwork,
+        reservations: &'r CoinReservations<'r>,
     ) -> MintResult<ProfileMintStatus>
     where
         C: ChainSource,
@@ -337,8 +364,23 @@ impl ProfileMinter {
             )));
         }
 
-        let funding =
-            select_funding_coin(chain, wallet.puzzle_hash(), &MintOptions::with_fee(fee))?;
+        // Held, not discarded. Four fallible steps follow, one of them a peak READ answered by a
+        // peer this crate does not trust; discarding the guard here strands the launch funding coin
+        // for the full TTL every time one of them fails, on a different coin each retry.
+        let (funding, held) = select_and_reserve(
+            reservations,
+            MAX_RESERVATION_ATTEMPTS,
+            |excluded| {
+                let coin = select_funding_coin(
+                    chain,
+                    wallet.puzzle_hash(),
+                    &MintOptions::with_fee(fee),
+                    excluded,
+                )?;
+                Ok((coin, vec![coin.coin_id()]))
+            },
+            |e| MintError::ReservationUnusable(e.to_string()),
+        )?;
         let pushed_at_height = peak_height(chain)?;
 
         // As on the DID half: the lineage walk and the coin selection above are network round
@@ -370,10 +412,18 @@ impl ProfileMinter {
             .map_err(|e| MintError::Journal(e.to_string()))?;
 
         if let Err(error) = push(publisher, &launch.bundle) {
+            // Same rule as the stage rewind beside it: a definitive no means the bundle is dead and
+            // the coins guard nothing, so the guard drops and releases; any other error leaves the
+            // outcome unknown, so the hold stands until the TTL rather than let a second launch
+            // spend an input the first may already have consumed.
             rewind_to_an_unlaunched_store_on_a_definitive_no(registry, ix, did, &error);
+            if !matches!(error, MintError::Rejected(_)) {
+                let _ = held.commit();
+            }
             return Err(error);
         }
 
+        let _ = held.commit();
         Ok(ProfileMintStatus::StorePending {
             did: did.clone(),
             store_launcher_id,

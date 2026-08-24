@@ -48,6 +48,7 @@ use crate::keys::wallet_key::WalletKey;
 use crate::mint::MIN_CONFIRMATION_DEPTH;
 use crate::wallet::authorizer::WalletOps;
 use crate::wallet::policy::CustodyPolicy;
+use crate::wallet::reservation::{select_and_reserve, CoinReservations, ReservationId};
 
 /// The most wallet coins one transfer will consume.
 ///
@@ -57,6 +58,13 @@ use crate::wallet::policy::CustodyPolicy;
 /// unbounded selection turns a dusty wallet into a bundle no mempool will take, and the failure
 /// would arrive after the push rather than before it.
 pub const MAX_TRANSFER_INPUT_COINS: usize = 12;
+
+/// How many times selection may re-run after losing its coins to a concurrent reservation.
+///
+/// Each attempt excludes at least one more coin, so the loop already terminates on its own. This
+/// bound exists for the case the loop cannot reason about: a store that reports a conflict for a
+/// coin it does not actually hold, which would otherwise spin here forever.
+pub(crate) const MAX_RESERVATION_ATTEMPTS: usize = 16;
 
 /// The only human-readable prefix a transfer will pay: Chia mainnet's.
 ///
@@ -95,6 +103,31 @@ pub enum TransferError {
         /// The total of every confirmed, unspent coin the wallet holds.
         available: u64,
     },
+
+    /// The wallet holds enough value, but every coin that could cover this transfer is already
+    /// committed to an in-flight spend.
+    ///
+    /// SEPARATE from [`InsufficientFunds`](Self::InsufficientFunds), and the distinction is the
+    /// whole point: `available` is the user's REAL balance, reserved coins included, because a
+    /// reservation narrows what may be selected and never what the user holds. Collapsing the two
+    /// would tell a person their money is gone when it is merely busy, and would invite the deposit
+    /// that does not help.
+    #[error("every coin that could fund this transfer is reserved by an in-flight spend: it needs {required} mojos, the wallet holds {available} but only {selectable} is free right now")]
+    CoinsReserved {
+        /// The amount plus the fee.
+        required: u64,
+        /// The total of every confirmed, unspent coin the wallet holds — reserved ones included.
+        available: u64,
+        /// The total of the coins that are not currently reserved.
+        selectable: u64,
+    },
+
+    /// The reservation store could not be consulted, so what is already in flight is UNKNOWN.
+    ///
+    /// The build REFUSES rather than proceeding, because proceeding is exactly the double-select
+    /// the reservation exists to prevent. A guard that fails open is not a guard.
+    #[error("{0}")]
+    ReservationUnusable(String),
 
     /// The wallet holds enough value, but only across more coins than one transfer may consume.
     ///
@@ -484,6 +517,7 @@ pub struct TransferPlan {
     amount_mojos: u64,
     fee_mojos: u64,
     change_mojos: u64,
+    reservation: Option<ReservationId>,
 }
 
 impl TransferPlan {
@@ -502,6 +536,21 @@ impl TransferPlan {
     /// The pre-existing wallet coins this transfer consumes.
     pub fn source_coin_ids(&self) -> &[Bytes32] {
         &self.source_coin_ids
+    }
+
+    /// The reservation holding this plan's inputs, when the plan took one.
+    ///
+    /// Release it through
+    /// [`CoinReservations::release`](crate::wallet::reservation::CoinReservations::release) the
+    /// moment the transfer is known settled or known dead, rather than waiting out the TTL — the
+    /// user's own coins should not stay held over a question the chain has already answered.
+    ///
+    /// `None` on a plan from
+    /// [`build_transfer_replacing`](crate::wallet::authorizer::WalletOps::build_transfer_replacing),
+    /// which re-spends coins the ORIGINAL plan already reserved and must not take a second,
+    /// self-conflicting hold on them.
+    pub fn reservation(&self) -> Option<ReservationId> {
+        self.reservation
     }
 
     /// The id of the coin that will pay the recipient.
@@ -826,6 +875,12 @@ impl WalletOps {
     /// and the resulting approval to
     /// [`MoneySigner::sign_approved`](crate::wallet::money_signer::MoneySigner::sign_approved).
     ///
+    /// `reservations` is the in-flight coin set. The coins this build selects are RESERVED in it
+    /// before the plan is returned, so a second build in the same confirmation window cannot choose
+    /// them — the chain still reports them unspent while the first bundle sits in a mempool. Release
+    /// the returned [`TransferPlan::reservation`] as soon as the transfer is known settled or known
+    /// dead; the TTL is only the backstop for a build that is abandoned.
+    ///
     /// `custody` is the profile's configured tier, and it is consulted for one reason: a
     /// [`Vault`](CustodyPolicy::Vault) profile cannot pay a third party at all, and the honest place
     /// to say so is before a spend is built rather than at the gate, where the refusal would arrive
@@ -841,6 +896,7 @@ impl WalletOps {
         chain: &C,
         custody: &CustodyPolicy,
         request: &TransferRequest,
+        reservations: &CoinReservations<'_>,
     ) -> TransferResult<TransferPlan>
     where
         C: ChainSource + ?Sized,
@@ -858,8 +914,26 @@ impl WalletOps {
         }
 
         let required = request.required_total()?;
-        let selected = select_input_coins(chain, wallet.puzzle_hash(), required)?;
-        build_transfer_spends(&wallet, &selected, request)
+        // Selection and reservation are ONE step. Selecting first and reserving afterwards is
+        // check-then-act: two builders both see the coin free and both take it, which is the defect
+        // this closes rather than a smaller version of it.
+        let (selected, held) = select_and_reserve(
+            reservations,
+            MAX_RESERVATION_ATTEMPTS,
+            |excluded| {
+                let coins = select_input_coins(chain, wallet.puzzle_hash(), required, excluded)?;
+                let ids = coins.iter().map(Coin::coin_id).collect();
+                Ok((coins, ids))
+            },
+            |e| TransferError::ReservationUnusable(e.to_string()),
+        )?;
+
+        // `held` stays alive across the build, so a build that fails releases the coins on its way
+        // out instead of stranding them for the TTL over a plan that does not exist. It is committed
+        // only once there IS a plan for it to guard.
+        let mut plan = build_transfer_spends(&wallet, &selected, request, None)?;
+        plan.reservation = Some(held.commit());
+        Ok(plan)
     }
 
     /// Rebuild a pushed transfer at a HIGHER fee, re-spending EXACTLY the coins it already spends.
@@ -940,7 +1014,11 @@ impl WalletOps {
             });
         }
 
-        build_transfer_spends(&wallet, &inputs, &request)
+        // Deliberately UNRESERVED. A replacement re-spends the coins the original plan already
+        // holds, so taking a second reservation over them would conflict with the caller's own
+        // in-flight transfer and refuse the fee bump it is supposed to enable. The original
+        // reservation is still the one guarding these inputs, and it is still the one to release.
+        build_transfer_spends(&wallet, &inputs, &request, None)
     }
 }
 
@@ -1178,10 +1256,19 @@ where
 ///    [`mint`](crate::mint) uses to pick its funding coin); otherwise
 /// 2. largest-first accumulation, so the fewest possible coins are consumed before the cap is
 ///    consulted.
+///
+/// # Reserved coins narrow SELECTION, never the balance
+///
+/// `reserved` names coins already committed to an in-flight spend. They are excluded from what may
+/// be CHOSEN, and deliberately still counted in `available` — a reserved coin is the user's money,
+/// and subtracting it would report a shortfall they do not have. That is why a wallet blocked only
+/// by reservations raises [`TransferError::CoinsReserved`], which says the coins are busy, rather
+/// than [`TransferError::InsufficientFunds`], which would say they are gone.
 fn select_input_coins<C>(
     chain: &C,
     puzzle_hash: Bytes32,
     required: u64,
+    reserved: &HashSet<Bytes32>,
 ) -> TransferResult<Vec<Coin>>
 where
     C: ChainSource + ?Sized,
@@ -1271,6 +1358,24 @@ where
         });
     }
 
+    // Reservations are applied HERE, after `available` and after the shortfall test, and the order is
+    // the property rather than an implementation detail. Filtering reserved coins out earlier would
+    // fold them out of the balance too, so a user with plenty of money and one busy coin would be
+    // told they cannot afford their own transfer. Filtering later — at the bundle — would be too
+    // late, because the coin would already have been chosen.
+    spendable.retain(|coin| !reserved.contains(&coin.coin_id()));
+    let selectable = spendable
+        .iter()
+        .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
+        .ok_or(TransferError::BalanceUnjudgeable)?;
+    if selectable < required {
+        return Err(TransferError::CoinsReserved {
+            required,
+            available,
+            selectable,
+        });
+    }
+
     let selected = if let Some(single) = spendable.iter().find(|coin| coin.amount >= required) {
         vec![*single]
     } else {
@@ -1345,6 +1450,7 @@ fn build_transfer_spends(
     wallet: &WalletKey,
     selected: &[Coin],
     request: &TransferRequest,
+    reservation: Option<ReservationId>,
 ) -> TransferResult<TransferPlan> {
     let (lead, secondaries) = selected
         .split_last()
@@ -1403,6 +1509,7 @@ fn build_transfer_spends(
         amount_mojos: request.amount_mojos,
         fee_mojos: request.fee_mojos,
         change_mojos: change,
+        reservation,
     })
 }
 
@@ -1411,7 +1518,11 @@ mod tests {
     use super::*;
     use crate::id::ProfileIx;
     use crate::session_residency::Residency;
+    use crate::wallet::clock::{FixedClock, SystemClock, UnreadableClock};
     use crate::wallet::policy::{HotWallet, Vault};
+    use crate::wallet::reservation::{
+        CoinReservationStore, LocalReservations, ReservationError, DEFAULT_RESERVATION_TTL_SECS,
+    };
     use chia_wallet_sdk::prelude::FromClvm;
     use chia_wallet_sdk::types::{run_puzzle, Condition};
     use clvmr::serde::node_from_bytes;
@@ -1441,6 +1552,19 @@ mod tests {
 
     fn ops() -> WalletOps {
         WalletOps::new(seed(), ProfileIx::ROOT, Arc::new(Residency::new()))
+    }
+
+    /// An EMPTY reservation set, fresh for each call, for the tests that are not about reservations.
+    ///
+    /// Fresh rather than shared: these tests run in parallel in one process, and a shared table
+    /// would let one test's reservation silently change another's selection — which is a false RED
+    /// in one direction and a false GREEN in the other.
+    ///
+    /// The store is leaked so the borrow can be `'static` and the helper usable as an argument
+    /// expression. It is a few dozen bytes per call, in test builds only.
+    fn free() -> CoinReservations<'static> {
+        let store: &'static LocalReservations = Box::leak(Box::new(LocalReservations::new()));
+        CoinReservations::new(store, &SystemClock)
     }
 
     fn hot() -> CustodyPolicy {
@@ -1709,6 +1833,372 @@ mod tests {
         amounts
     }
 
+    /// **RED (dig-account#26): two builds in the same confirmation window select the SAME coin.**
+    ///
+    /// The chain double is deliberately STATIC across the two calls, because that is the real
+    /// condition: the first bundle is in the mempool, so the coin it spends is still reported unspent
+    /// to the second build. Nothing else is needed to reproduce the defect.
+    ///
+    /// The fixture holds TWO coins that each cover the transfer on their own. That is the truthful
+    /// control: with a reservation in place the second build must SUCCEED on the other coin, so this
+    /// test cannot be satisfied by an implementation that simply refuses every second build.
+    #[test]
+    fn two_builds_in_the_same_window_must_not_select_the_same_coin() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000, 1_100]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        // ONE reservation set across both builds, because that is what two callers of one wallet
+        // share. Handing each build its own would make this test pass while proving nothing.
+        let store = LocalReservations::new();
+        let reservations = store.reservations();
+
+        let first = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("the first build is funded");
+        let second = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("the second build is funded by the OTHER coin");
+
+        assert_ne!(
+            first.source_coin_ids(),
+            second.source_coin_ids(),
+            "two spends built in the same window selected the same coin"
+        );
+    }
+
+    /// A reservation store that cannot answer, for proving the build REFUSES rather than proceeds.
+    #[derive(Debug)]
+    struct UnreadableReservations;
+
+    impl CoinReservationStore for UnreadableReservations {
+        fn held(&self, _now_unix: u64) -> std::result::Result<Vec<Bytes32>, ReservationError> {
+            Err(ReservationError::Unavailable(
+                "simulated: the store is gone".into(),
+            ))
+        }
+
+        fn reserve_all(
+            &self,
+            _coins: &[Bytes32],
+            _now_unix: u64,
+            _expires_at_unix: u64,
+        ) -> std::result::Result<ReservationId, ReservationError> {
+            Err(ReservationError::Unavailable(
+                "simulated: the store is gone".into(),
+            ))
+        }
+
+        fn release(&self, _id: ReservationId) -> std::result::Result<(), ReservationError> {
+            Ok(())
+        }
+    }
+
+    /// A store whose READ fails while its WRITE succeeds — a read replica that is down, a cache
+    /// that cannot be reached, a control-interface call that times out on the query but not on the
+    /// command.
+    ///
+    /// This double exists because the obvious one does not test what it appears to. A store that
+    /// fails on BOTH methods is caught by whichever check runs second, so it cannot distinguish an
+    /// implementation that refuses on an unreadable `held` from one that quietly treats an
+    /// unreadable `held` as "nothing is reserved". Only a store that fails on exactly one method
+    /// can tell those two apart — and the second is the dangerous one, because it restores the
+    /// double-select while every call still reports success.
+    #[derive(Debug)]
+    struct UnreadableButWritable(LocalReservations);
+
+    impl CoinReservationStore for UnreadableButWritable {
+        fn held(&self, _now_unix: u64) -> std::result::Result<Vec<Bytes32>, ReservationError> {
+            Err(ReservationError::Unavailable(
+                "simulated: the read replica is down".into(),
+            ))
+        }
+
+        fn reserve_all(
+            &self,
+            coins: &[Bytes32],
+            now_unix: u64,
+            expires_at_unix: u64,
+        ) -> std::result::Result<ReservationId, ReservationError> {
+            self.0.reserve_all(coins, now_unix, expires_at_unix)
+        }
+
+        fn release(&self, id: ReservationId) -> std::result::Result<(), ReservationError> {
+            self.0.release(id)
+        }
+    }
+
+    /// A fixture instant, so every reservation lifetime in these tests is measured against a time
+    /// the test names rather than against the wall clock. Passing a small literal through a
+    /// wall-clock API would make every reservation already expired by ~1.8 billion seconds, and the
+    /// tests would assert the lapsed path while claiming to assert the live one.
+    const NOW: u64 = 1_800_000_000;
+
+    /// **The user is told their coins are BUSY, never that their money is gone.**
+    ///
+    /// This is a PLACEMENT test, not an outcome test. Excluding reserved coins BEFORE the balance is
+    /// computed also refuses the build — with `InsufficientFunds`, reporting an `available` of 0 for
+    /// a wallet holding 1_000 mojos. Both placements produce "no plan"; only one of them tells the
+    /// truth about the balance, so the assertion is on the ERROR and on both of its figures.
+    #[test]
+    fn a_reserved_coin_is_still_the_users_money() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = LocalReservations::new();
+        let reservations = store.reservations();
+
+        ops.build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("the first build takes the only coin");
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect_err("the only coin is committed to the first build");
+
+        match error {
+            TransferError::CoinsReserved {
+                required,
+                available,
+                selectable,
+            } => {
+                assert_eq!(required, 900);
+                assert_eq!(
+                    available, 1_000,
+                    "a reserved coin is still the money the user holds and must still be counted"
+                );
+                assert_eq!(selectable, 0, "and none of it is free to select right now");
+            }
+            other => panic!(
+                "a busy coin must not be reported as a shortfall - that asks a funded user to \
+                 deposit for no reason: {other:?}"
+            ),
+        }
+    }
+
+    /// **RELEASE, on the confirm-or-reject path.** A settled or dead transfer hands its coins back
+    /// at once rather than holding them for the rest of the TTL.
+    ///
+    /// The clock does NOT move, so nothing here can be satisfied by expiry — this test can only pass
+    /// because `release` did something.
+    #[test]
+    fn releasing_a_reservation_frees_its_coin_immediately() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = LocalReservations::new();
+        let clock = FixedClock::new(NOW);
+        let reservations = CoinReservations::new(&store, &clock);
+
+        let first = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("the first build takes the only coin");
+        let held = first
+            .reservation()
+            .expect("an ordinary build reserves what it selected");
+
+        assert!(
+            ops.build_transfer(&chain, &hot(), &request, &reservations)
+                .is_err(),
+            "the control: while the reservation is live the coin is unavailable"
+        );
+
+        reservations.release(held).expect("release must succeed");
+
+        let after = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("a released coin is selectable again");
+        assert_eq!(after.source_coin_ids(), first.source_coin_ids());
+    }
+
+    /// **RELEASE, on the timeout path.** A build abandoned without a release — a crash, a user who
+    /// walked away — must not hold the wallet's own coins for ever.
+    ///
+    /// The boundary is pinned from BOTH sides: at exactly `NOW + TTL` the reservation is still live,
+    /// and one second later it is not. A test that only stepped far past the TTL would pass equally
+    /// for a reservation that never expired and for one that expired immediately.
+    #[test]
+    fn a_reservation_lapses_after_its_ttl_and_not_before() {
+        const TTL: u64 = 300;
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = LocalReservations::new();
+        let clock = FixedClock::new(NOW);
+        let reservations =
+            CoinReservations::with_ttl_secs(&store, &clock, TTL).expect("a non-zero TTL is fine");
+
+        ops.build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("the first build takes the only coin");
+
+        clock.set(NOW + TTL);
+        assert!(
+            ops.build_transfer(&chain, &hot(), &request, &reservations)
+                .is_err(),
+            "at exactly the TTL the reservation is still holding the coin"
+        );
+
+        clock.set(NOW + TTL + 1);
+        ops.build_transfer(&chain, &hot(), &request, &reservations)
+            .expect("one second past the TTL the coin is selectable again");
+    }
+
+    /// **Expiry must not resurrect a SPENT coin.** The reservation is a filter layered on top of the
+    /// chain read, never a replacement for it.
+    ///
+    /// The fixture holds two coins, one already spent on chain, and lets the reservation lapse. A
+    /// reservation table allowed to stand in for the chain read would hand the spent coin back as
+    /// selectable; the honest answer is that the wallet is short.
+    #[test]
+    fn a_lapsed_reservation_does_not_make_a_spent_coin_selectable() {
+        let ops = ops();
+        let ph = ops.puzzle_hash();
+        let alive = Coin::new(Bytes32::new([2; 32]), ph, 100);
+        let consumed = Coin::new(Bytes32::new([3; 32]), ph, 5_000);
+        let chain = FixedChain::with_records(vec![confirmed(alive), spent(consumed)]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = LocalReservations::new();
+        let clock = FixedClock::new(NOW);
+        let reservations = CoinReservations::new(&store, &clock);
+
+        clock.set(NOW + DEFAULT_RESERVATION_TTL_SECS * 10);
+        let error = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect_err("the only coin big enough is already spent on chain");
+
+        assert!(
+            matches!(
+                error,
+                TransferError::InsufficientFunds { available: 100, .. }
+            ),
+            "a spent coin is not spendable whatever the reservation table says: {error:?}"
+        );
+    }
+
+    /// **FAIL DIRECTION: an unreadable store REFUSES the build.**
+    ///
+    /// The wallet can plainly afford this transfer, so nothing but the unreadable guard can be
+    /// causing the refusal. Proceeding here would be the double-select the reservation exists to
+    /// prevent, reached by ignoring the guard rather than by not having one.
+    #[test]
+    fn an_unreadable_reservation_store_refuses_rather_than_proceeds() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = UnreadableReservations;
+        let clock = FixedClock::new(NOW);
+        let reservations = CoinReservations::new(&store, &clock);
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect_err("a guard that cannot be read must stop the build, not be skipped");
+
+        assert!(
+            matches!(error, TransferError::ReservationUnusable(_)),
+            "and it must say so as itself, not as a shortfall or a chain fault: {error:?}"
+        );
+    }
+
+    /// **A store whose READ fails must refuse too, even though its WRITE would have worked.**
+    ///
+    /// Separate from the test above, and the separation is the point: that store fails on both
+    /// methods, so it stays green even if an unreadable `held` is silently treated as "nothing is
+    /// reserved" — the write path catches it instead. Reverting the `held` guard alone leaves that
+    /// test passing, which is how a fail-open would have shipped.
+    ///
+    /// Here the write path CANNOT catch it. The only thing standing between this build and a
+    /// selection made over an unknown reservation set is the refusal on the read.
+    #[test]
+    fn a_store_that_cannot_be_read_refuses_even_when_it_could_be_written() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+        let request = TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900);
+        let store = UnreadableButWritable(LocalReservations::new());
+        let clock = FixedClock::new(NOW);
+        let reservations = CoinReservations::new(&store, &clock);
+
+        // The control: this store DOES grant reservations, so a refusal here cannot be blamed on a
+        // store that simply never works.
+        store
+            .reserve_all(&[Bytes32::new([0xAB; 32])], NOW, NOW + 300)
+            .expect("the write path of this double genuinely works");
+
+        let error = ops
+            .build_transfer(&chain, &hot(), &request, &reservations)
+            .expect_err("what is already reserved is UNKNOWN, so selection cannot be trusted");
+
+        assert!(
+            matches!(error, TransferError::ReservationUnusable(_)),
+            "{error:?}"
+        );
+    }
+
+    /// **An unreadable CLOCK refuses too.** A "now" that cannot be read makes every expiry
+    /// judgement meaningless, and a guard whose expiry cannot be judged is not a guard.
+    ///
+    /// Worth its own test because the failure is silent in the dangerous direction: a clock read as
+    /// a huge number expires every reservation at once, turning the mechanism off while every call
+    /// still reports success.
+    #[test]
+    fn an_unreadable_clock_refuses_rather_than_guesses() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000_000]);
+        let store = LocalReservations::new();
+        let reservations = CoinReservations::new(&store, &UnreadableClock);
+
+        let error = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900),
+                &reservations,
+            )
+            .expect_err("an unreadable clock cannot judge expiry, so it must stop the build");
+
+        assert!(
+            matches!(error, TransferError::ReservationUnusable(_)),
+            "{error:?}"
+        );
+    }
+
+    /// **A fee bump must not be blocked by its own transfer's reservation.**
+    ///
+    /// `build_transfer_replacing` deliberately re-spends the coins the original plan holds. Taking a
+    /// second reservation over them would conflict with itself and refuse the very operation it
+    /// exists to enable — the wallet locking itself out of its own funds, which is a worse failure
+    /// than the double-select it was added to prevent.
+    #[test]
+    fn a_fee_bump_is_not_blocked_by_its_own_reservation() {
+        let ops = ops();
+        let chain = FixedChain::holding(ops.puzzle_hash(), &[1_000]);
+        let store = LocalReservations::new();
+        let reservations = store.reservations();
+
+        let plan = ops
+            .build_transfer(
+                &chain,
+                &hot(),
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 500)
+                    .with_fee(10),
+                &reservations,
+            )
+            .expect("the first build is funded");
+        assert!(plan.reservation().is_some(), "the control: it did reserve");
+        let pending = plan.pushed_at(PEAK);
+
+        let bumped = ops
+            .build_transfer_replacing(&chain, &hot(), &pending, 50)
+            .expect("a fee bump re-spends coins its own transfer already reserved");
+
+        assert_eq!(
+            bumped.source_coin_ids(),
+            plan.source_coin_ids(),
+            "a replacement re-spends the SAME inputs, which is what makes it a replacement"
+        );
+        assert!(
+            bumped.reservation().is_none(),
+            "and it takes no second hold on them"
+        );
+    }
+
     /// One coin that covers the whole amount is preferred, and it is the SMALLEST such coin — the
     /// wallet's larger coins stay intact and the change stays small.
     ///
@@ -1725,6 +2215,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 900),
+                &free(),
             )
             .expect("the 900 coin covers it exactly");
 
@@ -1750,6 +2241,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
+                &free(),
             )
             .expect("one coin covers this transfer, however much dust surrounds it");
         assert_eq!(inputs_of(&plan), vec![1_000_000]);
@@ -1768,6 +2260,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("1_800 mojos cover 1_000");
 
@@ -1788,6 +2281,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 5_000),
+                &free(),
             )
             .expect_err("1_000 mojos cannot cover 5_000");
         assert!(
@@ -1821,6 +2315,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("only 5 mojos are actually spendable");
         assert!(
@@ -1864,6 +2359,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("a source that cannot report a height cannot judge the balance");
         assert!(
@@ -1891,7 +2387,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .is_ok());
     }
@@ -1928,6 +2425,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("a foreign coin must not stop a wallet spending the coins it owns");
 
@@ -1968,6 +2466,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("5 spendable mojos cannot cover 1_000");
         assert!(
@@ -2011,6 +2510,7 @@ mod tests {
                     &chain,
                     &hot(),
                     &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                    &free(),
                 )
                 .unwrap_or_else(|e| {
                     panic!("attempt {attempt}: dust from a stranger must never block a send: {e}")
@@ -2037,6 +2537,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("a coin of unknown status must not block an affordable transfer");
         assert_eq!(plan.source_coin_ids(), &[genuine.coin_id()]);
@@ -2071,6 +2572,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("5 spendable mojos cannot cover 1_000");
         assert!(
@@ -2110,6 +2612,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("both inputs agree, so the transfer must build");
 
@@ -2145,6 +2648,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+                &free(),
             )
             .expect_err("a selected input the network calls spent must abandon the attempt");
 
@@ -2172,6 +2676,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+                &free(),
             )
             .expect_err("an input the by-name read denies must abandon the attempt");
 
@@ -2201,6 +2706,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("the single-coin path must confirm its coin by name as well");
 
@@ -2233,6 +2739,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+                &free(),
             )
             .expect_err("one 1000-mojo coin cannot fund 1500, however many times it is listed");
 
@@ -2274,6 +2781,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_200),
+                &free(),
             )
             .expect("1000 + 400 covers 1200, so the transfer must build");
 
@@ -2311,6 +2819,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
                     .with_fee(1_000),
+                &free(),
             )
             .expect("builds");
 
@@ -2353,6 +2862,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
                     .with_fee(1_000),
+                &free(),
             )
             .expect("builds");
 
@@ -2402,6 +2912,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
                     .with_fee(1_000),
+                &free(),
             )
             .expect("builds");
 
@@ -2429,6 +2940,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
                     .with_fee(1_000),
+                &free(),
             )
             .expect("builds");
 
@@ -2464,6 +2976,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(own), 500),
+                &free(),
             )
             .expect_err("a self-payment moves nothing and would duplicate a coin id");
         assert!(matches!(error, TransferError::SelfPayment), "{error}");
@@ -2483,6 +2996,7 @@ mod tests {
                     &chain,
                     &hot(),
                     &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), amount),
+                    &free(),
                 )
                 .expect("builds");
             let created = created_coins(plan.coin_spends());
@@ -2513,6 +3027,7 @@ mod tests {
                     PayableDestination::from_derived(RECIPIENT),
                     100 * coins.len() as u64,
                 ),
+                &free(),
             )
             .expect_err("one coin over the cap");
         assert!(
@@ -2541,6 +3056,7 @@ mod tests {
                     PayableDestination::from_derived(RECIPIENT),
                     100 * coins.len() as u64,
                 ),
+                &free(),
             )
             .expect("exactly the cap is allowed");
         assert_eq!(plan.coin_spends().len(), MAX_TRANSFER_INPUT_COINS);
@@ -2560,6 +3076,7 @@ mod tests {
                 &chain,
                 &CustodyPolicy::Vault(Vault::default()),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
+                &free(),
             )
             .expect_err("a vault outflow may only pay this profile's own hot wallet");
         assert!(
@@ -2582,7 +3099,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600_000),
+                &free(),
             )
             .is_ok());
     }
@@ -2601,6 +3119,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(1),
+                &free(),
             )
             .expect_err("1_000 mojos cannot pay 1_000 plus a fee");
         assert!(
@@ -2624,7 +3143,8 @@ mod tests {
             .build_transfer(
                 &chain,
                 &hot(),
-                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
+                &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .is_ok());
     }
@@ -2638,6 +3158,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 0),
+                &free(),
             )
             .expect_err("a transfer moves a positive amount");
         assert!(matches!(error, TransferError::ZeroAmount), "{error}");
@@ -2655,6 +3176,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), u64::MAX)
                     .with_fee(1),
+                &free(),
             )
             .expect_err("u64::MAX + 1 is not a spendable total");
         assert!(
@@ -2674,6 +3196,7 @@ mod tests {
                 &FixedChain::offline(),
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("an unanswerable chain is not an empty wallet");
         assert!(
@@ -2745,6 +3268,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect_err("a balance past u64 cannot be judged");
         assert!(
@@ -2866,6 +3390,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
+                &free(),
             )
             .expect("builds");
 
@@ -2885,6 +3410,7 @@ mod tests {
                 &source,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
+                &free(),
             )
             .expect("builds");
 
@@ -2920,6 +3446,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds");
         let naive_retry = ops
@@ -2928,6 +3455,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(100),
+                &free(),
             )
             .expect("builds");
 
@@ -2969,6 +3497,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds");
         let pending = original.pushed_at(PEAK);
@@ -3016,6 +3545,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3060,6 +3590,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3098,6 +3629,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3121,6 +3653,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3151,6 +3684,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3177,6 +3711,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds");
         let pending = original.pushed_at(PEAK);
@@ -3220,6 +3755,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3243,6 +3779,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3275,6 +3812,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3316,6 +3854,7 @@ mod tests {
                 &wallet,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3325,6 +3864,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 500)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3431,6 +3971,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_000)
                     .with_fee(50),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3452,6 +3993,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 1_500),
+                &free(),
             )
             .expect("builds")
             .pushed_at(PEAK);
@@ -3480,6 +4022,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 550),
+                &free(),
             )
             .expect("builds");
 
@@ -3573,6 +4116,7 @@ mod tests {
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 700_000)
                     .with_fee(1_000),
+                &free(),
             )
             .expect("builds");
         assert!(
@@ -3635,6 +4179,7 @@ mod tests {
                 &chain,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 500),
+                &free(),
             )
             .expect("builds");
 
@@ -3652,6 +4197,7 @@ mod tests {
                 source,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
+                &free(),
             )
             .expect("builds");
         // Derived from the coins the puzzles CREATE rather than from an assumed spend ordering, so
@@ -3838,6 +4384,7 @@ mod tests {
                 &source,
                 &hot(),
                 &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 600),
+                &free(),
             )
             .expect("builds");
         let payment = created_coins(plan.coin_spends())

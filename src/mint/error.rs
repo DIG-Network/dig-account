@@ -28,6 +28,27 @@ pub enum MintError {
         available: u64,
     },
 
+    /// The wallet OWNS a coin large enough, but it is already committed to an in-flight spend.
+    ///
+    /// Deliberately NOT [`InsufficientFunds`](Self::InsufficientFunds), which is the only variant
+    /// that means "add funds and try again". This one means "wait" — `available` still counts the
+    /// reserved coin, because it is the user's money and a reservation narrows what may be selected,
+    /// never what they hold. A wizard that rendered this as a shortfall would ask a funded user to
+    /// deposit for no reason.
+    #[error("the coin that would fund this mint is reserved by an in-flight spend: it needs {required} mojos, the wallet's largest confirmed coin is {available} and is busy")]
+    CoinsReserved {
+        /// The minimum single-coin amount required.
+        required: u64,
+        /// The largest confirmed unspent coin the wallet holds, reserved ones included.
+        available: u64,
+    },
+
+    /// The reservation store could not be consulted, so what is already in flight is UNKNOWN.
+    ///
+    /// The mint REFUSES rather than proceeding over a guard it cannot read.
+    #[error("{0}")]
+    ReservationUnusable(String),
+
     /// The chain ACCEPTED the request and refused the spend: the bundle reached a node and the
     /// mempool declined it. The user's funds did not move, and retrying the same bundle will fail
     /// the same way.

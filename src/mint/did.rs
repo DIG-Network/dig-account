@@ -33,6 +33,9 @@
 use std::collections::HashSet;
 
 use chia_bls::Signature;
+
+use crate::wallet::reservation::{select_and_reserve, CoinReservations, HeldCoins, ReservationId};
+use crate::wallet::transfer::MAX_RESERVATION_ATTEMPTS;
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use chia_wallet_sdk::driver::{SpendContext, StandardLayer};
 use chia_wallet_sdk::prelude::MAINNET_CONSTANTS;
@@ -155,21 +158,39 @@ impl ProfileMinter {
     ///
     /// On [`MintNetwork::mainnet`] this spends real XCH: one mojo becomes the DID singleton and
     /// `options.fee` goes to a farmer.
-    pub fn begin_did_mint<C, P>(
+    pub fn begin_did_mint<'r, C, P>(
         &self,
         ix: ProfileIx,
         chain: &C,
         publisher: &P,
         network: &MintNetwork,
         options: &MintOptions,
-    ) -> MintResult<PendingMint>
+        reservations: &'r CoinReservations<'r>,
+    ) -> MintResult<(PendingMint, ReservationId)>
     where
         C: ChainSource + ?Sized,
         P: SpendPublisher + ?Sized,
     {
-        let (bundle, pending) = self.prepare_did_mint(ix, chain, network, options)?;
-        push(publisher, &bundle)?;
-        Ok(pending)
+        let (bundle, pending, held) =
+            self.prepare_did_mint(ix, chain, network, options, reservations)?;
+
+        // The push outcome decides the coins, and the two failures are NOT the same.
+        //
+        // `Rejected` is the mempool refusing this bundle: it can never be included, so the coins
+        // guard nothing and holding them would be a lockout over a spend that is already dead.
+        // Dropping the guard releases them.
+        //
+        // Anything else means the outcome is UNKNOWN - the bundle may well have landed - so the
+        // coins stay held to the TTL. That is over-reserving, the safe direction: releasing here and
+        // re-selecting would build a second bundle spending an input the first may have consumed.
+        match push(publisher, &bundle) {
+            Ok(()) => Ok((pending, held.commit())),
+            Err(rejected @ MintError::Rejected(_)) => Err(rejected),
+            Err(unknown) => {
+                let _ = held.commit();
+                Err(unknown)
+            }
+        }
     }
 
     /// Build and SIGN a DID mint, without pushing it.
@@ -178,20 +199,34 @@ impl ProfileMinter {
     /// reservation of `ix` BEFORE the bundle reaches a mempool. Pushing first would leave a window
     /// in which the user has paid for a DID that no journal entry names — the exact loss
     /// dig_ecosystem#2377 describes.
-    pub(super) fn prepare_did_mint<C>(
+    pub(super) fn prepare_did_mint<'r, C>(
         &self,
         ix: ProfileIx,
         chain: &C,
         network: &MintNetwork,
         options: &MintOptions,
-    ) -> MintResult<(SpendBundle, PendingMint)>
+        reservations: &'r CoinReservations<'r>,
+    ) -> MintResult<(SpendBundle, PendingMint, HeldCoins<'r>)>
     where
         C: ChainSource + ?Sized,
     {
         let wallet = self.live_wallet_key(ix)?;
         options.check_fee_ceiling()?;
 
-        let source = select_funding_coin(chain, wallet.puzzle_hash(), options)?;
+        // Selected and reserved in one step, so a transfer building at the same moment cannot take
+        // the funding coin out from under this mint.
+        // The guard stays alive across every step below. Four of them are fallible and two are
+        // remote reads, so a bare id here would strand the funding coin for the full TTL whenever a
+        // peer failed after the listing - repeatable, and on a different coin each time.
+        let (source, held) = select_and_reserve(
+            reservations,
+            MAX_RESERVATION_ATTEMPTS,
+            |excluded| {
+                let coin = select_funding_coin(chain, wallet.puzzle_hash(), options, excluded)?;
+                Ok((coin, vec![coin.coin_id()]))
+            },
+            |e| MintError::ReservationUnusable(e.to_string()),
+        )?;
         // The peak BEFORE the push. A mint cannot confirm in a block that already existed when it
         // was pushed, so this height is what later makes a back-dated confirmation contradict
         // something the chain itself said earlier.
@@ -203,7 +238,9 @@ impl ProfileMinter {
         self.ensure_live()?;
         let signature = sign_mint_spends(&wallet, &coin_spends, network)?;
 
-        Ok((SpendBundle::new(coin_spends, signature), pending))
+        // The guard is handed on UNCOMMITTED: a signed bundle exists, but it has not been pushed,
+        // and whether the coins should stay held depends on how that push goes.
+        Ok((SpendBundle::new(coin_spends, signature), pending, held))
     }
 
     /// Ask the chain where `pending` stands: confirmed, still waiting, or dead.
@@ -310,10 +347,16 @@ where
 /// unconfirmed, already spent, or locked by a puzzle this wallet cannot unlock is not spendable, so
 /// it is not a candidate — and it is not counted toward `available` either, or
 /// [`MintError::InsufficientFunds`] would report a balance the user cannot actually spend.
+///
+/// `reserved` names coins already committed to an in-flight spend — a transfer, a $DIG send, or
+/// another mint. They are excluded from what may be CHOSEN and deliberately still counted toward
+/// `available`, so a mint blocked only by a busy coin says the coin is busy
+/// ([`MintError::CoinsReserved`]) rather than claiming the user cannot afford their own mint.
 pub(super) fn select_funding_coin<C>(
     chain: &C,
     puzzle_hash: Bytes32,
     options: &MintOptions,
+    reserved: &HashSet<Bytes32>,
 ) -> MintResult<Coin>
 where
     C: ChainSource + ?Sized,
@@ -337,19 +380,41 @@ where
     let required = options.required_coin_amount();
     let mut best: Option<Coin> = None;
     let mut available = 0u64;
+    // Whether the wallet OWNS a coin that could fund the mint is judged over EVERY spendable coin,
+    // before reservations narrow the choice. The two questions get different answers because they
+    // are different questions: "you cannot afford this" is fixed by a deposit, "your coin is busy
+    // for the next few minutes" is fixed by waiting, and telling a user the first when the second is
+    // true is a lie about their own money.
+    let mut owns_a_covering_coin = false;
     for record in spendable {
         available = available.max(record.coin.amount);
-        if record.coin.amount >= required
-            && best.map_or(true, |current| record.coin.amount < current.amount)
-        {
+        if record.coin.amount < required {
+            continue;
+        }
+        owns_a_covering_coin = true;
+        if reserved.contains(&record.coin.coin_id()) {
+            continue;
+        }
+        if best.map_or(true, |current| record.coin.amount < current.amount) {
             best = Some(record.coin);
         }
     }
 
-    let chosen = best.ok_or(MintError::InsufficientFunds {
-        required,
-        available,
-    })?;
+    let chosen = match best {
+        Some(coin) => coin,
+        None if owns_a_covering_coin => {
+            return Err(MintError::CoinsReserved {
+                required,
+                available,
+            })
+        }
+        None => {
+            return Err(MintError::InsufficientFunds {
+                required,
+                available,
+            })
+        }
+    };
     confirm_spendable_by_name(chain, chosen).map_err(unknown_state)?;
     Ok(chosen)
 }
@@ -661,11 +726,88 @@ mod tests {
                 .collect(),
         );
 
-        let chosen = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect("two coins cover the fee");
+        let chosen = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect("two coins cover the fee");
         assert_eq!(
             chosen.amount, 900,
             "50 and 20 are too small; 5_000 is larger"
+        );
+    }
+
+    /// **A mint does not take a coin an in-flight transfer already holds.**
+    ///
+    /// The fixture holds TWO coins that could each fund the mint, and reserves the one the
+    /// smallest-sufficient rule would otherwise choose. The second coin is the truthful control: the
+    /// mint must still succeed, on the other coin, so this cannot be satisfied by an implementation
+    /// that simply refuses whenever anything is reserved.
+    #[test]
+    fn a_reserved_coin_is_not_chosen_to_fund_a_mint() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let coin =
+            |tag: u8, amount| Coin::new(Bytes32::new([tag; 32]), wallet.puzzle_hash(), amount);
+        let preferred = coin(1, 900);
+        let spare = coin(2, 5_000);
+        let chain = FixedChain::new(vec![preferred, spare]);
+
+        let control = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect("the control: unreserved, the smallest sufficient coin wins");
+        assert_eq!(control.coin_id(), preferred.coin_id());
+
+        let reserved: HashSet<Bytes32> = [preferred.coin_id()].into_iter().collect();
+        let chosen = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &reserved,
+        )
+        .expect("the mint falls back to the coin that is free");
+        assert_eq!(
+            chosen.coin_id(),
+            spare.coin_id(),
+            "a coin committed to another spend must not fund a mint too"
+        );
+    }
+
+    /// **A mint blocked ONLY by a reservation says the coin is busy, not that the user is broke.**
+    ///
+    /// `InsufficientFunds` is the one variant that means "add funds and try again", so rendering a
+    /// busy coin as one would ask a funded user to deposit for no reason. `available` still reports
+    /// the reserved coin, because a reservation narrows what may be selected and never what the user
+    /// holds.
+    #[test]
+    fn a_mint_blocked_by_a_reservation_is_not_reported_as_a_shortfall() {
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let only = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 5_000);
+        let chain = FixedChain::new(vec![only]);
+        let reserved: HashSet<Bytes32> = [only.coin_id()].into_iter().collect();
+
+        let error = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &reserved,
+        )
+        .expect_err("the only coin is committed elsewhere");
+
+        assert!(
+            matches!(
+                error,
+                MintError::CoinsReserved {
+                    available: 5_000,
+                    ..
+                }
+            ),
+            "a busy coin is not a shortfall, and the balance must still count it: {error}"
         );
     }
 
@@ -694,8 +836,13 @@ mod tests {
             ],
         };
 
-        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::default())
-            .expect_err("neither coin is spendable");
+        let error = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::default(),
+            &HashSet::new(),
+        )
+        .expect_err("neither coin is spendable");
         assert!(
             matches!(error, MintError::InsufficientFunds { available: 0, .. }),
             "{error}"
@@ -720,8 +867,13 @@ mod tests {
             Coin::new(parent, wallet.puzzle_hash(), 900),
         ]);
 
-        let chosen = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect("the wallet's own coin covers the mint, so a foreign record is not fatal");
+        let chosen = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect("the wallet's own coin covers the mint, so a foreign record is not fatal");
         assert_eq!(
             chosen.puzzle_hash,
             wallet.puzzle_hash(),
@@ -742,8 +894,13 @@ mod tests {
             Coin::new(parent, wallet.puzzle_hash(), 50),
         ]);
 
-        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect_err("50 mojos cannot cover a 101-mojo mint");
+        let error = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect_err("50 mojos cannot cover a 101-mojo mint");
         assert!(
             matches!(error, MintError::InsufficientFunds { available: 50, .. }),
             "{error}"
@@ -763,8 +920,13 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
         let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Spent);
 
-        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect_err("a coin the chain also calls spent must never fund a spend");
+        let error = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect_err("a coin the chain also calls spent must never fund a spend");
         assert!(
             matches!(error, MintError::ChainUnreachable(_)),
             "the two reads disagree, so the coin's state is UNKNOWN, never a refusal or a shortfall: {error}"
@@ -784,8 +946,13 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
         let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Absent);
 
-        let error = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect_err("a coin the chain does not know by name must never fund a spend");
+        let error = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect_err("a coin the chain does not know by name must never fund a spend");
         assert!(matches!(error, MintError::ChainUnreachable(_)), "{error}");
     }
 
@@ -797,8 +964,13 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1; 32]), wallet.puzzle_hash(), 900);
         let chain = DisagreeingChain::listing_says_spendable(coin, ByNameAnswer::Spendable);
 
-        let chosen = select_funding_coin(&chain, wallet.puzzle_hash(), &MintOptions::with_fee(100))
-            .expect("two agreeing reads are the ordinary case");
+        let chosen = select_funding_coin(
+            &chain,
+            wallet.puzzle_hash(),
+            &MintOptions::with_fee(100),
+            &HashSet::new(),
+        )
+        .expect("two agreeing reads are the ordinary case");
         assert_eq!(chosen, coin);
     }
 

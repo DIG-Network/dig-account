@@ -32,6 +32,17 @@ mod common;
 
 use common::{unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// A recipient nobody in these tests holds the key for — so a payment to it is genuinely value
 /// leaving the wallet, not change wearing a different hat.
 const RECIPIENT: Bytes32 = Bytes32::new([7u8; 32]);
@@ -97,7 +108,7 @@ fn send(
     request: &TransferRequest,
 ) -> anyhow::Result<dig_account::PendingTransfer> {
     let ops = account.wallet_ops();
-    let plan = ops.build_transfer(chain, &hot(), request)?;
+    let plan = ops.build_transfer(chain, &hot(), request, &free())?;
     let bundle = authorize_and_sign(account, &plan);
 
     let pending = plan.pushed_now(chain)?;
@@ -179,6 +190,7 @@ fn a_multi_coin_transfer_is_accepted_by_consensus() -> anyhow::Result<()> {
         &chain,
         &hot(),
         &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), 700_000).with_fee(FEE),
+        &free(),
     )?;
     assert!(
         plan.coin_spends().len() > 1,
@@ -311,7 +323,8 @@ fn an_offline_chain_fails_closed_rather_than_answering() -> anyhow::Result<()> {
         account.wallet_ops().build_transfer(
             &offline,
             &hot(),
-            &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
+            &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT),
+            &free(),
         ),
         Err(TransferError::ChainUnreachable(_))
     ));
@@ -335,6 +348,7 @@ fn the_gates_summary_names_the_recipient_and_the_exact_amount() -> anyhow::Resul
         &chain,
         &hot(),
         &TransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT).with_fee(FEE),
+        &free(),
     )?;
 
     let summary = ops.summarize(plan.coin_spends(), &hot())?;

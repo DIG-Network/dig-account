@@ -24,6 +24,8 @@ pub mod money_signer;
 #[cfg(test)]
 pub(crate) mod nft_fixture;
 pub mod policy;
+/// In-flight coin reservation: what a built-but-unsettled spend has already committed.
+pub mod reservation;
 pub mod summary;
 pub mod transfer;
 pub mod vault_move;

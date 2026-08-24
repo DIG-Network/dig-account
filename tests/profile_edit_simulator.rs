@@ -30,6 +30,17 @@ mod common;
 
 use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// Enough to fund both mint bundles and their change with room to spare.
 const FUNDING: u64 = 1_000_000;
 
@@ -153,12 +164,13 @@ fn mint_profile_at(
         chain,
         &network,
         &Default::default(),
+        &free(),
     )?;
     chain.farm()?;
-    minter.advance_profile_mint(&mut registry, ix, chain, chain, &network)?;
+    minter.advance_profile_mint(&mut registry, ix, chain, chain, &network, &free())?;
     chain.farm()?;
 
-    let status = minter.advance_profile_mint(&mut registry, ix, chain, chain, &network)?;
+    let status = minter.advance_profile_mint(&mut registry, ix, chain, chain, &network, &free())?;
     let ProfileMintStatus::Confirmed { did, store } = status else {
         panic!("both halves farmed and buried, so the mint is confirmed; got {status:?}");
     };

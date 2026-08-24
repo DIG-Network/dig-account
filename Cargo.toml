@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -73,9 +73,10 @@ dig-chainsource-interface = "0.3"
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.
 #
-# DO NOT bump to ^0.7 to "keep current". dig-store 0.7.1 — reached through dig-social-profile 0.4 —
-# requires dig-merkle ^0.6, and ^0.6 excludes 0.7.0. Asking for ^0.7 here does not upgrade that
-# edge; it resolves a SECOND dig-merkle line beside it. 0.6 and 0.7 both already build on
+# DO NOT bump to ^0.8 to "keep current" (re-measured 2026-08-24: 0.8.0 is the index latest).
+# dig-store 0.7.1 — reached through dig-social-profile 0.6 — requires dig-merkle ^0.6, and ^0.6
+# excludes every later minor. Asking for ^0.8 here does not upgrade that edge; it resolves a SECOND
+# dig-merkle line beside it. The cascade runs dig-store first, then dig-social-profile, then here. 0.6 and 0.7 both already build on
 # chia-wallet-sdk 0.34, so ^0.6 costs nothing and keeps the tree single-rooted.
 dig-merkle = "0.6"
 # The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
