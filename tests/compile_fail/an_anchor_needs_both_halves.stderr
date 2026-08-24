@@ -6,7 +6,7 @@ error: cannot construct `ProfileAnchor` with struct literal syntax due to privat
 12 |         did: "did:chia:x".to_string(),
    |         ----------------------------- private field
    |
-   = note: ...and other private fields `launcher_id`, `did_coin_id`, `did_confirmed_height`, `store_launcher_id`, `store_confirmed_height`, `store_launched_from` and `store_coin_id` that were not provided
+   = note: ...and other private fields that were not provided
 
 warning: unreachable statement
   --> tests/compile_fail/an_anchor_needs_both_halves.rs:17:5

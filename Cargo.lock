@@ -491,10 +491,11 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.8.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3780fdb278096102cd39f62614e341c4d03352507e05947ccb77ac8b7dd92eb0"
+checksum = "e14ef66f4c6323f168d0f584d0b76bc48dbfc15c220dae314237b79abc56aff4"
 dependencies = [
+ "async-trait",
  "chia-bls 0.36.1",
  "chia-consensus",
  "chia-protocol",
@@ -1363,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1380,7 +1381,7 @@ dependencies = [
  "dig-chainsource-interface",
  "dig-constants",
  "dig-did 0.7.0",
- "dig-identity 0.6.0",
+ "dig-identity 0.7.0",
  "dig-ipc-protocol",
  "dig-keystore",
  "dig-merkle",
