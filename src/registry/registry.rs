@@ -549,7 +549,7 @@ impl ProfileRegistry {
         for entry in &self.entries {
             if let Some(first) = identities.insert(entry.anchor().launcher_id(), entry.ix()) {
                 return Err(format!(
-                    "profiles {first} and {second} both claim identity {did}: one DID cannot be two                      profiles, which would derive two wallet keys and two DEKs for one person",
+                    "profiles {first} and {second} both claim identity {did}; one DID cannot be two profiles, because each index derives its own wallet key and its own DEK",
                     second = entry.ix(),
                     did = entry.anchor().did()
                 ));
@@ -579,7 +579,7 @@ impl ProfileRegistry {
             }
             if !anchor.pairing_holds() {
                 return Err(format!(
-                    "profile {ix}'s store was launched from DID coin {launched_from}, not from                      this profile's DID coin {did_coin}; the two halves are not one mint",
+                    "profile {ix}'s store was launched from DID coin {launched_from}, not from its own DID coin {did_coin}; the two halves are not one mint",
                     launched_from = anchor
                         .store_launched_from()
                         .expect("pairing_holds is only false when the coin is recorded"),
@@ -844,7 +844,7 @@ mod tests {
         assert_eq!(
             at_ceiling.next_free_ix(),
             None,
-            "there is no index past u32::MAX, and answering with the occupied ceiling wedges              every future mint"
+            "there is no index past u32::MAX, and answering with the occupied ceiling wedges every future mint"
         );
 
         let mut below_ceiling = ProfileRegistry::empty();
@@ -854,7 +854,7 @@ mod tests {
         assert_eq!(
             below_ceiling.next_free_ix(),
             Some(ProfileIx(u32::MAX)),
-            "the last index is still mintable, so the refusal above is the ceiling and not a              function that stopped answering"
+            "the last index is still mintable, so the refusal above is the ceiling and not a function that stopped answering"
         );
     }
 
