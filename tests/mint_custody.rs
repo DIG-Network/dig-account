@@ -20,11 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chia_protocol::{Bytes32, CoinSpend};
 use dig_account::auth::policy::Clock;
 use dig_account::{
     AccountId, AccountSession, AccountStore, AuthFactors, MintError, MintOptions, MintStatus,
     PasswordOnlyPolicy, ProfileIx, UnlockGate, UnlockedAccount, MAX_MINT_FEE_MOJOS,
 };
+use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_keystore::MemoryBackend;
 use dig_session::{Password, ENTROPY_LEN};
 
@@ -300,6 +302,136 @@ fn reading_mint_status_after_lock_still_answers() -> anyhow::Result<()> {
             MintStatus::Confirmed(_)
         ),
         "a mint pushed before the lock must remain resolvable after it"
+    );
+    Ok(())
+}
+
+/// A chain that runs `during` the first time the mint asks for the peak, then delegates everything
+/// to a real simulator.
+///
+/// The peak read sits between the mint deriving its key and the mint signing its bundle, so this
+/// wrapper puts a user action in exactly the window a lock can land in — which is the whole point.
+/// It is a wrapper rather than a modified simulator so the mint being exercised is the ordinary
+/// one, with a single actor varied.
+struct LocksMidCeremony<'a> {
+    inner: &'a SimulatorChain,
+    during: Box<dyn Fn() + 'a>,
+    fired: std::cell::Cell<bool>,
+}
+
+impl<'a> LocksMidCeremony<'a> {
+    fn new(inner: &'a SimulatorChain, during: impl Fn() + 'a) -> Self {
+        Self {
+            inner,
+            during: Box::new(during),
+            fired: std::cell::Cell::new(false),
+        }
+    }
+
+    fn fire_once(&self) {
+        if !self.fired.replace(true) {
+            (self.during)();
+        }
+    }
+}
+
+impl ChainSource for LocksMidCeremony<'_> {
+    type Error = <SimulatorChain as ChainSource>::Error;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        self.inner.resolve_singleton_lineage(launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.fire_once();
+        self.inner.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_timestamp(height)
+    }
+}
+
+/// **Regression (dig-account#31): a lock that lands DURING the ceremony must stop the signature.**
+///
+/// The mint checks residency once, derives its key, and only then consults the chain — selecting a
+/// funding coin and reading a peak — before signing. That window is a network round trip, not the
+/// handful of instructions it looks like in the source, and a user who locks their account inside
+/// it has revoked the capability. A signature produced afterwards spends their money under an
+/// unlock that no longer exists.
+///
+/// This is a PLACEMENT test, so it is written to fail on placement rather than on outcome: the lock
+/// arrives after the entry check has already passed, so the only thing that can refuse is a
+/// re-check sitting below the chain reads. A guard left at the top of the call passes every other
+/// custody test in this file and fails this one.
+#[test]
+fn a_lock_landing_mid_ceremony_stops_the_signature() -> anyhow::Result<()> {
+    let (gate, account, _clock) = gated_unlock();
+    let simulator = funded_chain(&account);
+    let minter = account.profile_minter();
+    let gate = std::cell::RefCell::new(gate);
+
+    let chain = LocksMidCeremony::new(&simulator, || gate.borrow_mut().lock());
+    let error = minter
+        .begin_did_mint(
+            ProfileIx::ROOT,
+            &chain,
+            &simulator,
+            &simulator_network(),
+            &MintOptions::default(),
+        )
+        .expect_err("an account locked mid-ceremony cannot sign");
+
+    assert!(
+        matches!(error, MintError::Locked),
+        "the refusal must be the revoked unlock, not a chain or build failure: {error}"
+    );
+    assert_eq!(
+        simulator.pushed_bundles(),
+        0,
+        "nothing may reach the mempool once the unlock is gone"
+    );
+
+    // The control: the identical fixture and the identical wrapper, with the lock omitted. Without
+    // it, a mint too broken to run at all would produce the same refusal.
+    let (_gate, live, _clock) = gated_unlock();
+    let live_simulator = funded_chain(&live);
+    let live_chain = LocksMidCeremony::new(&live_simulator, || {});
+    live.profile_minter().begin_did_mint(
+        ProfileIx::ROOT,
+        &live_chain,
+        &live_simulator,
+        &simulator_network(),
+        &MintOptions::default(),
+    )?;
+    assert_eq!(
+        live_simulator.pushed_bundles(),
+        1,
+        "the same ceremony, with nothing revoked, mints"
     );
     Ok(())
 }

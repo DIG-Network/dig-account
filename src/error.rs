@@ -31,6 +31,20 @@ pub enum AccountError {
     #[error("a profile is already registered at index {0}")]
     ProfileAlreadyRegistered(ProfileIx),
 
+    /// A profile with this IDENTITY is already recorded, at a different index.
+    ///
+    /// A profile IS its on-chain identity. Two entries claiming one DID would derive different
+    /// wallet keys and different DEKs from their two indices while presenting as the same person,
+    /// so the account could receive at an address the identity's own surfaces never show. The
+    /// existing entry is left untouched.
+    #[error("profile {existing} is already registered with identity {did}")]
+    ProfileIdentityAlreadyRegistered {
+        /// The index that already holds this identity.
+        existing: ProfileIx,
+        /// The `did:chia:…` string both entries claim.
+        did: String,
+    },
+
     /// The ACTIVE profile cannot be hidden from the host's lists.
     ///
     /// A hidden active profile is a trap: the UI lists nothing while the wallet keeps deriving and

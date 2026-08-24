@@ -341,6 +341,10 @@ impl ProfileMinter {
             select_funding_coin(chain, wallet.puzzle_hash(), &MintOptions::with_fee(fee))?;
         let pushed_at_height = peak_height(chain)?;
 
+        // As on the DID half: the lineage walk and the coin selection above are network round
+        // trips, so the unlock is re-read immediately before the store launch is signed
+        // (dig-account#31).
+        self.ensure_live()?;
         let launch = build_and_sign_store_launch(
             &wallet,
             tip.did(),

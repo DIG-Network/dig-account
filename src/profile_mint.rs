@@ -64,6 +64,27 @@ impl ProfileMinter {
         }
         Ok(self.seed.master_seed())
     }
+
+    /// Refuse if the unlock has ended, without deriving anything.
+    ///
+    /// # Why the mint re-reads the residency instead of trusting its entry check
+    ///
+    /// A mint's key is derived once, at the top of the ceremony, and the bundle is signed at the
+    /// bottom. Between the two the ceremony CONSULTS THE CHAIN — it selects a funding coin, reads a
+    /// peak, and on the store half walks a singleton lineage — so the window is a network round
+    /// trip, not the few instructions it looks like in the source. A user who locks their account
+    /// during that window has revoked the capability, and a signature produced afterwards would
+    /// spend their money under an unlock that no longer exists.
+    ///
+    /// This does not weaken the entry check, which still stops a locked account deriving key
+    /// material at all. It closes the tail of the same window (dig-account#31).
+    pub(crate) fn ensure_live(&self) -> MintResult<()> {
+        if self.residency.is_live() {
+            Ok(())
+        } else {
+            Err(MintError::Locked)
+        }
+    }
 }
 
 #[cfg(test)]

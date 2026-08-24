@@ -153,12 +153,13 @@ where
 
 /// Which index to mint at: the one already in progress, else the next free one.
 ///
-/// `next_free_ix` never fills a gap — a gap is not evidence an index is unused (dig_ecosystem#2392).
-pub fn target_index(registry: &ProfileRegistry) -> ProfileIx {
+/// `next_free_ix` never fills a gap — a gap is not evidence an index is unused (dig_ecosystem#2392),
+/// and it reports exhaustion rather than handing back an occupied index (dig-account#33).
+pub fn target_index(registry: &ProfileRegistry) -> Option<ProfileIx> {
     registry
         .in_progress()
         .first()
-        .map_or_else(|| registry.next_free_ix(), |mint| mint.ix())
+        .map_or_else(|| registry.next_free_ix(), |mint| Some(mint.ix()))
 }
 
 /// Read the journal, treating an absent file as an empty registry and a corrupt one as fatal.
