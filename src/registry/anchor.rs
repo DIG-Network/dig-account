@@ -146,8 +146,9 @@ impl ProfileAnchor {
     /// identity its own earlier versions wrote. The claim this method makes is therefore precisely
     /// "nothing here contradicts the pairing", never "the pairing was proven".
     pub fn pairing_holds(&self) -> bool {
+        // `map_or(true, ..)` rather than `is_none_or`, which is newer than this crate's MSRV.
         self.store_launched_from
-            .is_none_or(|launched_from| launched_from == self.did_coin_id)
+            .map_or(true, |launched_from| launched_from == self.did_coin_id)
     }
 }
 
