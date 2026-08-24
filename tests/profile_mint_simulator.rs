@@ -30,6 +30,17 @@ mod common;
 
 use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// Enough to fund both bundles and their change with room to spare.
 const FUNDING: u64 = 1_000_000;
 
@@ -65,14 +76,15 @@ fn mint_a_whole_profile(
         chain,
         network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
     // The DID has confirmed; this call launches the store.
-    minter.advance_profile_mint(registry, ProfileIx::ROOT, chain, chain, network)?;
+    minter.advance_profile_mint(registry, ProfileIx::ROOT, chain, chain, network, &free())?;
     chain.farm()?;
 
-    Ok(minter.advance_profile_mint(registry, ProfileIx::ROOT, chain, chain, network)?)
+    Ok(minter.advance_profile_mint(registry, ProfileIx::ROOT, chain, chain, network, &free())?)
 }
 
 /// **The composition validates on chain.** Both bundles are accepted by the CLVM + BLS validator,
@@ -161,12 +173,13 @@ fn launching_directly_from_the_did_coin_is_refused() -> anyhow::Result<()> {
 
     let (account, chain, _registry) = ready_to_mint();
     let minter = account.profile_minter();
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -227,6 +240,7 @@ fn a_resume_launches_from_the_existing_did_and_never_re_mints_it() -> anyhow::Re
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -254,10 +268,23 @@ fn a_resume_launches_from_the_existing_did_and_never_re_mints_it() -> anyhow::Re
         0,
     )?;
 
-    minter.advance_profile_mint(&mut reloaded, ProfileIx::ROOT, &chain, &chain, &network)?;
+    minter.advance_profile_mint(
+        &mut reloaded,
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &network,
+        &free(),
+    )?;
     chain.farm()?;
-    let status =
-        minter.advance_profile_mint(&mut reloaded, ProfileIx::ROOT, &chain, &chain, &network)?;
+    let status = minter.advance_profile_mint(
+        &mut reloaded,
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &network,
+        &free(),
+    )?;
 
     let ProfileMintStatus::Confirmed { did, store } = status else {
         panic!("the resumed store launch confirms the profile, got {status:?}");
@@ -299,6 +326,7 @@ fn repeated_advances_against_an_unconfirming_chain_push_nothing() -> anyhow::Res
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     assert_eq!(chain.pushed_bundles(), 1, "begin pushes the DID bundle");
 
@@ -312,6 +340,7 @@ fn repeated_advances_against_an_unconfirming_chain_push_nothing() -> anyhow::Res
             &chain,
             &chain,
             &network,
+            &free(),
         )?;
         assert!(
             matches!(status, ProfileMintStatus::DidPending { .. }),
@@ -442,6 +471,7 @@ fn an_undelivered_store_launch_is_never_broadcast_twice() -> anyhow::Result<()> 
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -450,7 +480,14 @@ fn an_undelivered_store_launch_is_never_broadcast_twice() -> anyhow::Result<()> 
     let attempts_before = chain.push_attempts();
     assert!(
         minter
-            .advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)
+            .advance_profile_mint(
+                &mut registry,
+                ProfileIx::ROOT,
+                &chain,
+                &chain,
+                &network,
+                &free()
+            )
             .is_err(),
         "an undeliverable push reports an UNKNOWN outcome, never a success"
     );
@@ -470,6 +507,7 @@ fn an_undelivered_store_launch_is_never_broadcast_twice() -> anyhow::Result<()> 
             &chain,
             &chain,
             &network,
+            &free(),
         )?;
         assert!(
             matches!(status, ProfileMintStatus::StorePending { .. }),
@@ -506,6 +544,7 @@ fn an_unanswered_did_push_keeps_the_mint_journalled() -> anyhow::Result<()> {
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     );
 
     assert!(result.is_err(), "an undeliverable push is not a success");
@@ -608,12 +647,13 @@ fn a_second_real_did(account: &UnlockedAccount, chain: &SimulatorChain) -> anyho
     const STRANGER: ProfileIx = ProfileIx(1);
 
     chain.fund(account.wallet_ops_at(STRANGER).puzzle_hash(), FUNDING);
-    let pending = account.profile_minter().begin_did_mint(
+    let (pending, _reservation) = account.profile_minter().begin_did_mint(
         STRANGER,
         chain,
         chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -651,6 +691,7 @@ fn a_lineage_answering_with_a_different_singleton_is_refused() -> anyhow::Result
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -671,7 +712,14 @@ fn a_lineage_answering_with_a_different_singleton_is_refused() -> anyhow::Result
     let attempts_before = chain.push_attempts();
 
     let error = minter
-        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &hostile, &hostile, &network)
+        .advance_profile_mint(
+            &mut registry,
+            ProfileIx::ROOT,
+            &hostile,
+            &hostile,
+            &network,
+            &free(),
+        )
         .expect_err("a tip that is not this mint's DID coin must be refused");
 
     assert!(
@@ -700,6 +748,7 @@ fn a_lineage_answering_with_a_different_singleton_is_refused() -> anyhow::Result
         &hostile,
         &hostile,
         &network,
+        &free(),
     )?;
     assert!(
         matches!(status, ProfileMintStatus::StorePending { .. }),
@@ -712,6 +761,7 @@ fn a_lineage_answering_with_a_different_singleton_is_refused() -> anyhow::Result
         &hostile,
         &hostile,
         &network,
+        &free(),
     )?
     else {
         panic!("the honestly-resolved launch confirms the profile");
@@ -748,12 +798,20 @@ fn a_rejected_store_launch_rewinds_and_is_retried() -> anyhow::Result<()> {
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
     chain.start_rejecting("MEMPOOL_CONFLICT");
     let error = minter
-        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)
+        .advance_profile_mint(
+            &mut registry,
+            ProfileIx::ROOT,
+            &chain,
+            &chain,
+            &network,
+            &free(),
+        )
         .expect_err("a refused launch is not a success");
     assert!(matches!(error, MintError::Rejected(_)), "got {error:?}");
 
@@ -777,10 +835,23 @@ fn a_rejected_store_launch_rewinds_and_is_retried() -> anyhow::Result<()> {
     // The node recovers. The retry is what the rewind exists for: without it this advance would read
     // `StorePushed`, report `StorePending`, and push nothing for the rest of the mint's life.
     chain.stop_rejecting();
-    minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    minter.advance_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &network,
+        &free(),
+    )?;
     chain.farm()?;
-    let status =
-        minter.advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)?;
+    let status = minter.advance_profile_mint(
+        &mut registry,
+        ProfileIx::ROOT,
+        &chain,
+        &chain,
+        &network,
+        &free(),
+    )?;
     assert!(
         matches!(status, ProfileMintStatus::Confirmed { .. }),
         "the retried launch confirms the profile, got {status:?}"
@@ -808,12 +879,20 @@ fn an_unanswered_store_launch_does_not_rewind() -> anyhow::Result<()> {
         &chain,
         &network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
 
     chain.stop_delivering_pushes();
     let error = minter
-        .advance_profile_mint(&mut registry, ProfileIx::ROOT, &chain, &chain, &network)
+        .advance_profile_mint(
+            &mut registry,
+            ProfileIx::ROOT,
+            &chain,
+            &chain,
+            &network,
+            &free(),
+        )
         .expect_err("an undeliverable push reports an UNKNOWN outcome");
     assert!(
         matches!(error, MintError::ChainUnreachable(_)),
@@ -852,6 +931,7 @@ fn a_rejected_did_push_releases_the_index() -> anyhow::Result<()> {
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     );
 
     assert!(matches!(result, Err(dig_account::MintError::Rejected(_))));

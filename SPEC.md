@@ -937,9 +937,114 @@ recipient's `CREATE_COIN` memos is the load-bearing hint, and displacing it chan
 find the coin. And the memo MUST NOT alter any created coin's `(parent, puzzle_hash, amount)`, so it
 can never change a spend's value flow or its coin ids.
 
+### 6.6a In-flight coin reservation (normative)
+
+Between building a spend and that spend confirming, the chain still reports its inputs as UNSPENT: the
+bundle is in a mempool, not in a block. A second build in that window therefore sees the same coins,
+applies the same rule, and selects the same coin. The second bundle is not merely wasteful — its input
+is already committed, so it can never be included, and it fails AFTER the money moved.
+
+Every coin selector in this crate MUST therefore consult one reservation set. The four are
+`wallet::transfer::select_input_coins`, `wallet::cat_transfer::select_cat_coins`,
+`wallet::cat_transfer::select_fee_coins`, and `mint::did::select_funding_coin`.
+
+Reservation is BOOKKEEPING. It MUST NOT hold a key, produce a signature, or authorize anything; it only
+narrows what a selector is willing to choose.
+
+#### 6.6a.1 Acquisition is atomic (normative)
+
+`CoinReservationStore::reserve_all` MUST take EVERY coin it is given or NONE of them, and on refusal it
+MUST leave the store exactly as it was. Reading a held set, selecting, and then reserving is
+check-then-act: two callers both observe a coin free and both take it, which is the defect this section
+exists to close. A caller whose reservation is refused MUST re-select against a strictly larger exclusion
+set, bounded so that a store reporting a conflict it cannot justify cannot spin.
+
+#### 6.6a.2 Reservation narrows SELECTION, never BALANCE (normative)
+
+A reserved coin MUST still be counted in the `available` figure a shortfall reports. A build blocked
+ONLY by reservations MUST be refused with a DISTINCT variant — `TransferError::CoinsReserved`,
+`CatTransferError::CoinsReserved`, `MintError::CoinsReserved` — and MUST NOT be reported as
+`InsufficientFunds`, `NoXchForFee`, or any other variant meaning "add funds". Those variants send a user
+to acquire money they already hold, to solve a wait.
+
+#### 6.6a.3 Expiry, and what it must not do (normative)
+
+A reservation ALWAYS expires; the default TTL is 300 seconds. A TTL of zero MUST be refused at
+construction, because a reservation that lapses before its bundle is signed is a guard that is off while
+every call reports success. A reservation is still held AT its expiry instant and lapses only after it:
+where the boundary is ambiguous the implementation MUST over-reserve, since holding a coin marginally
+too long delays a spend while freeing it marginally too early re-opens the double-select.
+
+Expiry MUST NOT resurrect a spent coin. The reservation set is a filter layered ON TOP of the chain
+read, never a replacement for it, so a coin whose reservation has lapsed is still subject to the
+selector's own spent-check.
+
+#### 6.6a.4 Release (normative)
+
+A plan that reserved coins carries its handle (`TransferPlan::reservation`,
+`CatTransferPlan::reservation`), and the caller MUST release it as soon as the spend is known settled or
+known dead, rather than waiting out the TTL. Releasing an unknown or already-lapsed handle MUST NOT be
+an error: a caller releasing on confirmation cannot know whether the TTL got there first, and making
+that race an error teaches callers to ignore the result.
+
+A build that reserves more than one leg MUST reserve them in ONE reservation. A $DIG send that reserved
+its CAT coins and then failed to fund its fee would strand the CAT for the full TTL over a spend that
+was never built.
+
+#### 6.6a.4a A reservation MUST NOT outlive the operation that took it (normative)
+
+Selection is not the last step that can fail. A $DIG send still has a lineage walk, a mint still has a
+peak read, a build, an unlock re-check and a signature; several of those are REMOTE reads answered by a
+peer this crate does not trust. **On every path out of the operation that reserved them — including
+every error path — the coins MUST be either released or deliberately kept. There is no third outcome.**
+
+This is a STRUCTURAL requirement, not a discipline: the reservation is handed back as a guard that
+releases on drop unless it is explicitly committed, so an error path that did not exist when the code
+was written still releases. An implementation that returns a bare handle into a function using `?`
+does not satisfy this clause, however carefully its current paths are written.
+
+The property is not merely tidiness. Because selection excludes what is already held (§6.6a.1), a
+caller retrying against a source that answers the listing and then fails a later read orphans a
+DIFFERENT coin on each attempt, walking the whole wallet shut — and may repeat it once the TTL lapses.
+**The TTL bounds one round; it does not bound a caller.** A missing release is therefore a renewable
+denial-of-funds primitive, which is a worse failure than the double-select this section exists to
+prevent, and it MUST NOT be mitigated by shortening the TTL: that trades a lockout for a double-select.
+
+#### 6.6a.4b The push outcome decides the coins (normative)
+
+Where a reservation survives until a broadcast, the outcome of that broadcast decides it, and the two
+failures MUST NOT be collapsed:
+
+- **Definitively rejected** by the mempool — the bundle can never be included, so the coins guard
+  nothing and MUST be released. Holding them would be a lockout over a spend that is already dead.
+- **Any other failure** — the outcome is UNKNOWN and the bundle may have landed, so the coins MUST stay
+  held until the TTL. Releasing and re-selecting could build a second bundle spending an input the
+  first has already consumed.
+
+`build_transfer_replacing` MUST NOT reserve. It re-spends the coins the original plan already holds, so
+a second hold would conflict with the caller's own in-flight transfer and refuse the fee bump it exists
+to enable.
+
+#### 6.6a.5 Fail direction (normative)
+
+When the reservation store or the clock cannot be read, what is in flight is UNKNOWN and the build MUST
+REFUSE — `ReservationUnusable` on each error surface. It MUST NOT proceed as though nothing were
+reserved: that is the double-select reached by ignoring the guard rather than by lacking one. A guard
+that fails open is not a guard.
+
+#### 6.6a.6 Scope (normative)
+
+`LocalReservations` covers callers inside ONE process and does not survive a restart. Two processes
+sharing one wallet, each holding their own, re-create the cross-process double-select each fixes
+locally.
+
+The store is therefore a SEAM. dig-account is the key-holding custody side and carries no database and
+no runtime, so the process that owns the wallet replica supplies a store with the scope it needs. The
+scope limit is stated by the store a consumer chooses, never implied by silence.
+
 ### 6.7 The ordinary-transfer builder
 
-`WalletOps::build_transfer(chain, custody, request) -> TransferPlan` builds the unsigned coin spends for
+`WalletOps::build_transfer(chain, custody, request, reservations) -> TransferPlan` builds the unsigned coin spends for
 a native-XCH payment out of a profile's wallet. It is a BUILDER and nothing more: it MUST NOT authorize,
 sign, or broadcast. The caller passes `TransferPlan::coin_spends` unchanged to §6.3's
 `PolicyAuthorizer::authorize_op` and the resulting approval to §6.2's `sign_approved`. A builder that
@@ -1246,9 +1351,15 @@ return `ChainUnreachable`, never `Ok(None)`.
 
 ### 6A.4 Coin selection and change
 
-The funding coin is the SMALLEST confirmed, unspent coin whose amount is at least `1 + fee`. Unconfirmed
-and spent coins are neither selected nor counted toward the `available` amount reported by
-`InsufficientFunds`.
+The funding coin is the SMALLEST confirmed, unspent, UNRESERVED coin whose amount is at least
+`1 + fee`. Unconfirmed and spent coins are neither selected nor counted toward the `available` amount
+reported by `InsufficientFunds`.
+
+A coin already committed to an in-flight spend (§6.6a) is excluded from SELECTION and still counted
+toward `available`, and a mint blocked only by such a coin MUST be refused as `MintError::CoinsReserved`
+rather than `InsufficientFunds` — the latter is the only variant meaning "add funds and try again", and
+saying it to a funded user asks them to deposit for no reason. The chosen coin is reserved before the
+bundle is built.
 
 The selected coin MUST then be re-read BY NAME, and the mint MUST refuse unless that answer also
 reports it confirmed and unspent. A by-puzzle-hash listing and a by-name read are different questions

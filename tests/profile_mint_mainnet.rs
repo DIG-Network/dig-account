@@ -76,6 +76,17 @@ use dig_chainsource_interface::ChainSource;
 use dig_keystore::MemoryBackend;
 use dig_session::Password;
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 mod mint_journal;
 
 use mint_journal::{
@@ -239,7 +250,7 @@ where
     let mut last_seen = String::new();
 
     loop {
-        let outcome = minter.advance_profile_mint(registry, ix, chain, publisher, network);
+        let outcome = minter.advance_profile_mint(registry, ix, chain, publisher, network, &free());
         // `advance_profile_mint` may have pushed the store half and moved the journal, so persist
         // before reacting to anything.
         save_registry(&settings.registry_path, registry);

@@ -36,6 +36,17 @@ use dig_account::{
 };
 use dig_chainsource_interface::ChainSource;
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// The env var an operator sets to `1` to authorise a BRAND-NEW mint over a registry that already
 /// holds profiles. Absent, the harness refuses rather than spend a second time.
 pub const NEW_MINT_VAR: &str = "DIG_MINT_NEW";
@@ -141,7 +152,16 @@ where
         return Err(BeginNewMintError::WouldSpendAgain { already_minted });
     }
 
-    let began = minter.begin_profile_mint(registry, ix, seed, chain, publisher, network, options);
+    let began = minter.begin_profile_mint(
+        registry,
+        ix,
+        seed,
+        chain,
+        publisher,
+        network,
+        options,
+        &free(),
+    );
 
     // The journal must reach disk before anything else can go wrong: a pushed DID that no file names
     // is the loss state this whole harness is shaped around. `begin_profile_mint` KEEPS the pushed

@@ -22,6 +22,17 @@ mod common;
 
 use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// The funding coin of the mainnet run that was refused.
 const MAINNET_SOURCE_AMOUNT: u64 = 799_599_999_990;
 /// The fee that run was driven with.
@@ -82,6 +93,7 @@ fn mainnet_shaped_bundle() -> anyhow::Result<Vec<CoinSpend>> {
         &chain,
         &simulator_network(),
         &MintOptions::with_fee(MAINNET_FEE),
+        &free(),
     )?;
 
     let pushed = chain.accepted_bundles();

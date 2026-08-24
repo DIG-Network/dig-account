@@ -34,6 +34,17 @@ mod common;
 
 use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 const PW: &str = "correct horse battery staple";
 const ENTROPY: [u8; ENTROPY_LEN] = [0x5A; ENTROPY_LEN];
 const IDLE: Duration = Duration::from_secs(60);
@@ -119,12 +130,13 @@ fn a_host_holding_only_an_unlocked_account_can_mint() -> anyhow::Result<()> {
     let account = unlocked_account();
     let chain = funded_chain(&account);
 
-    let pending = account.profile_minter().begin_did_mint(
+    let (pending, _reservation) = account.profile_minter().begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
 
     chain.farm()?;
@@ -160,6 +172,7 @@ fn a_minter_held_across_lock_refuses_and_pushes_nothing() -> anyhow::Result<()> 
             &chain,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("a relocked account cannot mint");
     assert!(matches!(error, MintError::Locked), "{error}");
@@ -178,6 +191,7 @@ fn a_minter_held_across_lock_refuses_and_pushes_nothing() -> anyhow::Result<()> 
         &live_chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     assert_eq!(live_chain.pushed_bundles(), 1);
     Ok(())
@@ -201,6 +215,7 @@ fn a_minter_held_across_an_elapsed_idle_window_refuses_with_no_gate_call() -> an
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     assert_eq!(
         chain.pushed_bundles(),
@@ -216,6 +231,7 @@ fn a_minter_held_across_an_elapsed_idle_window_refuses_with_no_gate_call() -> an
             &chain,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("the idle window has lapsed");
     assert!(matches!(error, MintError::Locked), "{error}");
@@ -248,6 +264,7 @@ fn the_fee_ceiling_admits_the_ceiling_and_refuses_one_mojo_over() -> anyhow::Res
         &chain,
         &simulator_network(),
         &MintOptions::with_fee(MAX_MINT_FEE_MOJOS),
+        &free(),
     )?;
     assert_eq!(chain.pushed_bundles(), 1, "a fee at the ceiling is allowed");
 
@@ -258,6 +275,7 @@ fn the_fee_ceiling_admits_the_ceiling_and_refuses_one_mojo_over() -> anyhow::Res
             &chain,
             &simulator_network(),
             &MintOptions::with_fee(MAX_MINT_FEE_MOJOS + 1),
+            &free(),
         )
         .expect_err("one mojo over the ceiling is refused");
     assert!(
@@ -286,12 +304,13 @@ fn reading_mint_status_after_lock_still_answers() -> anyhow::Result<()> {
     let chain = funded_chain(&account);
     let minter = account.profile_minter();
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
     gate.lock();
@@ -403,6 +422,7 @@ fn a_lock_landing_mid_ceremony_stops_the_signature() -> anyhow::Result<()> {
             &simulator,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("an account locked mid-ceremony cannot sign");
 
@@ -427,6 +447,7 @@ fn a_lock_landing_mid_ceremony_stops_the_signature() -> anyhow::Result<()> {
         &live_simulator,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     assert_eq!(
         live_simulator.pushed_bundles(),

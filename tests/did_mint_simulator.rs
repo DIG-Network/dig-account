@@ -17,6 +17,17 @@ mod common;
 
 use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// The whole mint, proven by consensus: a real bundle is built, signed with the account's own wallet
 /// key, accepted by the CLVM+signature validator, and the DID coin it creates is what the evidence
 /// names.
@@ -27,12 +38,13 @@ fn a_mint_is_accepted_by_the_consensus_validator_and_yields_its_did() -> anyhow:
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
 
     chain.farm()?;
@@ -60,12 +72,13 @@ fn a_pushed_but_unfarmed_mint_is_not_yet_a_did() -> anyhow::Result<()> {
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
 
     assert!(
@@ -86,12 +99,13 @@ fn farmed_did_coin(network: &MintNetwork) -> anyhow::Result<chia_protocol::Coin>
     let minter = account.profile_minter();
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         network,
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
     let coin = chain
@@ -114,12 +128,13 @@ fn a_mempool_observation_of_the_did_coin_is_not_evidence() -> anyhow::Result<()>
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     // The DID coin exactly as it will exist on chain — learned by farming this same mint on a
     // second, throwaway chain, so the record under test differs from real evidence in ONE respect:
@@ -151,12 +166,13 @@ fn an_unreachable_chain_is_not_reported_as_an_unconfirmed_mint() -> anyhow::Resu
     let online = SimulatorChain::new();
     online.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &online,
         &online,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     online.farm()?;
 
@@ -183,6 +199,7 @@ fn an_unfunded_wallet_reports_insufficient_funds() {
             &chain,
             &simulator_network(),
             &MintOptions::with_fee(50),
+            &free(),
         )
         .expect_err("an unfunded wallet cannot mint");
 
@@ -218,6 +235,7 @@ fn a_wallet_whose_coins_are_all_too_small_reports_the_largest_one() {
             &chain,
             &simulator_network(),
             &MintOptions::with_fee(100),
+            &free(),
         )
         .expect_err("no single coin covers the fee");
 
@@ -249,6 +267,7 @@ fn an_unreachable_chain_during_selection_is_not_reported_as_insufficient_funds()
             &chain,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("an unreachable chain cannot be asked for coins");
 
@@ -274,6 +293,7 @@ fn a_rejected_push_is_reported_as_a_rejection_with_the_node_reason() {
             &chain,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("a rejected push is not a mint");
 
@@ -306,6 +326,7 @@ fn an_undeliverable_push_is_unreachable_rather_than_rejected() {
             &reachable_but_undeliverable,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         )
         .expect_err("an undeliverable push has an unknown outcome");
 
@@ -328,6 +349,7 @@ fn the_fee_leaves_the_wallet_and_the_change_returns_to_it() -> anyhow::Result<()
         &chain,
         &simulator_network(),
         &MintOptions::with_fee(1_234),
+        &free(),
     )?;
     chain.farm()?;
 
@@ -359,12 +381,13 @@ fn a_wallet_holding_exactly_fee_plus_two_can_still_mint() -> anyhow::Result<()> 
     let fee = 100;
     chain.fund(wallet_puzzle_hash(&account), fee + 2);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::with_fee(fee),
+        &free(),
     )?;
 
     // Consensus accepts the bundle — this is what fails with a duplicate output if the 1-mojo change
@@ -389,12 +412,13 @@ fn the_amounts_either_side_of_the_colliding_one_also_mint() -> anyhow::Result<()
         let chain = SimulatorChain::new();
         chain.fund(wallet_puzzle_hash(&account), amount);
 
-        let pending = minter.begin_did_mint(
+        let (pending, _reservation) = minter.begin_did_mint(
             ProfileIx::ROOT,
             &chain,
             &chain,
             &simulator_network(),
             &MintOptions::with_fee(fee),
+            &free(),
         )?;
         chain.farm()?;
         assert!(
@@ -415,12 +439,13 @@ fn a_freshly_included_mint_is_not_evidence_until_it_is_buried() -> anyhow::Resul
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
 
     chain.include_in_a_block()?;
@@ -476,12 +501,13 @@ fn a_mint_whose_input_was_spent_elsewhere_is_failed_not_awaiting() -> anyhow::Re
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
 
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
 
     // The control: while the input is unspent, this same mint reads as merely waiting.
@@ -517,12 +543,13 @@ fn a_source_without_a_peak_height_cannot_establish_evidence() -> anyhow::Result<
     // The control: with a peak, this same chain mints and confirms.
     let chain = SimulatorChain::new();
     chain.fund(wallet_puzzle_hash(&account), 1_000_000);
-    let pending = minter.begin_did_mint(
+    let (pending, _reservation) = minter.begin_did_mint(
         ProfileIx::ROOT,
         &chain,
         &chain,
         &simulator_network(),
         &MintOptions::default(),
+        &free(),
     )?;
     chain.farm()?;
     assert!(minter.mint_status(&pending, &chain)?.minted().is_some());
@@ -551,6 +578,7 @@ fn a_source_without_a_peak_height_cannot_establish_evidence() -> anyhow::Result<
             &unstartable,
             &simulator_network(),
             &MintOptions::default(),
+            &free(),
         ),
         Err(MintError::ChainUnreachable(_))
     ));

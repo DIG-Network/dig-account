@@ -62,7 +62,10 @@ use crate::chain_confirm::{confirm_all_spendable_by_name, UnconfirmedInput};
 use crate::keys::wallet_key::WalletKey;
 use crate::wallet::authorizer::WalletOps;
 use crate::wallet::policy::CustodyPolicy;
-use crate::wallet::transfer::{PayableDestination, MAX_TRANSFER_INPUT_COINS};
+use crate::wallet::reservation::{select_and_reserve, CoinReservations, ReservationId};
+use crate::wallet::transfer::{
+    PayableDestination, MAX_RESERVATION_ATTEMPTS, MAX_TRANSFER_INPUT_COINS,
+};
 
 /// Base units in one $DIG.
 ///
@@ -109,6 +112,30 @@ pub enum CatTransferError {
         /// Every confirmed, unspent $DIG the wallet holds, in base units.
         available: u64,
     },
+
+    /// Every coin that could fund this send — $DIG or the XCH fee — is already committed to an
+    /// in-flight spend.
+    ///
+    /// Deliberately NOT [`InsufficientDig`](Self::InsufficientDig) or
+    /// [`NoXchForFee`](Self::NoXchForFee): `available` is what the user really holds, reserved coins
+    /// included, because a reservation narrows what may be selected and never what they own. The
+    /// remedy is to wait, never to deposit.
+    #[error("every coin that could fund this send is reserved by an in-flight spend: it needs {required}, the wallet holds {available} but only {selectable} is free right now")]
+    CoinsReserved {
+        /// What this leg needs — $DIG base units for the asset leg, mojos for the fee leg.
+        required: u64,
+        /// Everything the wallet holds on that leg, reserved coins included.
+        available: u64,
+        /// The part of it that is not currently reserved.
+        selectable: u64,
+    },
+
+    /// The reservation store could not be consulted, so what is already in flight is UNKNOWN.
+    ///
+    /// The build REFUSES. Proceeding over an unreadable guard is precisely the double-select the
+    /// reservation exists to prevent.
+    #[error("{0}")]
+    ReservationUnusable(String),
 
     /// The wallet holds enough $DIG, spread across more coins than one transfer may consume.
     #[error(
@@ -253,9 +280,20 @@ pub struct CatTransferPlan {
     amount_base_units: u64,
     fee_mojos: u64,
     change_base_units: u64,
+    reservation: Option<ReservationId>,
 }
 
 impl CatTransferPlan {
+    /// The reservation holding BOTH legs of this plan — the $DIG coins and the XCH fee coin.
+    ///
+    /// One reservation rather than two on purpose: a build that reserved its $DIG and then failed to
+    /// fund its fee would strand the $DIG for the whole TTL over a spend that never existed.
+    ///
+    /// Release it as soon as the send is known settled or known dead.
+    pub fn reservation(&self) -> Option<ReservationId> {
+        self.reservation
+    }
+
     /// The unsigned spends, to hand to the authorizing gate.
     pub fn coin_spends(&self) -> &[CoinSpend] {
         &self.coin_spends
@@ -338,11 +376,12 @@ impl WalletOps {
         chain: &C,
         custody: &CustodyPolicy,
         request: &CatTransferRequest,
+        reservations: &CoinReservations<'_>,
     ) -> CatTransferResult<CatTransferPlan>
     where
         C: ChainSource + ?Sized,
     {
-        self.build_cat_transfer(chain, custody, DIG_ASSET_ID, request)
+        self.build_cat_transfer(chain, custody, DIG_ASSET_ID, request, reservations)
     }
 
     /// Build the unsigned coin spends for a payment of ANY CAT out of this profile's wallet.
@@ -370,6 +409,7 @@ impl WalletOps {
         custody: &CustodyPolicy,
         asset_id: Bytes32,
         request: &CatTransferRequest,
+        reservations: &CoinReservations<'_>,
     ) -> CatTransferResult<CatTransferPlan>
     where
         C: ChainSource + ?Sized,
@@ -386,16 +426,41 @@ impl WalletOps {
             return Err(CatTransferError::SelfPayment);
         }
 
-        let cat_coins = select_cat_coins(
-            chain,
-            asset_id,
-            wallet.puzzle_hash(),
-            request.amount_base_units,
+        // BOTH legs are chosen and reserved in ONE atomic step. Reserving the $DIG and then
+        // discovering the fee coin is gone would leave the user's $DIG held for the full TTL by a
+        // spend that was never built — a reservation that locks the wallet out of its own funds is a
+        // worse failure than the double-select it was added to prevent.
+        let ((cat_coins, fee_coins), held) = select_and_reserve(
+            reservations,
+            MAX_RESERVATION_ATTEMPTS,
+            |excluded| {
+                let cat_coins = select_cat_coins(
+                    chain,
+                    asset_id,
+                    wallet.puzzle_hash(),
+                    request.amount_base_units,
+                    excluded,
+                )?;
+                let fee_coins =
+                    select_fee_coins(chain, wallet.puzzle_hash(), request.fee_mojos, excluded)?;
+                let ids = cat_coins
+                    .iter()
+                    .chain(fee_coins.iter())
+                    .map(Coin::coin_id)
+                    .collect();
+                Ok(((cat_coins, fee_coins), ids))
+            },
+            |e| CatTransferError::ReservationUnusable(e.to_string()),
         )?;
-        let fee_coins = select_fee_coins(chain, wallet.puzzle_hash(), request.fee_mojos)?;
+        // `held` stays alive across BOTH remaining fallible steps, and the first of them matters
+        // most: `resolve_lineage` is a REMOTE read, answered by a peer this crate does not trust.
+        // A source that answers the listings truthfully and then fails the parent-spend read would
+        // otherwise orphan the reserved coins on every attempt — and because selection correctly
+        // excludes what is held, each retry orphans a DIFFERENT coin, walking the whole wallet shut.
         let cats = resolve_lineage(chain, asset_id, &cat_coins)?;
-
-        build_dig_transfer_spends(&wallet, &cats, &fee_coins, request)
+        let mut plan = build_dig_transfer_spends(&wallet, &cats, &fee_coins, request, None)?;
+        plan.reservation = Some(held.commit());
+        Ok(plan)
     }
 }
 
@@ -409,6 +474,7 @@ fn select_cat_coins<C>(
     asset_id: Bytes32,
     p2_puzzle_hash: Bytes32,
     required: u64,
+    reserved: &HashSet<Bytes32>,
 ) -> CatTransferResult<Vec<Coin>>
 where
     C: ChainSource + ?Sized,
@@ -451,6 +517,21 @@ where
         });
     }
 
+    // After the balance, never before it — the same ordering property `transfer::select_input_coins`
+    // documents. A reserved CAT coin is still the user's $DIG.
+    spendable.retain(|coin| !reserved.contains(&coin.coin_id()));
+    let selectable = spendable
+        .iter()
+        .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
+        .ok_or(CatTransferError::BalanceUnjudgeable)?;
+    if selectable < required {
+        return Err(CatTransferError::CoinsReserved {
+            required,
+            available,
+            selectable,
+        });
+    }
+
     let selected = if let Some(single) = spendable.iter().find(|coin| coin.amount >= required) {
         vec![*single]
     } else {
@@ -484,6 +565,7 @@ fn select_fee_coins<C>(
     chain: &C,
     p2_puzzle_hash: Bytes32,
     fee_mojos: u64,
+    reserved: &HashSet<Bytes32>,
 ) -> CatTransferResult<Vec<Coin>>
 where
     C: ChainSource + ?Sized,
@@ -517,14 +599,42 @@ where
     // ONE coin, the smallest that covers the fee. A fee is small and a multi-coin fee leg would add
     // inputs, signatures and bytes to a bundle that is already carrying a CAT ring.
     spendable.sort_by_cached_key(|coin| (coin.amount, coin.coin_id()));
-    let chosen = spendable
+
+    // Whether the wallet OWNS a coin big enough is answered before reservations are applied, and
+    // the two answers are reported as different errors. "You have no XCH for the fee" and "your XCH
+    // is busy for the next few minutes" are different things to tell a person, and only one of them
+    // is fixed by depositing.
+    let owns_a_covering_coin = spendable.iter().any(|coin| coin.amount >= fee_mojos);
+
+    // The fee leg draws from the SAME XCH puzzle hash as an ordinary transfer, so an unreserved fee
+    // coin here is selectable by `transfer::select_input_coins` at the same moment. That is why both
+    // paths consult one reservation set rather than each keeping its own view.
+    spendable.retain(|coin| !reserved.contains(&coin.coin_id()));
+    let selectable = spendable
+        .iter()
+        .try_fold(0u64, |sum, coin| sum.checked_add(coin.amount))
+        .ok_or(CatTransferError::BalanceUnjudgeable)?;
+
+    let chosen = match spendable
         .iter()
         .find(|coin| coin.amount >= fee_mojos)
         .copied()
-        .ok_or(CatTransferError::NoXchForFee {
-            required: fee_mojos,
-            available,
-        })?;
+    {
+        Some(coin) => coin,
+        None if owns_a_covering_coin => {
+            return Err(CatTransferError::CoinsReserved {
+                required: fee_mojos,
+                available,
+                selectable,
+            })
+        }
+        None => {
+            return Err(CatTransferError::NoXchForFee {
+                required: fee_mojos,
+                available,
+            })
+        }
+    };
 
     confirm_all_spendable_by_name(chain, std::slice::from_ref(&chosen))?;
     Ok(vec![chosen])
@@ -613,6 +723,7 @@ fn build_dig_transfer_spends(
     cats: &[Cat],
     fee_coins: &[Coin],
     request: &CatTransferRequest,
+    reservation: Option<ReservationId>,
 ) -> CatTransferResult<CatTransferPlan> {
     if cats.is_empty() {
         return Err(CatTransferError::Build(
@@ -711,5 +822,159 @@ fn build_dig_transfer_spends(
         amount_base_units: request.amount_base_units,
         fee_mojos: request.fee_mojos,
         change_base_units: change,
+        reservation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dig_chainsource_interface::CoinRecord;
+
+    /// A chain source over a fixed record set. Records are supplied whole, not as bare coins,
+    /// because confirmed / unconfirmed / spent are the distinctions these selectors are made of.
+    #[derive(Debug)]
+    struct FixedChain {
+        records: Vec<CoinRecord>,
+    }
+
+    impl ChainSource for FixedChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> std::result::Result<Option<CoinRecord>, String> {
+            Ok(self
+                .records
+                .iter()
+                .find(|record| record.coin.coin_id() == coin_id)
+                .cloned())
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            Ok(self
+                .records
+                .iter()
+                .filter(|record| record.coin.puzzle_hash == puzzle_hash)
+                .cloned()
+                .collect())
+        }
+
+        fn coin_records_by_parent(
+            &self,
+            _parent: Bytes32,
+        ) -> std::result::Result<Vec<CoinRecord>, String> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(&self, _coin_id: Bytes32) -> std::result::Result<Option<CoinSpend>, String> {
+            Ok(None)
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> std::result::Result<Option<dig_chainsource_interface::SingletonLineage>, String>
+        {
+            Err("not supported by this test double".to_string())
+        }
+
+        fn peak_height(&self) -> std::result::Result<Option<u32>, String> {
+            Ok(Some(4_200_000))
+        }
+
+        fn block_timestamp(&self, _height: u32) -> std::result::Result<Option<u64>, String> {
+            Ok(None)
+        }
+    }
+
+    fn confirmed(coin: Coin) -> CoinRecord {
+        CoinRecord {
+            coin,
+            confirmed_height: Some(4_100_000),
+            spent_height: None,
+            timestamp: None,
+            coinbase: false,
+        }
+    }
+
+    const P2: Bytes32 = Bytes32::new([0x11; 32]);
+
+    fn xch(tag: u8, amount: u64) -> Coin {
+        Coin::new(Bytes32::new([tag; 32]), P2, amount)
+    }
+
+    /// **The $DIG fee leg and an ordinary XCH transfer draw from the SAME coins, so they must share
+    /// one reservation set.**
+    ///
+    /// This is the rival-implementation property. Two selection paths over one puzzle hash, each
+    /// keeping its own idea of what is in flight, double-select by construction — which is exactly
+    /// the defect this family exists to close, reappearing between two paths instead of between two
+    /// calls of one path.
+    ///
+    /// The fixture keeps a second, larger coin as the truthful control: the fee leg must still
+    /// SUCCEED on it, so a blanket refusal cannot pass this test.
+    #[test]
+    fn the_fee_leg_will_not_take_an_xch_coin_an_ordinary_transfer_reserved() {
+        let taken = xch(1, 1_000);
+        let spare = xch(2, 2_000);
+        let chain = FixedChain {
+            records: vec![confirmed(taken), confirmed(spare)],
+        };
+
+        let control = select_fee_coins(&chain, P2, 500, &HashSet::new())
+            .expect("the control: unreserved, the smallest sufficient coin pays the fee");
+        assert_eq!(control[0].coin_id(), taken.coin_id());
+
+        let reserved: HashSet<Bytes32> = [taken.coin_id()].into_iter().collect();
+        let chosen = select_fee_coins(&chain, P2, 500, &reserved)
+            .expect("a $DIG send can still pay its fee from the coin that is free");
+        assert_eq!(
+            chosen[0].coin_id(),
+            spare.coin_id(),
+            "an XCH coin an in-flight transfer holds must not also pay a CAT fee"
+        );
+    }
+
+    /// **A busy fee coin is reported as busy, never as an absence of XCH.**
+    ///
+    /// `NoXchForFee` tells a user to acquire XCH. Saying that to somebody who HAS the XCH — it is
+    /// simply committed for the next few minutes — sends them to an exchange to solve a wait.
+    #[test]
+    fn a_reserved_fee_coin_is_not_reported_as_missing_xch() {
+        let only = xch(1, 1_000);
+        let chain = FixedChain {
+            records: vec![confirmed(only)],
+        };
+        let reserved: HashSet<Bytes32> = [only.coin_id()].into_iter().collect();
+
+        let error = select_fee_coins(&chain, P2, 500, &reserved)
+            .expect_err("the only XCH coin is committed elsewhere");
+
+        match error {
+            CatTransferError::CoinsReserved {
+                available,
+                selectable,
+                ..
+            } => {
+                assert_eq!(available, 1_000, "the XCH is still the user's money");
+                assert_eq!(selectable, 0);
+            }
+            other => panic!("a busy fee coin is not missing XCH: {other:?}"),
+        }
+    }
+
+    /// **A zero fee reserves nothing.** A $DIG-only wallet can legitimately send with no fee, and a
+    /// fee leg that reserved a coin it was never going to spend would hold funds for no reason.
+    #[test]
+    fn a_zero_fee_selects_and_reserves_no_xch_at_all() {
+        let chain = FixedChain {
+            records: vec![confirmed(xch(1, 1_000))],
+        };
+        assert!(select_fee_coins(&chain, P2, 0, &HashSet::new())
+            .expect("a zero fee needs no XCH")
+            .is_empty());
+    }
 }

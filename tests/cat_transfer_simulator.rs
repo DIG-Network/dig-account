@@ -37,6 +37,17 @@ mod common;
 
 use common::{unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
+/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
+///
+/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
+/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
+fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
+    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
+        dig_account::wallet::reservation::LocalReservations::new(),
+    ));
+    store.reservations()
+}
+
 /// A recipient nobody in these tests holds the key for, so a payment to it is genuinely value
 /// leaving the wallet rather than change wearing a different hat.
 const RECIPIENT: Bytes32 = Bytes32::new([7u8; 32]);
@@ -200,6 +211,7 @@ fn a_cat_transfer_is_accepted_by_consensus_and_pays_the_recipient_exactly() -> a
         asset_id,
         &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
             .with_fee_mojos(FEE),
+        &free(),
     )?;
     let bundle = sign_via_gate(&account, plan.coin_spends());
     chain.push(&bundle).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -245,6 +257,7 @@ fn the_fee_is_paid_in_xch_and_the_cat_amount_is_untouched() -> anyhow::Result<()
         asset_id,
         &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
             .with_fee_mojos(FEE),
+        &free(),
     )?;
     let bundle = sign_via_gate(&account, plan.coin_spends());
     chain.push(&bundle).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -295,6 +308,7 @@ fn a_multi_coin_cat_transfer_is_accepted_by_consensus() -> anyhow::Result<()> {
         // amounts differ because two same-amount coins from one parent would share a coin id.
         &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), 6_500)
             .with_fee_mojos(FEE),
+        &free(),
     )?;
     assert!(
         plan.dig_source_coin_ids().len() > 1,
@@ -338,6 +352,7 @@ fn a_cat_send_never_auto_approves_however_generous_the_policy() -> anyhow::Resul
         asset_id,
         &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
             .with_fee_mojos(FEE),
+        &free(),
     )?;
 
     match gate(&ops).authorize_op(plan.coin_spends(), SpendOpClass::SmallSend) {
@@ -375,6 +390,7 @@ fn a_cat_wallet_with_no_xch_is_told_it_needs_xch_for_the_fee() -> anyhow::Result
             asset_id,
             &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT)
                 .with_fee_mojos(FEE),
+            &free(),
         )
         .expect_err("a fee cannot be paid out of a CAT");
 
@@ -402,6 +418,7 @@ fn the_same_xch_less_wallet_can_send_at_a_zero_fee() -> anyhow::Result<()> {
         &hot(),
         asset_id,
         &CatTransferRequest::new(PayableDestination::from_derived(RECIPIENT), AMOUNT),
+        &free(),
     )?;
     assert!(
         plan.xch_source_coin_ids().is_empty(),
