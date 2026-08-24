@@ -21,10 +21,19 @@ use crate::mint::{ConfirmedStore, MintedDid};
 ///
 /// The `Deserialize` path is a CACHE OF A VERDICT, not a verdict. Loading one asserts only that
 /// this host recorded live evidence earlier and wrote it down; a hand-edited file can state
-/// anything at all. That is true of every persisted type, is not fixable by construction, and the
-/// mitigation — re-verifying an anchor against a trusted `ChainSource` — lands with profile
-/// discovery (dig_ecosystem#2392). Until then, an anchor is exactly as trustworthy as the file it
-/// came from.
+/// anything at all. That is true of every persisted type and is not fixable by construction.
+///
+/// [`verify_anchor`](crate::registry::verify_anchor) narrows the gap by asking a chain source about
+/// the coins this anchor names, and it is important to be precise about how far that goes: it
+/// establishes that those coin ids EXIST at the heights claimed, and nothing more. It does NOT bind
+/// them to this anchor's `did` or `launcher_id`, so a file naming a stranger's DID beside two
+/// genuine unrelated coins still verifies (dig-account#37). It is a mitigation of DEGREE, not the
+/// mitigation, and an anchor remains close to as trustworthy as the file it came from.
+///
+/// The source it consults is UNTRUSTED, never trusted: one source answering "no such coin"
+/// suppresses a real identity just as cheaply as a quiet one keeps a forged identity alive, so a
+/// consumer owes agreement across several independently-queried sources (NC-12). `SPEC.md` §2.4.1b
+/// is normative on all of this.
 ///
 /// It also carries no secret: an HD index, a `did:chia:` string, coin ids and heights are all
 /// public.

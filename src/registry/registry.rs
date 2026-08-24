@@ -480,8 +480,10 @@ impl ProfileRegistry {
     ///   that is checkable offline — and it is re-derived here with the same
     ///   `dig_did::did_string_from_launcher_id` the constructor uses, so the two cannot drift. This
     ///   closes a STRING SPOOF and nothing more: an attacker who computes the correct string for a
-    ///   launcher id still loads a fabricated anchor, which only re-verification against a trusted
-    ///   `ChainSource` can catch (dig_ecosystem#2392).
+    ///   launcher id still loads a fabricated anchor. Asking a chain source
+    ///   ([`verify_anchor`](crate::registry::verify_anchor)) raises the cost but does not close it
+    ///   either — that pass checks the named coins EXIST at the claimed heights and does not bind
+    ///   them to this anchor's identity, which is dig-account#37.
     /// - **No journalled mint discloses a store fee above the mint's ceiling**, so the bound
     ///   [`begin_mint`](Self::begin_mint) applies cannot be side-stepped by editing the file a
     ///   resumed phase B reads its spending limit from.
