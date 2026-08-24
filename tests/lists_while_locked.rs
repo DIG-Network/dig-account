@@ -103,7 +103,7 @@ fn a_locked_host_can_see_a_half_finished_mint_without_mistaking_it_for_a_profile
     assert!(!in_progress[0].progress_label().is_empty());
     assert_eq!(
         registry.next_free_ix(),
-        ProfileIx(10),
+        Some(ProfileIx(10)),
         "the next mint goes past the reserved index, never into it"
     );
 }

@@ -118,10 +118,10 @@ mint is journalled and on load: it is the amount a resumed phase B may spend, wi
 left to validate it against.
 
 Deserializing an anchor is a CACHE OF A VERDICT, not a verdict: it asserts only that this host recorded
-live evidence earlier and wrote it down. Re-verification against a trusted `ChainSource` is deferred to
-profile discovery.
+live evidence earlier and wrote it down. Turning that cache back into a verdict requires asking the
+chain, which is §2.4.1b.
 
-#### 2.4.1 The four invariants (normative)
+#### 2.4.1 The five invariants (normative)
 
 Enforced on construction, on EVERY mutation, and on DESERIALIZE. A registry violating any of them MUST
 NOT load: `from_json` returns `RegistryInvariant` and yields no registry at all, never a partial one.
@@ -138,11 +138,19 @@ NOT load: `from_json` returns `RegistryInvariant` and yields no registry at all,
 4. **Indices are SPARSE.** Gaps are legal, and nothing MAY derive an index from `entries.len()`.
    `next_free_ix()` MUST return one past the highest index known — confirmed OR in progress — and MUST
    NOT reuse a gap: an index that looks free locally may already hold an undiscovered profile, and an
-   in-progress index names a DID that is already paid for.
+   in-progress index names a DID that is already paid for. When the highest known index is `u32::MAX`
+   there is no such index, and `next_free_ix()` MUST report exhaustion rather than return the occupied
+   ceiling: answering with an occupied index makes every subsequent mint fail as a duplicate, which is
+   a permanent denial of the mint path living in durable state.
+5. **An identity is registered ONCE.** No two `entries` MAY carry the same anchor `launcher_id`.
+   A profile IS its on-chain identity, so two entries claiming one DID would derive two different
+   wallet keys and two different DEKs while presenting as the same person — the account would receive
+   at an address that identity's own surfaces never show. Enforced when a profile is recorded
+   (`ProfileIdentityAlreadyRegistered`, leaving the registry untouched) and on load.
 
 #### 2.4.1a The evidence rules re-asserted on load (normative)
 
-The four invariants above are STRUCTURAL. Separately, the deserialize path MUST re-assert the evidence
+The five invariants above are STRUCTURAL. Separately, the deserialize path MUST re-assert the evidence
 rules that the evidence constructors enforce, because `Deserialize` reaches the fields directly and
 never passes through those constructors. These apply to a `ProfileAnchor` AND to every journalled
 record, held to the SAME rules — the journal is not a lesser record, it is the SPEND-PATH input a phase-B
@@ -160,6 +168,61 @@ resume parents its store launch from.
 3. **A journalled `store_fee` MUST NOT exceed `MAX_MINT_FEE_MOJOS`**, on construction and on load. A
    resumed phase B spends the journalled fee with no phase-A context to re-validate against, so the file
    — not an argument — is the path that would otherwise hand an unbounded fee to a farmer.
+4. **An anchor's two halves MUST still state that they belong together.** A `ProfileAnchor` persists
+   the DID coin its store was launched from, and `check` MUST re-assert that it equals the anchor's own
+   `did_coin_id` — the SAME comparison `ProfileAnchor::from_confirmed` makes. Without the persisted
+   field the constructor's check could not be repeated, so a file could pair any DID with any store.
+   An anchor written before dig-account 0.22 does not carry the field; its absence MUST load (it is an
+   old file, not a failed pairing) and MUST NOT be reported as a pairing that was proven.
+
+#### 2.4.1b Re-verifying an anchor against the chain (normative)
+
+Every rule above is checkable OFFLINE, and none of them can distinguish a record of a real mint from an
+internally-consistent forgery. Re-verification narrows that gap by asking the chain instead of the file:
+for each coin an anchor names — the DID coin and the store coin — the source is asked whether it exists
+and at which height it confirmed.
+
+**What a `Verified` verdict proves, exactly.** That those two coin ids exist on chain and confirmed at
+the heights the anchor claims. NOTHING beyond that. In particular it does NOT establish that the
+anchor's `did` or `launcher_id` has any relation to the coins that were checked: the pass reads only a
+`CoinRecord`'s confirmation height and never the coin's `puzzle_hash` or `parent_coin_info`, which are
+the only fields that could tie a coin to an identity. A file naming a STRANGER's DID beside two
+unrelated but genuine coins, at their true heights, therefore satisfies every rule in §2.4.1a and
+verifies here — the coin ids and heights are public, so fabricating one costs nothing.
+
+A consumer MUST NOT read `Verified` as "this profile belongs to this account". Binding the checked
+coins to the claimed identity is a further check, specified and tracked separately; until it exists,
+re-verification raises the cost of a forgery and does not close it. This paragraph is normative
+precisely because the weaker claim is the one an implementation can honour today.
+
+The verdict MUST be three-valued, and an implementation MUST NOT collapse it to a boolean:
+
+- **Verified** — every coin the anchor names exists and confirmed at the claimed height, with the
+  limitation stated above.
+- **Contradicted** — the source ANSWERED, and disagreed: a named coin does not exist, or confirmed at a
+  different height. A host MUST NOT present a contradicted anchor as a profile.
+- **Unknown** — the source could not answer, reported a coin without its block (`confirmed_height` is
+  documented as "not known by THIS source", never "not confirmed"), or the anchor predates the fields
+  the pass needs. A host SHOULD keep presenting the profile and disclose that the check is pending.
+
+An unreachable source MUST NOT contradict anything. Treating a failed lookup as disagreement would make
+an offline host indistinguishable from a forged registry, and would retire an identity that costs real
+XCH to recreate. Equally, an anchor whose store half cannot be re-read MUST report Unknown rather than
+Verified: a pass reported on the strength of the one half that happened to be checkable is a claim the
+implementation cannot support.
+
+**Both halves MUST be evaluated, and `Contradicted` MUST outrank `Unknown`.** An implementation that
+returned on the first half that did not pass would let a non-answer about one coin MASK a contradiction
+about the other, reporting a presentable `Unknown` about an anchor the source was willing to disagree
+with. A source that disagreed has said strictly more than one that could not answer.
+
+**A single source is not a verdict, and the consumer owns that.** The verdict is computed per call and
+holds no state, so a source that goes quiet cannot poison a cached result — but it can keep a
+contradicted anchor presentable indefinitely by never answering again, and the sharper mirror is worse:
+one untrusted source answering "no such coin" forces `Contradicted` and SUPPRESSES a real identity. A
+consumer that acts on these verdicts MUST therefore treat the source as untrusted and agree across
+several independently-queried sources (NC-12), exactly as the light client does for chain state. This
+crate deliberately does not do that for the caller: it reports what ONE source said.
 
 A host MUST NOT map a `RegistryInvariant` load failure to an empty registry. That fallback silently
 re-arms the double-mint the journal exists to prevent: the file is the only record that stops an
@@ -374,6 +437,15 @@ window bounds spending, not disclosure.** `mint_status` sits on the disclosure s
 derives no key material and moves nothing, reading only public chain state about a `PendingMint` the
 host already holds. Refusing it would strand a host that locked while a mint was in flight, holding a
 pushed bundle it could never resolve, and would protect nothing that is not already public.
+
+**A mint MUST re-read the residency immediately before it SIGNS**, not only when it derives its key.
+A mint derives at the top of the ceremony and signs at the bottom, and between the two it consults the
+chain — selecting a funding coin, reading a peak, and on the store half walking a singleton lineage —
+so the window is a network round trip rather than the few instructions it appears to be. A lock landing
+inside that window is a revocation, and a signature produced afterwards would spend under an unlock that
+no longer exists. This does not replace the check on entry, which still stops a locked account deriving
+key material at all; it closes the tail of the same window. Both halves of a profile mint are bound by
+it (`MintError::Locked`, with nothing pushed).
 
 The non-observing surfaces continue to serve a handle retained past the idle deadline, including the
 full 24-word recovery phrase. A host MUST therefore treat a retained `UnlockedAccount` as live key

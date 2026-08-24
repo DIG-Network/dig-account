@@ -21,10 +21,19 @@ use crate::mint::{ConfirmedStore, MintedDid};
 ///
 /// The `Deserialize` path is a CACHE OF A VERDICT, not a verdict. Loading one asserts only that
 /// this host recorded live evidence earlier and wrote it down; a hand-edited file can state
-/// anything at all. That is true of every persisted type, is not fixable by construction, and the
-/// mitigation — re-verifying an anchor against a trusted `ChainSource` — lands with profile
-/// discovery (dig_ecosystem#2392). Until then, an anchor is exactly as trustworthy as the file it
-/// came from.
+/// anything at all. That is true of every persisted type and is not fixable by construction.
+///
+/// [`verify_anchor`](crate::registry::verify_anchor) narrows the gap by asking a chain source about
+/// the coins this anchor names, and it is important to be precise about how far that goes: it
+/// establishes that those coin ids EXIST at the heights claimed, and nothing more. It does NOT bind
+/// them to this anchor's `did` or `launcher_id`, so a file naming a stranger's DID beside two
+/// genuine unrelated coins still verifies (dig-account#37). It is a mitigation of DEGREE, not the
+/// mitigation, and an anchor remains close to as trustworthy as the file it came from.
+///
+/// The source it consults is UNTRUSTED, never trusted: one source answering "no such coin"
+/// suppresses a real identity just as cheaply as a quiet one keeps a forged identity alive, so a
+/// consumer owes agreement across several independently-queried sources (NC-12). `SPEC.md` §2.4.1b
+/// is normative on all of this.
 ///
 /// It also carries no secret: an HD index, a `did:chia:` string, coin ids and heights are all
 /// public.
@@ -43,6 +52,22 @@ pub struct ProfileAnchor {
     store_launcher_id: Bytes32,
     /// The height the store coin confirmed at.
     store_confirmed_height: u32,
+    /// The DID coin the store was launched FROM — the evidence [`from_confirmed`](Self::from_confirmed)
+    /// checks, kept so the check can be REPEATED on every load rather than only at construction.
+    ///
+    /// `Option` because anchors written before dig-account 0.22 do not carry it, and a `.dig`-adjacent
+    /// persisted record is never made unreadable by a later version (CLAUDE.md §5.1). Absent means
+    /// "this file predates the field", not "the halves are unpaired"; every anchor this crate writes
+    /// carries it, and `skip_serializing_if` keeps an old file's bytes byte-identical on re-write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_launched_from: Option<Bytes32>,
+    /// The confirmed store COIN, as distinct from the store's launcher id.
+    ///
+    /// Persisted for the same reason and under the same back-compat rule as `store_launched_from`:
+    /// without it the store half's confirmation height names no coin, so a re-verification pass
+    /// (`crate::registry::verify`) can re-read the DID half against the chain and nothing else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_coin_id: Option<Bytes32>,
 }
 
 impl ProfileAnchor {
@@ -73,6 +98,8 @@ impl ProfileAnchor {
             did_confirmed_height: did.confirmed_height(),
             store_launcher_id: store.launcher_id(),
             store_confirmed_height: store.confirmed_height(),
+            store_launched_from: Some(store.did_coin_id()),
+            store_coin_id: Some(store.coin_id()),
         })
     }
 
@@ -104,6 +131,33 @@ impl ProfileAnchor {
     /// The height the store coin confirmed at.
     pub fn store_confirmed_height(&self) -> u32 {
         self.store_confirmed_height
+    }
+
+    /// The DID coin the store was launched from, when this anchor records it.
+    ///
+    /// `None` only for anchors written before dig-account 0.22, whose pairing therefore cannot be
+    /// re-checked offline — see [`pairing_holds`](Self::pairing_holds).
+    pub fn store_launched_from(&self) -> Option<Bytes32> {
+        self.store_launched_from
+    }
+
+    /// The confirmed store coin, when this anchor records it.
+    ///
+    /// `None` only for anchors written before dig-account 0.22.
+    pub fn store_coin_id(&self) -> Option<Bytes32> {
+        self.store_coin_id
+    }
+
+    /// Whether this anchor's two halves still state that they belong together.
+    ///
+    /// Returns `true` for an anchor that does not record the launch coin at all: absence is an old
+    /// FILE, not a failed pairing, and refusing it would make dig-account 0.22 unable to read the
+    /// identity its own earlier versions wrote. The claim this method makes is therefore precisely
+    /// "nothing here contradicts the pairing", never "the pairing was proven".
+    pub fn pairing_holds(&self) -> bool {
+        // `map_or(true, ..)` rather than `is_none_or`, which is newer than this crate's MSRV.
+        self.store_launched_from
+            .map_or(true, |launched_from| launched_from == self.did_coin_id)
     }
 }
 

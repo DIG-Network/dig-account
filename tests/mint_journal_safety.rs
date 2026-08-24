@@ -138,7 +138,9 @@ fn a_rerun_over_a_recorded_profile_refuses_to_mint_again() -> anyhow::Result<()>
     mint_and_record(&account, &chain, &mut registry, &network)?;
 
     let pushes_before = chain.push_attempts();
-    let next = registry.next_free_ix();
+    let next = registry
+        .next_free_ix()
+        .expect("the fixture registry is nowhere near the index ceiling");
     // Each profile index spends from its OWN wallet, so the next index must be funded or the rerun
     // would be stopped by an empty wallet rather than by the guard under test — a refusal for the
     // wrong reason, which would pass even with no guard at all.

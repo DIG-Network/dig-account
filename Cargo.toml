@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -38,8 +38,16 @@ coinset-push = ["dep:ureq"]
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
 dig-wallet-backend = { version = "0.29", default-features = false, features = ["client"] }
 dig-session = "0.7"
-dig-identity = "0.6"
+# 0.7 is what `dig-social-profile` 0.6 already resolves, so asking for it here UNIFIES this crate's
+# own identity types with the social-profile seam rather than adding a line. A second line (0.6)
+# remains in the tree via dig-wallet-backend 0.29 and no dig-identity type crosses that boundary;
+# it collapses when dig-wallet-backend adopts 0.7 (dig-account#36).
+dig-identity = "0.7"
 dig-keystore = "0.9"
+# Held at ^0.10, which is what `dig-wallet-backend` 0.29 requires. 0.11 is published and this crate
+# could ask for it, but doing so resolves a SECOND dig-constants line beside the one the money
+# engine already carries rather than upgrading that edge — the same trap the dig-merkle note below
+# records. It moves when dig-wallet-backend moves (dig-account#36).
 dig-constants = "0.10"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
@@ -120,7 +128,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # Held at ^0.8, the first line on chia-wallet-sdk 0.34. 0.7 pinned ^0.33, and because 0.33 and 0.34
 # are incompatible 0.x minors, it resolved a THIRD chia-wallet-sdk alongside the crate's own — under
 # `cfg(test)`, which is precisely where the mainnet mint harness proves its spends.
-chia-query = "0.8"
+chia-query = "0.15"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.

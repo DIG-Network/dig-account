@@ -29,6 +29,7 @@ pub mod journal;
     reason = "the file holds the module's namesake type"
 )]
 pub mod registry;
+pub mod verify;
 pub mod visibility;
 
 pub use active::{ActiveProfile, ActiveSwitch, ProfileEndOutcome};
@@ -39,4 +40,5 @@ pub use journal::{
     ProfileMintInProgress,
 };
 pub use registry::ProfileRegistry;
+pub use verify::{verify_anchor, AnchorVerdict};
 pub use visibility::ProfileVisibility;

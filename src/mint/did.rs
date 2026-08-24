@@ -197,6 +197,10 @@ impl ProfileMinter {
         // something the chain itself said earlier.
         let pushed_at_height = peak_height(chain)?;
         let (coin_spends, pending) = build_mint_spends(&wallet, source, options, pushed_at_height)?;
+        // The chain reads above are a network round trip, so the unlock is re-read HERE rather than
+        // relied upon from the top of the call: a lock that lands mid-ceremony must stop the
+        // signature, not merely the derivation that preceded it (dig-account#31).
+        self.ensure_live()?;
         let signature = sign_mint_spends(&wallet, &coin_spends, network)?;
 
         Ok((SpendBundle::new(coin_spends, signature), pending))

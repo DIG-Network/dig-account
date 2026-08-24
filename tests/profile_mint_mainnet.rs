@@ -125,7 +125,10 @@ fn a_whole_profile_mints_on_mainnet() {
     let minter = account.profile_minter();
 
     let mut registry = load_registry(&settings.registry_path);
-    let ix = target_index(&registry);
+    // A mainnet harness that could not name an index has nothing to mint AT, and there is no
+    // sensible fallback: every free index is past the ceiling (dig-account#33).
+    let ix = target_index(&registry)
+        .expect("this account has minted at profile index u32::MAX, so it has no free index left");
     let wallet = account.wallet_ops_at(ix);
     let address = wallet.address().expect("the wallet address is derivable");
 

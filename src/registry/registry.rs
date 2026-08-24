@@ -28,6 +28,9 @@ use crate::registry::visibility::ProfileVisibility;
 /// 3. **The active entry is always `Shown`.** A hidden active profile is a trap: the UI lists
 ///    nothing while the wallet keeps deriving and receiving there.
 /// 4. **Indices are SPARSE.** Gaps are legal and nothing derives an index from `entries.len()`.
+/// 5. **An identity is registered once.** No two confirmed entries claim the same DID launcher id.
+///    A profile IS its on-chain identity, so two entries claiming one DID would derive two
+///    different wallet keys and two different DEKs while presenting as the same person.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "RawProfileRegistry", into = "RawProfileRegistry")]
 pub struct ProfileRegistry {
@@ -140,7 +143,15 @@ impl ProfileRegistry {
     }
 
     /// The index the NEXT mint should use: one past the highest index known, confirmed or in
-    /// progress.
+    /// progress — or `None` when the index space is exhausted.
+    ///
+    /// # Why it can fail
+    ///
+    /// `ProfileIx` is a `u32`, so an account whose highest known index is `u32::MAX` has no next
+    /// index. Returning the ceiling itself would hand the mint an OCCUPIED index, which
+    /// [`record_minted`](Self::record_minted) then refuses forever — a silent, durable denial of
+    /// the mint path rather than a reported one. `None` is the honest answer, and the type is what
+    /// makes a caller confront it.
     ///
     /// # Why it never fills a gap
     ///
@@ -152,7 +163,8 @@ impl ProfileRegistry {
     ///
     /// In-progress mints count for the same reason, and more urgently: the DID at that index is
     /// already paid for.
-    pub fn next_free_ix(&self) -> ProfileIx {
+    #[must_use]
+    pub fn next_free_ix(&self) -> Option<ProfileIx> {
         let highest = self
             .entries
             .iter()
@@ -160,8 +172,10 @@ impl ProfileRegistry {
             .chain(self.in_progress.iter().map(ProfileMintInProgress::ix))
             .max();
         match highest {
-            Some(ix) => ProfileIx(ix.0.saturating_add(1)),
-            None => ProfileIx::ROOT,
+            // `checked_add`, never `saturating_add`: saturating at the ceiling returns the very
+            // index the caller asked to avoid (dig-account#33).
+            Some(ix) => ix.0.checked_add(1).map(ProfileIx),
+            None => Some(ProfileIx::ROOT),
         }
     }
 
@@ -187,6 +201,12 @@ impl ProfileRegistry {
     ) -> Result<&ProfileEntry> {
         if self.contains(ix) {
             return Err(AccountError::ProfileAlreadyRegistered(ix));
+        }
+        if let Some(existing) = self.holder_of(did.launcher_id()) {
+            return Err(AccountError::ProfileIdentityAlreadyRegistered {
+                existing,
+                did: did.did().to_string(),
+            });
         }
 
         let anchor = ProfileAnchor::from_confirmed(did, store)?;
@@ -415,6 +435,18 @@ impl ProfileRegistry {
         serde_json::from_str(json).map_err(|e| AccountError::RegistryInvariant(e.to_string()))
     }
 
+    /// The index of the confirmed profile whose identity is `launcher_id`, if any.
+    ///
+    /// The launcher id is the comparison key rather than the DID string because the string is
+    /// DERIVED from it (`dig_did::did_string_from_launcher_id`): comparing the derived form would
+    /// make the rule depend on an encoding, while the launcher id is the identity itself.
+    fn holder_of(&self, launcher_id: chia_protocol::Bytes32) -> Option<ProfileIx> {
+        self.entries
+            .iter()
+            .find(|entry| entry.anchor().launcher_id() == launcher_id)
+            .map(ProfileEntry::ix)
+    }
+
     /// The index of the journalled mint at `ix`, if any.
     fn mint_position(&self, ix: ProfileIx) -> Option<usize> {
         self.in_progress.iter().position(|mint| mint.ix() == ix)
@@ -448,8 +480,10 @@ impl ProfileRegistry {
     ///   that is checkable offline — and it is re-derived here with the same
     ///   `dig_did::did_string_from_launcher_id` the constructor uses, so the two cannot drift. This
     ///   closes a STRING SPOOF and nothing more: an attacker who computes the correct string for a
-    ///   launcher id still loads a fabricated anchor, which only re-verification against a trusted
-    ///   `ChainSource` can catch (dig_ecosystem#2392).
+    ///   launcher id still loads a fabricated anchor. Asking a chain source
+    ///   ([`verify_anchor`](crate::registry::verify_anchor)) raises the cost but does not close it
+    ///   either — that pass checks the named coins EXIST at the claimed heights and does not bind
+    ///   them to this anchor's identity, which is dig-account#37.
     /// - **No journalled mint discloses a store fee above the mint's ceiling**, so the bound
     ///   [`begin_mint`](Self::begin_mint) applies cannot be side-stepped by editing the file a
     ///   resumed phase B reads its spending limit from.
@@ -513,6 +547,17 @@ impl ProfileRegistry {
             (None, true) => {}
         }
 
+        let mut identities = std::collections::BTreeMap::new();
+        for entry in &self.entries {
+            if let Some(first) = identities.insert(entry.anchor().launcher_id(), entry.ix()) {
+                return Err(format!(
+                    "profiles {first} and {second} both claim identity {did}; one DID cannot be two profiles, because each index derives its own wallet key and its own DEK",
+                    second = entry.ix(),
+                    did = entry.anchor().did()
+                ));
+            }
+        }
+
         for entry in &self.entries {
             let anchor = entry.anchor();
             let ix = entry.ix();
@@ -532,6 +577,15 @@ impl ProfileRegistry {
                 return Err(format!(
                     "profile {ix}'s store_confirmed_height is 0, which no on-chain confirmation \
                      can produce; ConfirmedStore::from_confirmed refuses it"
+                ));
+            }
+            if !anchor.pairing_holds() {
+                return Err(format!(
+                    "profile {ix}'s store was launched from DID coin {launched_from}, not from its own DID coin {did_coin}; the two halves are not one mint",
+                    launched_from = anchor
+                        .store_launched_from()
+                        .expect("pairing_holds is only false when the coin is recorded"),
+                    did_coin = anchor.did_coin_id()
                 ));
             }
             if entry.ended().is_some_and(|end| end.at_height() == 0) {
@@ -705,12 +759,51 @@ mod tests {
         assert_eq!(registry.active().map(ActiveProfile::ix), Some(ProfileIx(0)));
     }
 
+    /// **Regression (dig-account#28, #32): one identity, two indices.**
+    ///
+    /// `record_minted` refused only a repeated INDEX, so the same `MintedDid` recorded at two
+    /// indices produced two entries claiming one DID — two wallet keys and two DEKs for one
+    /// person. The control below records a genuinely different mint at the same index that was
+    /// just refused, so the refusal is the identity rule and not the index being unavailable.
+    #[test]
+    fn recording_one_identity_at_a_second_index_is_refused() {
+        let (did, store) = bound_mint(1);
+        let mut registry = ProfileRegistry::empty();
+        registry
+            .record_minted(ProfileIx(0), &did, &store, None)
+            .expect("the first profile records");
+
+        let result = registry.record_minted(ProfileIx(1), &did, &store, None);
+
+        assert!(
+            matches!(
+                &result,
+                Err(AccountError::ProfileIdentityAlreadyRegistered { existing, did: claimed })
+                    if *existing == ProfileIx(0) && claimed == did.did()
+            ),
+            "the refusal must name the index that already holds the identity: {result:?}"
+        );
+        assert_eq!(
+            registry.entries().len(),
+            1,
+            "a refused record must leave the registry exactly as it was"
+        );
+
+        let (other_did, other_store) = bound_mint(5);
+        assert_ne!(other_did.launcher_id(), did.launcher_id());
+        registry
+            .record_minted(ProfileIx(1), &other_did, &other_store, None)
+            .expect(
+                "a DIFFERENT identity at that same index records, so the refusal was the identity",
+            );
+    }
+
     /// Invariant 4: a gap is not evidence that an index is free — it may hold a profile this host
     /// has not discovered — so the next mint goes past everything known.
     #[test]
     fn next_free_ix_skips_gaps_rather_than_filling_them() {
         let registry = with_profiles(&[0, 3]);
-        assert_eq!(registry.next_free_ix(), ProfileIx(4));
+        assert_eq!(registry.next_free_ix(), Some(ProfileIx(4)));
     }
 
     /// An in-progress mint reserves its index just as firmly as a confirmed profile: the DID there
@@ -720,7 +813,7 @@ mod tests {
         let mut registry = with_profiles(&[0]);
         registry.begin_mint(ProfileIx(1), a_stage(), 1_000).unwrap();
 
-        assert_eq!(registry.next_free_ix(), ProfileIx(2));
+        assert_eq!(registry.next_free_ix(), Some(ProfileIx(2)));
     }
 
     /// **The double-spend test. Do not delete this as redundant with the two above** — they cover
@@ -732,7 +825,39 @@ mod tests {
         let mut registry = ProfileRegistry::empty();
         registry.begin_mint(ProfileIx(1), a_stage(), 1_000).unwrap();
 
-        assert_eq!(registry.next_free_ix(), ProfileIx(2));
+        assert_eq!(registry.next_free_ix(), Some(ProfileIx(2)));
+    }
+
+    /// **Regression (dig-account#29, #33): the index ceiling wedged the mint path forever.**
+    ///
+    /// `next_free_ix` saturated, so a registry whose highest known index was `u32::MAX` handed the
+    /// mint back that same OCCUPIED index, which `record_minted` then refused on every attempt —
+    /// a permanent, silent denial living in durable state.
+    ///
+    /// The bound is pinned from BOTH sides in one test on purpose: the `MAX - 1` case is what
+    /// stops the fix being "always return `None`", and it is the index immediately below the
+    /// ceiling rather than a comfortable small one, so an off-by-one in the guard is visible.
+    #[test]
+    fn next_free_ix_reports_exhaustion_only_at_the_ceiling() {
+        let mut at_ceiling = ProfileRegistry::empty();
+        at_ceiling
+            .begin_mint(ProfileIx(u32::MAX), a_stage(), 1_000)
+            .unwrap();
+        assert_eq!(
+            at_ceiling.next_free_ix(),
+            None,
+            "there is no index past u32::MAX, and answering with the occupied ceiling wedges every future mint"
+        );
+
+        let mut below_ceiling = ProfileRegistry::empty();
+        below_ceiling
+            .begin_mint(ProfileIx(u32::MAX - 1), a_stage(), 1_000)
+            .unwrap();
+        assert_eq!(
+            below_ceiling.next_free_ix(),
+            Some(ProfileIx(u32::MAX)),
+            "the last index is still mintable, so the refusal above is the ceiling and not a function that stopped answering"
+        );
     }
 
     /// A begun mint is not a profile: it is absent from every confirmed-profile read.
@@ -923,6 +1048,122 @@ mod tests {
 
         fn anchor(did: &str) -> String {
             anchor_confirmed_at(did, 10, 11)
+        }
+
+        /// An entry at `ix` whose identity is `launcher`, with its DID string DERIVED so the only
+        /// thing that varies between two such entries is the identity itself.
+        fn entry_with_identity(ix: u32, launcher: [u8; 32]) -> String {
+            let launcher_id = chia_protocol::Bytes32::new(launcher);
+            let did = dig_did::did_string_from_launcher_id(launcher_id);
+            let anchor = format!(
+                r#"{{
+            "did": "{did}",
+            "launcher_id": "{launcher_id}",
+            "did_coin_id": "{COIN_HEX}",
+            "did_confirmed_height": 10,
+            "store_launcher_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
+            "store_confirmed_height": 11
+        }}"#
+            );
+            wrap_entry(ix, "Shown", anchor)
+        }
+
+        /// An entry at `ix` whose store claims to have been launched from `launched_from`.
+        fn entry_launched_from(ix: u32, launched_from: &str) -> String {
+            let did = honest_did();
+            let anchor = format!(
+                r#"{{
+            "did": "{did}",
+            "launcher_id": "{LAUNCHER_HEX}",
+            "did_coin_id": "{COIN_HEX}",
+            "did_confirmed_height": 10,
+            "store_launcher_id": "0x0303030303030303030303030303030303030303030303030303030303030303",
+            "store_confirmed_height": 11,
+            "store_launched_from": "{launched_from}"
+        }}"#
+            );
+            wrap_entry(ix, "Shown", anchor)
+        }
+
+        fn two_entries(first: String, second: String) -> String {
+            format!(r#"{{"entries":[{first},{second}],"active":0,"in_progress":[]}}"#)
+        }
+
+        /// **Regression (dig-account#28, #32) on the FILE path.** The in-process guard lives in
+        /// `record_minted`; a registry is persisted by the host and can be hand-edited, so the same
+        /// rule has to hold on deserialize or it holds only where nobody was going to break it.
+        ///
+        /// The control varies exactly one thing — the second entry's launcher id — so a rejection
+        /// cannot be a registry that refuses two entries in general.
+        #[test]
+        fn a_file_claiming_one_identity_at_two_indices_is_rejected() {
+            assert_rejected(
+                two_entries(
+                    entry_with_identity(0, [1; 32]),
+                    entry_with_identity(1, [1; 32]),
+                ),
+                "claiming one identity at two indices",
+            );
+
+            let distinct = two_entries(
+                entry_with_identity(0, [1; 32]),
+                entry_with_identity(1, [2; 32]),
+            );
+            assert!(
+                ProfileRegistry::from_json(&distinct).is_ok(),
+                "two DIFFERENT identities at two indices are an ordinary multi-profile account"
+            );
+        }
+
+        /// **Regression (dig-account#34): the pairing check was construction-only.**
+        ///
+        /// `ProfileAnchor::from_confirmed` proves the store was launched from THIS DID's coin and
+        /// then discarded the evidence, so `check()` had nothing to re-derive it from and a file
+        /// could pair any DID with any store. The anchor now persists the launch coin, and the
+        /// rule is re-run on every load.
+        #[test]
+        fn a_file_whose_store_was_launched_from_another_did_coin_is_rejected() {
+            const STRANGER: &str =
+                "0x0909090909090909090909090909090909090909090909090909090909090909";
+            assert_ne!(STRANGER, COIN_HEX, "the fixture must genuinely differ");
+
+            assert_rejected(
+                format!(
+                    r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                    entry_launched_from(0, STRANGER)
+                ),
+                "whose store was launched from another DID's coin",
+            );
+
+            let paired = format!(
+                r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                entry_launched_from(0, COIN_HEX)
+            );
+            assert!(
+                ProfileRegistry::from_json(&paired).is_ok(),
+                "an anchor whose store WAS launched from its own DID coin must still load"
+            );
+        }
+
+        /// A registry written before dig-account 0.22 records no launch coin, and must still load:
+        /// absence is an old FILE, not a failed pairing, and refusing it would lose the user an
+        /// identity that costs real XCH to recreate (CLAUDE.md §5.1).
+        ///
+        /// Paired with the rejection above, this is what stops the new rule being read as
+        /// "an anchor without the field is unpaired".
+        #[test]
+        fn a_registry_written_before_the_launch_coin_field_still_loads() {
+            let json = format!(
+                r#"{{"entries":[{}],"active":0,"in_progress":[]}}"#,
+                entry(0, "Shown")
+            );
+            let registry =
+                ProfileRegistry::from_json(&json).expect("a pre-0.22 registry must still load");
+            assert_eq!(
+                registry.entries()[0].anchor().store_launched_from(),
+                None,
+                "the old file records no launch coin, and nothing may invent one for it"
+            );
         }
 
         fn anchor_confirmed_at(did: &str, did_height: u32, store_height: u32) -> String {
@@ -1162,6 +1403,12 @@ mod tests {
                 did_pushed_stage(),
                 did_confirmed_stage(&honest_did(), 10),
                 store_pushed_stage(&honest_did(), 10),
+                // Height 1 is the lowest HONEST confirmation, and it is carried here rather than
+                // only beside the anchors: without it a journal guard written `confirmed_height
+                // <= 1` — the over-rejecting sibling of the shipped `== 0` rule — passes the whole
+                // suite, because every other journal fixture confirms at 10 (dig-account#35).
+                did_confirmed_stage(&honest_did(), 1),
+                store_pushed_stage(&honest_did(), 1),
             ] {
                 ProfileRegistry::from_json(&registry_with_stage(stage.clone()))
                     .unwrap_or_else(|e| panic!("the honest stage {stage} must load: {e:?}"));
