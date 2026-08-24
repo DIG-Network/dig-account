@@ -53,36 +53,55 @@ impl AnchorVerdict {
 /// `store_coin_id`, which anchors written before dig-account 0.22 do not carry; that yields
 /// [`AnchorVerdict::Unknown`] rather than a pass, so an old file is never reported as verified on
 /// the strength of the half that happened to be checkable.
+/// # What `Verified` proves, exactly
+///
+/// That the two coin ids the anchor names EXIST on chain and confirmed at the heights it claims —
+/// and NOTHING beyond that. It does not prove the anchor's `did` or `launcher_id` has any relation
+/// to those coins, because this pass reads only `CoinRecord::confirmed_height` and never the coin's
+/// `puzzle_hash` or `parent_coin_info`, which are the fields that would tie a coin to an identity.
+/// A file naming a stranger's DID beside two unrelated REAL coins at their true heights therefore
+/// verifies. Closing that is the binding check tracked as dig-account#37; until it lands, a caller
+/// MUST NOT read `Verified` as "this profile is genuinely this account's".
+///
+/// # Both halves are always evaluated, and a contradiction WINS
+///
+/// Short-circuiting on the first non-pass would let an unreachable answer about the DID coin MASK a
+/// store coin the same source would have contradicted — reporting
+/// [`Unknown`](AnchorVerdict::Unknown), which [`may_present`](AnchorVerdict::may_present) permits,
+/// about an anchor the source was willing to disagree with. So both halves are asked and
+/// `Contradicted` beats `Unknown`: a source that DISAGREED has said more than one that could not
+/// answer.
 pub fn verify_anchor<C>(anchor: &ProfileAnchor, chain: &C) -> AnchorVerdict
 where
     C: ChainSource + ?Sized,
 {
-    if let Some(verdict) = confirm_coin(
+    let did = confirm_coin(
         chain,
         anchor.did_coin_id(),
         anchor.did_confirmed_height(),
         "DID",
-    ) {
-        return verdict;
-    }
+    );
 
-    let Some(store_coin_id) = anchor.store_coin_id() else {
-        return AnchorVerdict::Unknown(
-            "this anchor predates dig-account 0.22 and records no store coin, so its store half \
-             cannot be re-read"
+    let store = match anchor.store_coin_id() {
+        Some(store_coin_id) => confirm_coin(
+            chain,
+            store_coin_id,
+            anchor.store_confirmed_height(),
+            "store",
+        ),
+        None => Some(AnchorVerdict::Unknown(
+            "this anchor predates dig-account 0.22 and records no store coin, so its store half cannot be re-read"
                 .to_string(),
-        );
+        )),
     };
-    if let Some(verdict) = confirm_coin(
-        chain,
-        store_coin_id,
-        anchor.store_confirmed_height(),
-        "store",
-    ) {
-        return verdict;
-    }
 
-    AnchorVerdict::Verified
+    match (did, store) {
+        (None, None) => AnchorVerdict::Verified,
+        // A contradiction outranks a non-answer, whichever half raised it.
+        (Some(disagreement @ AnchorVerdict::Contradicted(_)), _)
+        | (_, Some(disagreement @ AnchorVerdict::Contradicted(_))) => disagreement,
+        (Some(other), _) | (_, Some(other)) => other,
+    }
 }
 
 /// `None` when `coin_id` confirmed at `claimed_height`; otherwise the verdict that says why not.
@@ -322,14 +341,61 @@ mod tests {
         assert!(verdict.may_present());
     }
 
+    /// **Regression: a non-answer about one half MASKED a contradiction about the other.**
+    ///
+    /// `verify_anchor` returned on the first half that did not pass, so a source that could not
+    /// report the DID coin's block hid a store coin the SAME source was willing to contradict. The
+    /// verdict was `Unknown`, which `may_present` permits — so an anchor the chain disagreed with
+    /// stayed on screen.
+    ///
+    /// The fixture is built so only the ORDERING can produce the right answer: the DID half yields
+    /// `Unknown` (known coin, unknown block) and the store half yields `Contradicted` (no such
+    /// coin), from ONE source in ONE call. A first-wins implementation returns `Unknown` here; the
+    /// sibling below puts the two the other way round, so neither can pass by accident of position.
+    #[test]
+    fn a_contradiction_beats_a_non_answer_about_the_other_half() {
+        let anchor = anchor();
+        let chain = CoinOracle::default().height_unknown(anchor.did_coin_id());
+
+        let verdict = verify_anchor(&anchor, &chain);
+
+        assert!(
+            matches!(&verdict, AnchorVerdict::Contradicted(why) if why.contains("store")),
+            "the store coin does not exist and the source said so; an unreadable DID block must \
+             not hide that: {verdict:?}"
+        );
+        assert!(!verdict.may_present());
+    }
+
+    /// The mirror of the test above, with the halves swapped, so neither passes by position.
+    #[test]
+    fn a_contradicted_did_beats_a_non_answer_about_the_store() {
+        let anchor = anchor();
+        let chain = CoinOracle::default().height_unknown(store_coin(&anchor));
+
+        let verdict = verify_anchor(&anchor, &chain);
+
+        assert!(
+            matches!(&verdict, AnchorVerdict::Contradicted(why) if why.contains("DID")),
+            "the DID coin does not exist and the source said so: {verdict:?}"
+        );
+    }
+
     /// `CoinRecord::confirmed_height` is documented as "not known by THIS source", never "not
     /// confirmed" — so a light source that knows the coin but not its block is an absence of
     /// knowledge, and treating it as disagreement would let the weakest source retire a real
     /// profile.
+    ///
+    /// The store half is fully honest here so the ONLY thing varied is the DID coin's block being
+    /// unreadable. An earlier version of this test left the store coin absent, which made it assert
+    /// `Unknown` about an anchor whose store half the source was actually contradicting — it passed
+    /// only because the implementation returned on the first non-pass.
     #[test]
     fn a_source_that_knows_the_coin_but_not_its_block_yields_unknown() {
         let anchor = anchor();
-        let chain = CoinOracle::default().height_unknown(anchor.did_coin_id());
+        let chain = CoinOracle::default()
+            .height_unknown(anchor.did_coin_id())
+            .confirmed(store_coin(&anchor), anchor.store_confirmed_height());
 
         let verdict = verify_anchor(&anchor, &chain);
 

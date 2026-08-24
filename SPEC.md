@@ -178,13 +178,27 @@ resume parents its store launch from.
 #### 2.4.1b Re-verifying an anchor against the chain (normative)
 
 Every rule above is checkable OFFLINE, and none of them can distinguish a record of a real mint from an
-internally-consistent forgery. Re-verification asks the chain instead of the file: for each coin an
-anchor names — the DID coin and the store coin — the source is asked whether it exists and at which
-height it confirmed.
+internally-consistent forgery. Re-verification narrows that gap by asking the chain instead of the file:
+for each coin an anchor names — the DID coin and the store coin — the source is asked whether it exists
+and at which height it confirmed.
+
+**What a `Verified` verdict proves, exactly.** That those two coin ids exist on chain and confirmed at
+the heights the anchor claims. NOTHING beyond that. In particular it does NOT establish that the
+anchor's `did` or `launcher_id` has any relation to the coins that were checked: the pass reads only a
+`CoinRecord`'s confirmation height and never the coin's `puzzle_hash` or `parent_coin_info`, which are
+the only fields that could tie a coin to an identity. A file naming a STRANGER's DID beside two
+unrelated but genuine coins, at their true heights, therefore satisfies every rule in §2.4.1a and
+verifies here — the coin ids and heights are public, so fabricating one costs nothing.
+
+A consumer MUST NOT read `Verified` as "this profile belongs to this account". Binding the checked
+coins to the claimed identity is a further check, specified and tracked separately; until it exists,
+re-verification raises the cost of a forgery and does not close it. This paragraph is normative
+precisely because the weaker claim is the one an implementation can honour today.
 
 The verdict MUST be three-valued, and an implementation MUST NOT collapse it to a boolean:
 
-- **Verified** — every coin the anchor names exists and confirmed at the claimed height.
+- **Verified** — every coin the anchor names exists and confirmed at the claimed height, with the
+  limitation stated above.
 - **Contradicted** — the source ANSWERED, and disagreed: a named coin does not exist, or confirmed at a
   different height. A host MUST NOT present a contradicted anchor as a profile.
 - **Unknown** — the source could not answer, reported a coin without its block (`confirmed_height` is
@@ -196,6 +210,19 @@ an offline host indistinguishable from a forged registry, and would retire an id
 XCH to recreate. Equally, an anchor whose store half cannot be re-read MUST report Unknown rather than
 Verified: a pass reported on the strength of the one half that happened to be checkable is a claim the
 implementation cannot support.
+
+**Both halves MUST be evaluated, and `Contradicted` MUST outrank `Unknown`.** An implementation that
+returned on the first half that did not pass would let a non-answer about one coin MASK a contradiction
+about the other, reporting a presentable `Unknown` about an anchor the source was willing to disagree
+with. A source that disagreed has said strictly more than one that could not answer.
+
+**A single source is not a verdict, and the consumer owns that.** The verdict is computed per call and
+holds no state, so a source that goes quiet cannot poison a cached result — but it can keep a
+contradicted anchor presentable indefinitely by never answering again, and the sharper mirror is worse:
+one untrusted source answering "no such coin" forces `Contradicted` and SUPPRESSES a real identity. A
+consumer that acts on these verdicts MUST therefore treat the source as untrusted and agree across
+several independently-queried sources (NC-12), exactly as the light client does for chain state. This
+crate deliberately does not do that for the caller: it reports what ONE source said.
 
 A host MUST NOT map a `RegistryInvariant` load failure to an empty registry. That fallback silently
 re-arms the double-mint the journal exists to prevent: the file is the only record that stops an
