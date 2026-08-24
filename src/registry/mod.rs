@@ -40,3 +40,4 @@ pub use journal::{
 };
 pub use registry::ProfileRegistry;
 pub use visibility::ProfileVisibility;
+
