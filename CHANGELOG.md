@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.24.0] - 2026-08-25
+
+### Features
+- **auth:** Concrete TOTP and passkey second factors (#42)
+
 ## [0.23.0] - 2026-08-24
 
 ### Features
