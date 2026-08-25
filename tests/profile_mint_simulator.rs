@@ -363,7 +363,7 @@ fn repeated_advances_against_an_unconfirming_chain_push_nothing() -> anyhow::Res
 #[test]
 fn the_eve_store_hydrates_with_the_seeded_root() -> anyhow::Result<()> {
     use chia_wallet_sdk::driver::SpendContext;
-    use dig_merkle::{DataStore, DigDataStoreMetadata};
+    use dig_merkle::{Datastore, DigDataStoreMetadata};
 
     let (account, chain, mut registry) = ready_to_mint();
     let status = mint_a_whole_profile(&account, &chain, &mut registry, &simulator_network())?;
@@ -376,7 +376,7 @@ fn the_eve_store_hydrates_with_the_seeded_root() -> anyhow::Result<()> {
         .borrow()
         .coin_spend(store.launcher_id())
         .expect("the launcher coin was spent on chain");
-    let hydrated = DataStore::<DigDataStoreMetadata>::from_spend(
+    let hydrated = Datastore::<DigDataStoreMetadata>::from_spend(
         &mut SpendContext::new(),
         &launcher_spend,
         &[],
