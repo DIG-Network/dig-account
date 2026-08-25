@@ -475,6 +475,101 @@ policy BEFORE the password unlock is attempted. `PasswordOnlyPolicy` is the base
 `AllOf` requires every listed `SecondFactor` to pass (logical AND, in order). Policy evaluation is pure
 and in-crate; the harness only supplies the factor VALUES (§7).
 
+A `SecondFactor` MUST NOT hold, derive, or require key material. It authorizes an unlock; it does not
+perform one. Both concrete factors below satisfy this structurally — neither can reach the account
+seed, a per-profile DEK, or the unlock password — which is what permits them to live in this crate at
+all without any secret crossing a boundary (§7, dig_ecosystem#908, `dig-ipc-protocol/SPEC.md` §1).
+
+Every `SecondFactor` fails in the DENY direction. `AllOf` maps any `Err` to
+`UnlockError::Unauthorized`, and no factor may return `Ok` on an input it could not positively verify.
+Absence of a factor value, a malformed value, an unreadable clock, unreadable internal state, and a
+failed check are all refusals.
+
+### 4.3 TOTP (`auth::second_factors::totp`, normative)
+
+`TotpFactor` implements RFC 6238 verification over the RFC 4226 HOTP primitive. Conformance:
+
+1. **Codes.** For a secret `K`, step `X`, digit count `D` and hash `H` (`SHA1` default, `SHA256` and
+   `SHA512` permitted per RFC 6238 §1.2), the accepted code at counter `C` is `HOTP(K, C)` truncated
+   to `D` digits. `T0 = 0`. The published RFC 6238 Appendix B vectors MUST verify.
+2. **Window.** Counters `C-skew ..= C+skew` are accepted, where `C = floor(now / X)` and `skew` is
+   `TotpParams::skew_steps`. The default is `1`, RFC 6238 §5.2's permitted maximum. The bound is
+   explicit configuration, never implicit.
+3. **Comparison.** The presented code is compared in constant time, and every candidate counter is
+   compared with no early exit, so neither the code nor the verifier's clock offset leaks by timing.
+4. **Replay, scoped to the factor instance (normative).** The factor records the HIGHEST counter it
+   has accepted and MUST refuse any counter at or below it. Within one `TotpFactor` a code is
+   therefore single-use across its entire validity, including the skew steps. A guard that remembered
+   only the last code accepted would leave an earlier, still arithmetically valid code spendable, and
+   MUST NOT be used.
+
+   **The guard's lifetime is the instance's, and no longer.** `last_consumed` is in-memory state on
+   the `TotpFactor`; it is not persisted and is not shared between factors. A NEW `TotpFactor`
+   constructed over the same secret starts with an empty guard and WILL accept a code an earlier
+   instance already spent. A host that requires replay protection to outlive a process, or to hold
+   across two factors built from one enrolment, MUST keep the factor instance alive for that span —
+   this crate does not provide the durable guarantee, and nothing here should be read as claiming it.
+   Persisting the guard is deliberately not attempted: it is coupled to the denial-of-unlock question
+   in `DIG-Network/dig-account` (see the follow-up issues linked from
+   https://github.com/DIG-Network/dig_ecosystem/issues/1499), because a durable guard would make that
+   denial durable too.
+5. **Clock.** Time is read through the fallible `TimeSource`. A clock that cannot be read MUST refuse;
+   no default epoch may be substituted.
+6. **Shape.** A code that is not exactly `D` ASCII digits is refused before any comparison.
+7. **Secret at rest.** `TotpSecret` is zeroized on drop and MUST NOT be rendered by `Debug`, logged,
+   or included in an error message. This crate does not persist it: the enrolled secret's at-rest home
+   is the host's OS-native credential store (dig_ecosystem#1502), NOT the account keystore. Sealing it
+   under the account password would place both factors behind one secret and collapse the second
+   factor into the first.
+8. **Enrolment.** `enrollment_uri` renders the `otpauth://totp/` provisioning string. It CONTAINS the
+   secret by construction and MUST be treated as secret material. Label and issuer components are
+   percent-encoded so a chosen display name cannot introduce or override a query parameter.
+
+### 4.4 Passkey / WebAuthn (`auth::second_factors::passkey`, normative)
+
+`PasskeyFactor` verifies a WebAuthn assertion. **Only the verification half of WebAuthn lives in this
+crate**, and the boundary is normative rather than incidental:
+
+| Step | Owner |
+|---|---|
+| Registration / attestation ceremony (`navigator.credentials.create`) | **dig-app** |
+| Assertion ceremony (`navigator.credentials.get`) | **dig-app** |
+| COSE_Key decoding of a newly registered credential | **dig-app** |
+| Challenge issuance | **dig-account** |
+| Credential record and signature-counter state | **dig-account** |
+| Assertion verification | **dig-account** |
+
+The dig-app rows require an interactive user session — a platform authenticator, a user gesture, a
+biometric or PIN prompt — which a headless crate cannot drive (dig_ecosystem#1499's residency table).
+They are NOT stubbed here, because a placeholder that cannot be implemented in this process is a
+promise the crate cannot keep. dig-app supplies, once at enrolment, the credential id and the
+credential public key as an uncompressed SEC-1 point (`0x04 || X || Y`).
+
+Conformance, in this order:
+
+1. **Algorithm.** ES256 (COSE `-7`) only. Any other algorithm is refused at ENROLMENT, not at unlock.
+2. **Credential identity.** The asserted credential id MUST equal the enrolled one (constant time).
+3. **Ceremony type.** `clientData.type` MUST be `webauthn.get`, so a registration signature cannot be
+   replayed as a login.
+4. **Origin.** `clientData.origin` MUST appear in the configured accepted-origin list. An EMPTY list
+   accepts nothing; an unset list MUST NOT be read as unrestricted.
+5. **Relying party.** The first 32 bytes of `authenticatorData` MUST equal `SHA-256(rp_id)`.
+6. **Flags.** `UP` MUST be set. `UV` MUST be set when `UserVerification::Required` (the default).
+7. **Signature.** The ES256 signature MUST verify over
+   `authenticatorData || SHA-256(clientDataJSON)` under the enrolled public key.
+8. **Challenge (normative ordering).** The challenge is spent only AFTER the signature verifies, and
+   spending is single-use. This ordering is required, not stylistic: consuming a challenge before
+   verifying the signature lets any process that can present bytes destroy the legitimate user's
+   outstanding challenge, which is a denial of unlock.
+9. **Signature counter.** After a successful verification, the presented counter MUST be strictly
+   greater than the stored one, and the stored value is then advanced. The sole exception is
+   WebAuthn L2 §6.1.1's: when both the presented and stored counters are zero the authenticator
+   maintains no counter and no conclusion is drawn. A counter that fails to advance indicates a
+   cloned credential and MUST refuse. The counter is advanced only on a verified assertion.
+10. **Challenge issuance.** At most ONE challenge is outstanding per factor; issuing invalidates any
+    predecessor. Challenges are 32 bytes from OS randomness and expire at a configured TTL. A clock
+    that cannot be read MUST refuse to issue.
+
 ## 5. Signer & domain separation
 
 ### 5.1 Identity signer
