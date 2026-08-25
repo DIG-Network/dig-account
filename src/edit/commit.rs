@@ -28,7 +28,7 @@ use std::sync::Arc;
 use chia_bls::Signature;
 use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use dig_chainsource_interface::ChainSource;
-use dig_merkle::{required_signatures, DataStore, DigDataStoreMetadata, Owner, RequiredSignature};
+use dig_merkle::{required_signatures, Datastore, DigDataStoreMetadata, Owner, RequiredSignature};
 use dig_social_profile::slot::standard::SCHEMA_VERSION;
 use dig_social_profile::{Profile, SlotEdit, VerifiedBody};
 
@@ -497,7 +497,7 @@ fn reject_protected_removals(edit: &ProfileEdit) -> EditResult<()> {
 pub(crate) fn gate_store_identity(
     wallet: &WalletKey,
     expected_launcher_id: Bytes32,
-    store: &DataStore<DigDataStoreMetadata>,
+    store: &Datastore<DigDataStoreMetadata>,
 ) -> EditResult<()> {
     if store.info.owner_puzzle_hash != wallet.puzzle_hash() {
         return Err(EditError::Refused(
@@ -531,7 +531,7 @@ pub(crate) fn gate_store_identity(
 /// the mint, in the shape the edit seam takes.
 fn gate_edit(
     wallet: &WalletKey,
-    store: &DataStore<DigDataStoreMetadata>,
+    store: &Datastore<DigDataStoreMetadata>,
     coin_spends: &[CoinSpend],
     required: &[RequiredSignature],
     network: &MintNetwork,
@@ -581,7 +581,7 @@ mod tests {
     use chia_protocol::{Coin, Program};
     use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
     use chia_wallet_sdk::signer::{AggSigConstants, RequiredBlsSignature};
-    use dig_merkle::{DataStoreInfo, DelegatedPuzzle, LineageProof, Proof};
+    use dig_merkle::{DatastoreInfo, DelegatedPuzzle, LineageProof, Proof};
 
     const SEED: [u8; 32] = [0x5A; 32];
     const OTHER_SEED: [u8; 32] = [0xA5; 32];
@@ -606,15 +606,15 @@ mod tests {
         owner: Bytes32,
         launcher_id: Bytes32,
         delegated_puzzles: Vec<DelegatedPuzzle>,
-    ) -> DataStore<DigDataStoreMetadata> {
-        DataStore {
+    ) -> Datastore<DigDataStoreMetadata> {
+        Datastore {
             coin: Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1),
             proof: Proof::Lineage(LineageProof {
                 parent_parent_coin_info: Bytes32::new([3; 32]),
                 parent_inner_puzzle_hash: Bytes32::new([4; 32]),
                 parent_amount: 1,
             }),
-            info: DataStoreInfo {
+            info: DatastoreInfo {
                 launcher_id,
                 metadata: DigDataStoreMetadata {
                     root_hash: Bytes32::new([5; 32]),
@@ -722,7 +722,7 @@ mod tests {
     }
 
     /// The one honest coin spend an edit builds: the store tip itself.
-    fn spends_of(store: &DataStore<DigDataStoreMetadata>) -> Vec<CoinSpend> {
+    fn spends_of(store: &Datastore<DigDataStoreMetadata>) -> Vec<CoinSpend> {
         vec![CoinSpend::new(
             store.coin,
             Program::default(),

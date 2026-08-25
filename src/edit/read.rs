@@ -10,7 +10,7 @@
 //! coin is never accepted because its puzzle hash looks right — that value is attacker-chosen.
 
 use dig_chainsource_interface::ChainSource;
-use dig_merkle::{DataStore, DigDataStoreMetadata};
+use dig_merkle::{Datastore, DigDataStoreMetadata};
 use dig_social_profile::{Profile as SchemaProfile, SlotId, Value, VerifiedBody};
 
 use crate::registry::ProfileAnchor;
@@ -118,7 +118,7 @@ where
 pub(crate) fn resolve_store_tip<C>(
     anchor: &ProfileAnchor,
     chain: &C,
-) -> EditResult<DataStore<DigDataStoreMetadata>>
+) -> EditResult<Datastore<DigDataStoreMetadata>>
 where
     C: ChainSource + ?Sized,
 {

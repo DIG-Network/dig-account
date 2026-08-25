@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -36,19 +36,19 @@ coinset-push = ["dep:ureq"]
 # The canonical money signer + independent spend verification live in dig-wallet-backend's `client`
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
-dig-wallet-backend = { version = "0.29", default-features = false, features = ["client"] }
-dig-session = "0.7"
+dig-wallet-backend = { version = "0.31", default-features = false, features = ["client"] }
+dig-session = "0.8"
 # 0.7 is what `dig-social-profile` 0.6 already resolves, so asking for it here UNIFIES this crate's
 # own identity types with the social-profile seam rather than adding a line. A second line (0.6)
 # remains in the tree via dig-wallet-backend 0.29 and no dig-identity type crosses that boundary;
 # it collapses when dig-wallet-backend adopts 0.7 (dig-account#36).
-dig-identity = "0.7"
+dig-identity = "0.7.1"
 dig-keystore = "0.9"
 # Held at ^0.10, which is what `dig-wallet-backend` 0.29 requires. 0.11 is published and this crate
 # could ask for it, but doing so resolves a SECOND dig-constants line beside the one the money
 # engine already carries rather than upgrading that edge — the same trap the dig-merkle note below
 # records. It moves when dig-wallet-backend moves (dig-account#36).
-dig-constants = "0.10"
+dig-constants = "0.11"
 dig-ipc-protocol = "0.3"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
@@ -64,7 +64,7 @@ dig-ipc-protocol = "0.3"
 # the two lines can never meet. Re-check that with `cargo tree -i dig-did@0.6.0` after any bump; if
 # a dig-did type ever DOES cross that boundary, the second line becomes a byte-drift hazard and
 # dig-social-profile must be released onto ^0.7 first.
-dig-did = "0.7"
+dig-did = "0.8"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
@@ -85,7 +85,7 @@ dig-chainsource-interface = "0.3.1"
 # excludes every later minor. Asking for ^0.8 here does not upgrade that edge; it resolves a SECOND
 # dig-merkle line beside it. The cascade runs dig-store first, then dig-social-profile, then here. 0.6 and 0.7 both already build on
 # chia-wallet-sdk 0.34, so ^0.6 costs nothing and keeps the tree single-rooted.
-dig-merkle = "0.6"
+dig-merkle = "0.9"
 # The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
 #
 # 0.4 is the first release on the chia 0.36.1 / chia-wallet-sdk 0.34 family. Before it, this crate
@@ -97,14 +97,14 @@ dig-merkle = "0.6"
 # `[u8; 32]` root (`ProfileSeed`), so no chia type crosses it. Nothing else from this crate may be
 # used — in particular NOT `IdentityProfile::mint_from_did`, which cannot mint a DID-rooted store
 # (see `mint::store_launch`).
-dig-social-profile = "0.6"
+dig-social-profile = "0.7"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chia-bls = "0.36.1"
 # The `serde` feature is required: coin ids and launcher ids are persisted in the profile
 # registry as canonical 0x-hex strings (SPEC §2.4).
 chia-protocol = { version = "0.36.1", features = ["serde"] }
 chia-puzzle-types = "0.36.1"
-chia-wallet-sdk = { version = "0.34", features = ["chip-0035"] }
+chia-wallet-sdk = { version = "0.36", features = ["chip-0035"] }
 clvmr = "0.16"
 # Asset ids and puzzle hashes are rendered as lowercase hex in a summary line.
 hex = "0.4"
@@ -160,15 +160,15 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # Held at ^0.8, the first line on chia-wallet-sdk 0.34. 0.7 pinned ^0.33, and because 0.33 and 0.34
 # are incompatible 0.x minors, it resolved a THIRD chia-wallet-sdk alongside the crate's own — under
 # `cfg(test)`, which is precisely where the mainnet mint harness proves its spends.
-chia-query = "0.15"
+chia-query = "0.16"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
-chia-sdk-test = "0.34"
+chia-sdk-test = "0.36"
 # The schema crate, in TESTS only: the edit seam's acceptance is that the root it commits equals the
 # one dig-social-profile computes from the same slots, and only a direct call can state that
 # independently of the wrapper under test.
-dig-social-profile = "0.6"
+dig-social-profile = "0.7"
 # Test-only: the consensus ErrorCode enum, so the orphaned-secondary test can pin its refusal to
 # AssertCoinAnnouncementFailed specifically. A bare is_err() there would be satisfied by a signature
 # failure and would leave the input binding untested. Pinned to the version chia-sdk-test 0.34
