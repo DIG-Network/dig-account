@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -68,7 +68,14 @@ dig-did = "0.7"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
-dig-chainsource-interface = "0.3"
+# Floor raised to the version this tree already resolves. The rest of the `dig-*` set is
+# deliberately NOT bumped: dig-keystore 0.10, dig-constants 0.11 and dig-wallet-backend 0.30 each
+# split a dependency into two lines here, because dig-session 0.7.0 — already the latest release —
+# still pins `dig-constants ^0.10` and `dig-keystore ^0.9`. That cascade is owed in dig-session
+# (release-first, CLAUDE.md §4.1), not workaroundable from this crate, and bridging the two lines
+# with a shim is the byte-drift class §4.1 exists to prevent. Verify with
+# `cargo tree -i dig-constants` after dig-session next releases.
+dig-chainsource-interface = "0.3.1"
 # The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.
@@ -108,6 +115,30 @@ serde = { version = "1", features = ["derive"] }
 # a runtime dependency, not a test-only one.
 serde_json = "1"
 zeroize = "1"
+# The RFC 4226 HOTP core (HMAC + dynamic truncation) that RFC 6238 TOTP is defined over. A vetted
+# RustCrypto-backed implementation is used deliberately: hand-rolling HMAC or the truncation is
+# exactly the class of bespoke crypto this crate must never contain. dig-account supplies the
+# counter window, the constant-time comparison and the replay guard around it; the primitive itself
+# is not ours.
+totp-lite = "2"
+# Constant-time equality for the presented TOTP code. A byte-wise `==` on a code leaks, through
+# timing, how long a prefix an attacker guessed correctly, which turns an 8-digit search into eight
+# 10-way searches.
+subtle = "2.6"
+# RFC 4648 base32 for the TOTP secret (the encoding every authenticator app enrolls from) and
+# base64url for the WebAuthn credential/challenge encodings. Already resolved in this tree.
+data-encoding = "2.11"
+# ES256 (`-7`) assertion verification for passkeys — the algorithm every platform authenticator
+# (Windows Hello, Touch ID, Android) produces. Held at ^0.13 rather than ^0.14 ON PURPOSE: 0.13.2 is
+# already resolved transitively here, and 0.14 moves to a new `elliptic-curve` line, so asking for
+# "latest" would resolve a SECOND curve subtree in a custody crate for no capability gain.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# The clientDataJSON and RP-id hashes WebAuthn defines. ^0.10 matches the line the rest of this tree
+# (and chia-*) already resolves; p256 0.13 uses the same one, so no second digest subtree appears.
+sha2 = "0.10"
+# OS randomness for TOTP secrets and WebAuthn challenges. ^0.6 is the line p256 0.13 and
+# dig-keystore already resolve, so `OsRng` here is the same type they use.
+rand_core = { version = "0.6", features = ["getrandom"] }
 # OPTIONAL, `coinset-push` only: the blocking HTTPS client behind `BlockingHttpTransport`. The
 # response MAPPING is deliberately independent of it, so the mempool-verdict logic is unit-tested
 # through the `PushTransport` seam with no client and no network at all.
@@ -149,6 +180,15 @@ chia-secp = "0.36.1"
 sha2 = "0.10"
 # Compile-fail proofs: several custody properties of `SpendApproval` are TYPE-SYSTEM properties, so
 # the only honest test for them is that the wrong code does not compile.
+# Test-only: the RFC 4226 primitive called DIRECTLY, as an independent oracle for the expected code
+# at a counter. Deriving that expectation from the verifier under test would agree with any
+# verifier; `tests/totp_rfc6238_vectors.rs` is what pins the primitive itself to the RFC.
+totp-lite = "2"
+# Test-only: `SigningKey`, so every passkey fixture signs with a REAL P-256 key. A symmetric mock
+# cannot distinguish a verifier that checks a signature from one that checks nothing.
+p256 = { version = "0.13", features = ["ecdsa"] }
+# Test-only: base32/base64url decoding in fixtures, so a fixture never has to re-implement one.
+data-encoding = "2.11"
 trybuild = "1.0"
 static_assertions = "1.1"
 

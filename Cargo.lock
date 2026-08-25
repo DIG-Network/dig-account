@@ -1364,7 +1364,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.23.0"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1378,6 +1378,7 @@ dependencies = [
  "chia-secp",
  "chia-wallet-sdk",
  "clvmr",
+ "data-encoding",
  "dig-chainsource-interface",
  "dig-constants",
  "dig-did 0.7.0",
@@ -1389,12 +1390,16 @@ dependencies = [
  "dig-social-profile",
  "dig-wallet-backend",
  "hex",
+ "p256",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "static_assertions",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
+ "totp-lite",
  "trybuild",
  "ureq",
  "x25519-dalek",
@@ -4211,6 +4216,18 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "totp-lite"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8e43134db17199f7f721803383ac5854edd0d3d523cc34dba321d6acfbe76c3"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+ "sha1",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "tower"

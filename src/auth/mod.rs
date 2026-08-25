@@ -10,3 +10,4 @@ pub mod factors;
 pub mod policy;
 pub mod provider;
 pub mod second_factor;
+pub mod second_factors;

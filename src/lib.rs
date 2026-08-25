@@ -64,6 +64,11 @@ pub use auth::factors::AuthFactors;
 pub use auth::policy::{AllOf, AuthPolicy, PasswordOnlyPolicy, UnlockError, UnlockGate};
 pub use auth::provider::{AuthProvider, SpendConfirmRequest, SpendDecision, UnlockRequest};
 pub use auth::second_factor::SecondFactor;
+pub use auth::second_factors::{
+    Challenge, ChallengeIssuer, CoseAlgorithm, PasskeyClock, PasskeyCredential, PasskeyError,
+    PasskeyFactor, SystemPasskeyClock, SystemTimeSource, TimeSource, TotpAlgorithm, TotpError,
+    TotpFactor, TotpParams, TotpSecret, UserVerification,
+};
 pub use chain_confirm::{
     confirm_all_spendable_by_name, confirm_spendable_by_name, UnconfirmedInput,
 };
