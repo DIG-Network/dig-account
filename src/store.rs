@@ -243,6 +243,39 @@ mod tests {
         assert_eq!(*unlocked.master_seed(), expanded(&ENTROPY_A));
     }
 
+    /// The refusal above must not REST on [`AccountStore::exists`]. That check is a fast path, and a
+    /// fast path is exactly what a concurrent enrol wins past: two callers both observe an absence,
+    /// both pay the Argon2id derivation, and the loser's blob replaces the winner's — leaving the
+    /// winning caller holding a seed that no longer opens anything.
+    ///
+    /// So this drives the underlying write DIRECTLY, at a key that already holds a blob, bypassing
+    /// the pre-check the way a racing thread would. Asserting only that it errors would be satisfied
+    /// by a write that clobbers and then complains, which is the very failure in question — the
+    /// load-bearing assertion is that `ENTROPY_A` still unlocks afterwards, so the refusal happened
+    /// INSTEAD of the write rather than after it.
+    #[test]
+    fn the_write_itself_refuses_an_occupied_key_not_merely_the_pre_check() {
+        let ks = store();
+        let acct = id("acct-1");
+        ks.enroll(&acct, Password::new(PW), &ENTROPY_A).unwrap();
+
+        let raced = Session::enroll_master_seed(
+            ks.backend.clone(),
+            AccountStore::blob_key(&acct),
+            Password::new(PW),
+            &ENTROPY_B,
+        );
+
+        // A loser is refused, and arrives as `Session` rather than `AlreadyExists` because the
+        // collision was detected by the write rather than by the pre-check (SPEC §2.1).
+        let err = AccountStoreError::from(raced.unwrap_err());
+        assert!(matches!(err, AccountStoreError::Session(_)), "{err}");
+
+        // The custody root that was there first is still the one that opens.
+        let unlocked = ks.unlock(&acct, Password::new(PW)).unwrap();
+        assert_eq!(*unlocked.master_seed(), expanded(&ENTROPY_A));
+    }
+
     #[test]
     fn unlock_with_a_wrong_password_fails_closed() {
         let ks = store();

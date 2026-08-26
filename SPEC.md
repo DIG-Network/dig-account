@@ -82,6 +82,16 @@ derives NO keys itself.
 
 - `enroll` MUST fail-closed (`AlreadyExists`) rather than overwrite an existing blob — a second enrol
   can never silently destroy a custody root.
+- That refusal MUST rest on the backend's own create-if-absent write, not on a preceding existence
+  check. Where the backend reports `Exclusivity::Atomic` (`FileBackend`, `MemoryBackend`), two
+  concurrent enrolments of the same `AccountId` therefore resolve to exactly one winner. Where it
+  reports `Exclusivity::BestEffort` (`OsKeychainBackend`, whose credential store offers no such
+  primitive), a concurrent enrolment race is NOT closed by this crate and a host that enrols
+  concurrently against it MUST serialise the call itself.
+- A raced loser is refused, but MAY surface as `Session` rather than `AlreadyExists`: the fast-path
+  existence check reports the latter, while a collision detected by the write arrives through
+  `dig-session`. Both refuse and neither destroys a custody root, so a caller testing for "already
+  enrolled" MUST NOT match on `AlreadyExists` alone.
 - `unlock` MUST return `NotFound` for an unknown account and a `Session` error (no handle) on a wrong
   password / tampered ciphertext.
 - `enroll` and `unlock` are `pub(crate)` (§8): they return a raw `UnlockedMasterSeed`, which MUST NOT
