@@ -23,9 +23,9 @@
 //! newly-standardised slot must not wait for a release of this crate — so this site is a deliberate
 //! remainder, not an oversight.
 //!
-//! Together they are why a dependency bump on those crates is BREAKING for consumers, and why
-//! 0.13.0 is the correct release: for a `0.x` crate Cargo treats the minor position as the major, so
-//! 0.12 -> 0.13 IS the breaking bump. Widening this surface makes it worse; narrowing it (an owned
+//! Together they are why a dependency bump on those crates is BREAKING for consumers, and so always
+//! takes a MINOR release here: for a `0.x` crate Cargo treats the minor position as the major, so
+//! `0.25 -> 0.26` IS the breaking bump. Widening this surface makes it worse; narrowing it (an owned
 //! slot-id newtype, opaque error variants, a local backend trait) is the direction of travel.
 //!
 //! An earlier revision of this paragraph claimed three. Counting by grepping `pub fn` for dependency

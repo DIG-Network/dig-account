@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.25.0"
+version = "0.26.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -37,19 +37,27 @@ coinset-push = ["dep:ureq"]
 # seam (LocalSigner, verify::derive_summary). Only the `client` half is pulled in — dig-account is the
 # key-holding custody side, never the running engine (no tokio runtime / rusqlite / offer builders).
 dig-wallet-backend = { version = "0.31", default-features = false, features = ["client"] }
-dig-session = "0.8"
-# 0.7 is what `dig-social-profile` 0.6 already resolves, so asking for it here UNIFIES this crate's
-# own identity types with the social-profile seam rather than adding a line. A second line (0.6)
-# remains in the tree via dig-wallet-backend 0.29 and no dig-identity type crosses that boundary;
-# it collapses when dig-wallet-backend adopts 0.7 (dig-account#36).
+# ^0.9 and `dig-keystore` ^0.13 MOVE TOGETHER, always. dig-session RE-EXPORTS `KeychainBackend`,
+# so a keystore bumped alone resolves a second dig-keystore line and the trait a backend implements
+# stops being the trait dig-session names — a `MemoryBackend: KeychainBackend` bound that reads as
+# obviously satisfied simply fails. dig-session 0.9.0 is the first release declaring `dig-keystore
+# ^0.13`, which is what makes the pair expressible at all.
+dig-session = "0.9"
+# The single dig-identity line in this tree. Every other dig-* edge here now resolves ^0.7 too, so
+# no dig-identity type can meet a different one across a seam.
 dig-identity = "0.7.1"
-dig-keystore = "0.9"
-# Held at ^0.10, which is what `dig-wallet-backend` 0.29 requires. 0.11 is published and this crate
-# could ask for it, but doing so resolves a SECOND dig-constants line beside the one the money
-# engine already carries rather than upgrading that edge — the same trap the dig-merkle note below
-# records. It moves when dig-wallet-backend moves (dig-account#36).
+dig-keystore = "0.13"
+# The single dig-constants line: dig-session 0.9 and dig-wallet-backend 0.31 both require ^0.11, so
+# asking for it here upgrades that shared edge rather than resolving a second one beside it.
 dig-constants = "0.11"
-dig-ipc-protocol = "0.3"
+# Floor at 0.3.1, which is the first release on chia-bls ^0.36.1. 0.3.0 required ^0.26 and was the
+# ONLY edge in this tree resolving a chia-bls line other than 0.36.1 through a first-party crate —
+# the remaining duplicates are internal to clvmr and chialisp and reach no public signature. The
+# boundary here is opaque byte arrays (`domain::Signature`, `SigningPublicKey` are `[u8; N]`
+# newtypes), so no chia-bls type ever crossed it, but the identity signer VERIFIES with whichever
+# chia-bls line this crate resolves. Keeping that the same line as the money signer's is what stops
+# one set of bytes being verifiable by one signer and not the other.
+dig-ipc-protocol = "0.3.1"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
 # spend bundle; it supplies the funding coin, signs what dig-did reports, and broadcasts.
@@ -68,13 +76,12 @@ dig-did = "0.8"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
-# Floor raised to the version this tree already resolves. The rest of the `dig-*` set is
-# deliberately NOT bumped: dig-keystore 0.10, dig-constants 0.11 and dig-wallet-backend 0.30 each
-# split a dependency into two lines here, because dig-session 0.7.0 — already the latest release —
-# still pins `dig-constants ^0.10` and `dig-keystore ^0.9`. That cascade is owed in dig-session
-# (release-first, CLAUDE.md §4.1), not workaroundable from this crate, and bridging the two lines
-# with a shim is the byte-drift class §4.1 exists to prevent. Verify with
-# `cargo tree -i dig-constants` after dig-session next releases.
+# Floor raised to the version this tree already resolves. HELD at ^0.3.1 deliberately: 0.3.1 is the
+# last release on this crate's chia 0.36.1 family. The published successor ships INTERNALLY SPLIT
+# across two chia lines (DIG-Network/dig-chainsource-interface#5), so adopting it would put two
+# chia-protocol lines behind the one canonical chain-READ seam — the byte-drift class §4.1 exists to
+# prevent, and not bridgeable with a shim from here. It moves when that crate is released
+# single-lined.
 dig-chainsource-interface = "0.3.1"
 # The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
