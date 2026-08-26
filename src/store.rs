@@ -253,6 +253,11 @@ mod tests {
     /// by a write that clobbers and then complains, which is the very failure in question — the
     /// load-bearing assertion is that `ENTROPY_A` still unlocks afterwards, so the refusal happened
     /// INSTEAD of the write rather than after it.
+    ///
+    /// What this does NOT prove is atomicity under real contention — a single-threaded test cannot
+    /// express a race, and this one does not try to. Exclusivity is the BACKEND's property, reported
+    /// by `write_new_exclusivity`: `Atomic` for `FileBackend` and `MemoryBackend`, `BestEffort` for
+    /// `OsKeychainBackend`, where the residual race is open and the host must serialise (SPEC §2.1).
     #[test]
     fn the_write_itself_refuses_an_occupied_key_not_merely_the_pre_check() {
         let ks = store();
