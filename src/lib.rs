@@ -52,6 +52,7 @@ pub mod melt;
 pub mod mint;
 pub mod model;
 pub mod profile_mint;
+pub mod profile_resolve;
 pub mod registry;
 pub mod session;
 pub mod session_residency;
