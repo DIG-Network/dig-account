@@ -303,6 +303,65 @@ it requires an odd-amount `CREATE_COIN` from the DID coin, which a singleton may
 consumer MUST resolve a profile store from its DID, and MUST NOT rely on a launcher-memo scan finding
 one.
 
+#### 2.4.4a `resolve_profile_store` — the resolver (normative)
+
+`profile_resolve::resolve_profile_store(chain, did_launcher_id)` is the resolution §2.4.4 requires. It
+takes a DID launcher id (what a `did:chia:` string decodes to) and answers with a
+`ProfileStoreResolution` or a `ProfileResolveError`.
+
+**The algorithm.** Every step MUST hold:
+
+1. The DID's coin set is `ChainSource::resolve_singleton_lineage(did_launcher_id)` — the canonical,
+   fail-closed forward walk. `Ok(None)` MUST yield `NoIdentitySingleton`. An implementation MUST NOT
+   re-implement the walk; the walk's guards (`require_coin_exists`, the `WalkBounds` hop and
+   wall-clock bounds) are what bound this resolution.
+2. For each coin of that lineage, its `coin_spend` is read and every `CREATE_COIN` recomputed. A
+   `CREATE_COIN(PROFILE_INTERMEDIATE_PUZZLE_HASH, 0)` names a profile launch; the intermediate coin
+   MUST be DERIVED as `Coin(did_coin_id, PROFILE_INTERMEDIATE_PUZZLE_HASH, 0)`.
+3. Each intermediate's own `coin_spend` is read and its single
+   `CREATE_COIN(SINGLETON_LAUNCHER_HASH, 1)` recomputed; the store launcher MUST be DERIVED as
+   `Coin(intermediate_id, SINGLETON_LAUNCHER_HASH, 1)`. An UNSPENT intermediate names no store.
+4. A derived launcher is an answer only while `resolve_singleton_lineage` still resolves it. A melted
+   store, or one whose eve was never minted, MUST drop out.
+
+**Derivation, not recognition (NC-12).** Before a spend is used, its `coin` MUST equal the coin it was
+requested for and its `puzzle_reveal` MUST hash to that coin's `puzzle_hash`; only then may it be
+evaluated. `coin_records_by_parent` MAY be used to pre-filter, and MUST NOT be what produces the store
+id: an index answer is a list the source chose to return, so believing it would make showing one
+person's profile under another person's DID a matter of adding a row.
+
+**Bounds.** The lineage is bounded by the canonical `WalkBounds`. Intermediates are additionally capped
+at `MAX_PROFILE_LAUNCHES_PER_DID` (8); past the cap the scan MUST refuse with `TooManyLaunches` rather
+than answer from a truncated set. Only the DID's own owner can add a launch, so the cap bounds honest
+work rather than a stranger's amplification — but it MUST be stated in the code, or that sentence is an
+assumption about behaviour instead of a property of it.
+
+**Completeness.** The enumeration MUST reach every member of the resolved lineage. A source that serves
+a partial lineage MUST be refused, never reported as an absence — a lost mid-lineage spend would
+otherwise hide every launch after it and read as "this DID has no profile".
+
+**The outcomes are distinct, and refusing is the safe direction.**
+
+| case | result |
+|---|---|
+| exactly one live store | `Resolved { store_launcher_id, did_coin_id }` |
+| none | `NoProfileStore` |
+| two or more | `Ambiguous(ids)` — ascending; an implementation MUST NOT pick one |
+| more than the cap | `Err(TooManyLaunches)` |
+| the DID has no coin on chain | `Err(NoIdentitySingleton)` |
+| a read failed | `Err(ChainUnreachable)` — MUST NOT be reported as `NoProfileStore` |
+| the source's data is internally inconsistent | `Err(Unparseable)` |
+
+Resolving to the WRONG store shows one person's profile under another person's DID; refusing shows a
+reason. Every ambiguity therefore refuses.
+
+**`PROFILE_INTERMEDIATE_PUZZLE_HASH`** is `NftIntermediateLauncherArgs::curry_tree_hash` of the mint's
+own `INTERMEDIATE_MINT_NUMBER` / `INTERMEDIATE_MINT_TOTAL` (§6B.1). It is a DISCRIMINATOR, not an
+authorization — anyone may pay a coin at that puzzle hash, and only the DID's owner can create one whose
+parent is that DID's coin. It MUST be pinned by a test against the intermediate coin a real mint puts on
+chain: nothing else notices if the resolver's constant and the minter's curry stop describing the same
+coin, and the symptom would be that every profile still mints and none ever resolves.
+
 #### 2.4.5 The end of a profile (normative)
 
 A profile ENDS when both of its singletons — the DID and the dig-store — have been melted and both melts
