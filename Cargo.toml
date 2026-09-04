@@ -76,10 +76,11 @@ dig-did = "0.8"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
-# Floor 0.3.3, the FIRST single-lined release. 0.3.1 was HELD because it shipped INTERNALLY SPLIT
-# (`chia-sdk-driver ^0.34` beside `chia-protocol ^0.36.1` — DIG-Network/dig-chainsource-interface#5),
-# and that hold's own stated release condition — "it moves when that crate is released single-lined"
-# — was met on 2026-08-26: 0.3.3 requires `chia-sdk-driver ^0.36.0`.
+# Floor 0.3.3, the CURRENT release (§2.4b). The first SINGLE-LINED one is 0.3.2: 0.3.1 was HELD
+# because it shipped INTERNALLY SPLIT (`chia-sdk-driver ^0.34` beside `chia-protocol ^0.36.1` —
+# DIG-Network/dig-chainsource-interface#5), and that hold's own stated release condition — "it moves
+# when that crate is released single-lined" — was met on 2026-08-26, when 0.3.2 moved the pin to
+# `chia-sdk-driver ^0.36.0`. dig-app has been on 0.3.2 since; dig-account was the straggler.
 #
 # The floor is a HARD co-requirement of the chia-query dev-dep below, not §2.4b hygiene. 0.3.1's
 # split sits behind its `lineage-walk` feature, so it stayed invisible while nothing enabled it;
