@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.26.1"
+version = "0.26.2"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -76,13 +76,19 @@ dig-did = "0.8"
 # The ONE canonical chain-READ seam. The mint reads its funding coins and its on-chain mint evidence
 # through this trait, so dig-account depends on no concrete provider and can never be handed a
 # bespoke reader that lies about confirmation.
-# Floor raised to the version this tree already resolves. HELD at ^0.3.1 deliberately: 0.3.1 is the
-# last release on this crate's chia 0.36.1 family. The published successor ships INTERNALLY SPLIT
-# across two chia lines (DIG-Network/dig-chainsource-interface#5), so adopting it would put two
-# chia-protocol lines behind the one canonical chain-READ seam — the byte-drift class §4.1 exists to
-# prevent, and not bridgeable with a shim from here. It moves when that crate is released
-# single-lined.
-dig-chainsource-interface = "0.3.1"
+# Floor 0.3.3, the FIRST single-lined release. 0.3.1 was HELD because it shipped INTERNALLY SPLIT
+# (`chia-sdk-driver ^0.34` beside `chia-protocol ^0.36.1` — DIG-Network/dig-chainsource-interface#5),
+# and that hold's own stated release condition — "it moves when that crate is released single-lined"
+# — was met on 2026-08-26: 0.3.3 requires `chia-sdk-driver ^0.36.0`.
+#
+# The floor is a HARD co-requirement of the chia-query dev-dep below, not §2.4b hygiene. 0.3.1's
+# split sits behind its `lineage-walk` feature, so it stayed invisible while nothing enabled it;
+# chia-query 0.24 declares that feature, and feature unification turns it on for the ONE shared
+# instance in this graph. Resolving 0.3.1 there puts chia-sdk-{derive,driver,signer,types} 0.34
+# beside this crate's own 0.36 under `cfg(test)` — measured, not predicted — which is precisely where
+# the mainnet mint harness proves its spends. A caret of "0.3.1" permits that resolution, so the
+# floor is STATED rather than left to whatever the lock happens to hold.
+dig-chainsource-interface = "0.3.3"
 # The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.
@@ -164,10 +170,23 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # Test-only: the ONLY published ChainSource impl that serves `resolve_singleton_lineage`, which the
 # store half needs via `dig_did::walk_did_lineage_to_tip`. Used by the ignored mainnet harness.
 #
-# Held at ^0.8, the first line on chia-wallet-sdk 0.34. 0.7 pinned ^0.33, and because 0.33 and 0.34
-# are incompatible 0.x minors, it resolved a THIRD chia-wallet-sdk alongside the crate's own — under
-# `cfg(test)`, which is precisely where the mainnet mint harness proves its spends.
-chia-query = "0.16"
+# Tracks chia-query's CURRENT line rather than a frozen one, because this harness is where the
+# mint's chain reads are proven and a stale reader proves them against retired semantics. Two
+# behaviour changes since 0.16 land HERE and nowhere else in this crate, since `src/` is
+# provider-agnostic and reads through whatever `ChainSource` the consumer injects:
+#   - 0.22 made `coin_records_by_puzzle_hash` a fail-closed wrapper over a graded twin, so it can now
+#     answer `SourcesDisagree`/`UncorroboratedPresence` where it previously returned a silently SHORT
+#     set. Both map to `ChainSourceError::Transport`, which `select_funding_coin` and
+#     `select_input_coins` already render as `ChainUnreachable`, never `InsufficientFunds` — the
+#     distinction DEVELOPMENT_LOG.md records as missing is exactly the one this restores.
+#   - 0.23 delegates the singleton walk to
+#     `dig_chainsource_interface::resolve_singleton_lineage_via_walk`, which requires every derived
+#     successor to have a coin record. A tip the chain never created is now a refusal, not an answer;
+#     `DidConfirmedStoreNotLaunched` therefore means the store is genuinely unlaunched.
+# The signature the harness uses is unchanged across the whole range: `ChiaQuery::new(cfg)` is still
+# async, `ChiaQueryProvider::new(Arc<ChiaQuery>, Handle, ProviderInfo)` still takes three arguments,
+# and `provider_registry::interface` is still the `dig_chainsource_interface` re-export.
+chia-query = "0.24"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
