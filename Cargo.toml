@@ -89,7 +89,14 @@ dig-did = "0.8"
 # beside this crate's own 0.36 under `cfg(test)` — measured, not predicted — which is precisely where
 # the mainnet mint harness proves its spends. A caret of "0.3.1" permits that resolution, so the
 # floor is STATED rather than left to whatever the lock happens to hold.
-dig-chainsource-interface = "0.3.3"
+#
+# `lineage-walk` is enabled because `profile_resolve` reuses the walk's own DoS bounds —
+# `MAX_REVEAL_EXPANDED_BYTES` and `MAX_HOP_CLVM_COST` — rather than restating two numbers that could
+# drift away from the walk this crate's reads already go through. It pulls in no crate this tree does
+# not already resolve (chia-puzzle-types, chia-sdk-*, clvm-*, clvmr), and it makes the 0.3.3 floor
+# above LOAD-BEARING at build time rather than only under `cfg(test)`: the split that 0.3.1 shipped
+# sat behind exactly this feature.
+dig-chainsource-interface = { version = "0.3.3", features = ["lineage-walk"] }
 # The canonical dig-store LAUNCH driver. dig-account never hand-rolls a store launch: the launcher,
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.

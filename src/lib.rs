@@ -93,6 +93,10 @@ pub use mint::{
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;
+pub use profile_resolve::{
+    resolve_profile_store, ProfileResolveError, ProfileStoreResolution,
+    MAX_PROFILE_LAUNCHES_PER_DID, PROFILE_INTERMEDIATE_PUZZLE_HASH,
+};
 pub use registry::{
     ActiveProfile, ActiveSwitch, ConfirmedStoreRecord, MintStage, MintedDidRecord,
     PendingMintRecord, PendingStoreLaunchRecord, ProfileAnchor, ProfileEnd, ProfileEndOutcome,
