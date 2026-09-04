@@ -187,7 +187,19 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # The signature the harness uses is unchanged across the whole range: `ChiaQuery::new(cfg)` is still
 # async, `ChiaQueryProvider::new(Arc<ChiaQuery>, Handle, ProviderInfo)` still takes three arguments,
 # and `provider_registry::interface` is still the `dig_chainsource_interface` re-export.
-chia-query = "0.24"
+#
+# A FLOOR of 0.24.1, deliberately, not `"0.24"` and not `= "0.24.1"`. 0.24.0 shipped a HIGH defect
+# (DIG-Network/chia-query#59): the light-client drive loop wedges on a superseded session and the
+# coin-state cache freezes with `needs_rearm()` never firing, so a consumer cannot tell "nothing
+# happened" from "wedged on a dead session". `"0.24"` would still admit that release; `= "0.24.1"`
+# would lock out the NEXT security patch. `>=0.24.1, <0.25.0` makes the defective release
+# unresolvable while later patches keep flowing — the same shape as the dig-chainsource-interface
+# floor above.
+#
+# The graph guard in `tests/one_chia_line_in_the_lock.rs` would catch a future 0.24.x that re-split
+# the dependency graph. It would NOT catch another #59-class runtime wedge, which is why the floor
+# carries that half rather than the caret being trusted alone.
+chia-query = "0.24.1"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
