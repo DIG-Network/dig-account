@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.26.2"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1467,9 +1467,9 @@ dependencies = [
 
 [[package]]
 name = "dig-keystore"
-version = "0.13.1"
+version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0d27e7884b62452ca1a13c5d7a5c1e9fac629a0f45b534b9bece5b2bd9cbe24"
+checksum = "ed3a3021bd5d3a648c9ecf4c8308aa4dd8f5758303d2f4ed63a482116d2bd2a1"
 dependencies = [
  "aes-gcm",
  "argon2",

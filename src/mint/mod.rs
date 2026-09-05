@@ -53,3 +53,13 @@ pub use profile::ProfileMintStatus;
 pub use seed::ProfileSeed;
 pub use status::MintStatus;
 pub use store_evidence::{ConfirmedStore, PendingStoreLaunch};
+// The launch SHAPE, shared with the resolver that reads it back off chain
+// ([`crate::profile_resolve`]). Crate-internal: these are the mint's own composition, not a public
+// contract — what the outside world gets is the derived
+// [`PROFILE_INTERMEDIATE_PUZZLE_HASH`](crate::profile_resolve::PROFILE_INTERMEDIATE_PUZZLE_HASH),
+// which is golden-tested against a real mint.
+pub(crate) use store_launch::{INTERMEDIATE_AMOUNT, LAUNCHER_AMOUNT};
+// The curry inputs behind that hash. Test-only: production code uses the derived constant, and the
+// tests are what hold the two together.
+#[cfg(test)]
+pub(crate) use store_launch::{INTERMEDIATE_MINT_NUMBER, INTERMEDIATE_MINT_TOTAL};

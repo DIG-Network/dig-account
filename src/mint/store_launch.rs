@@ -49,20 +49,24 @@ use crate::mint::error::{MintError, MintResult};
 use crate::mint::store_evidence::PendingStoreLaunch;
 
 /// The launcher singleton's amount. Odd by consensus requirement; one mojo by convention.
-const LAUNCHER_AMOUNT: u64 = 1;
+///
+/// `pub(crate)` so [`crate::profile_resolve`] recognises the launch by the SAME value the mint
+/// emits. A resolver that restated it would be a rival constant, silently right until the day the
+/// mint's shape moved.
+pub(crate) const LAUNCHER_AMOUNT: u64 = 1;
 
 /// The amount of the intermediate coin the DID emits. **EVEN, and that is the whole point** — an
 /// odd-amount output from a singleton is refused at build time (see the module docs).
-const INTERMEDIATE_AMOUNT: u64 = 0;
+pub(crate) const INTERMEDIATE_AMOUNT: u64 = 0;
 
 /// `mint_number` — the intermediate's index within its parent spend. A profile mint emits exactly
 /// one intermediate per DID spend, so it is always the first.
-const INTERMEDIATE_MINT_NUMBER: usize = 0;
+pub(crate) const INTERMEDIATE_MINT_NUMBER: usize = 0;
 
 /// `mint_total` — how many intermediates that parent spend emits. One. Both this and
 /// [`INTERMEDIATE_MINT_NUMBER`] are curried into the intermediate's puzzle, so they determine its
 /// coin id and are part of the launch's identity rather than cosmetic bookkeeping.
-const INTERMEDIATE_MINT_TOTAL: usize = 1;
+pub(crate) const INTERMEDIATE_MINT_TOTAL: usize = 1;
 
 /// A SIGNED store-launch bundle and what to watch for on chain.
 pub(super) struct StoreLaunchBundle {

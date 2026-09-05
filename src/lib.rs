@@ -52,6 +52,7 @@ pub mod melt;
 pub mod mint;
 pub mod model;
 pub mod profile_mint;
+pub mod profile_resolve;
 pub mod registry;
 pub mod session;
 pub mod session_residency;
@@ -92,6 +93,10 @@ pub use mint::{
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;
+pub use profile_resolve::{
+    resolve_profile_store, ProfileResolveError, ProfileStoreResolution,
+    MAX_PROFILE_LAUNCHES_PER_DID, PROFILE_INTERMEDIATE_PUZZLE_HASH,
+};
 pub use registry::{
     ActiveProfile, ActiveSwitch, ConfirmedStoreRecord, MintStage, MintedDidRecord,
     PendingMintRecord, PendingStoreLaunchRecord, ProfileAnchor, ProfileEnd, ProfileEndOutcome,

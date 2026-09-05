@@ -29,18 +29,7 @@ use dig_social_profile::slot::standard;
 
 mod common;
 
-use common::{simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
-
-/// An EMPTY, freshly-allocated coin-reservation set, for tests that are not about reservations.
-///
-/// Fresh per call rather than shared, so one test cannot silently change another's coin selection.
-/// The store is leaked to give the borrow a `'static` lifetime; a few dozen bytes, in tests only.
-fn free() -> dig_account::wallet::reservation::CoinReservations<'static> {
-    let store: &'static dig_account::wallet::reservation::LocalReservations = Box::leak(Box::new(
-        dig_account::wallet::reservation::LocalReservations::new(),
-    ));
-    store.reservations()
-}
+use common::{free, simulator_network, unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
 /// Enough to fund two whole profile mints and their change with room to spare.
 const FUNDING: u64 = 10_000_000;
