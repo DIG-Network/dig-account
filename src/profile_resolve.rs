@@ -90,7 +90,7 @@ use crate::mint::{INTERMEDIATE_AMOUNT, LAUNCHER_AMOUNT};
 /// `NftIntermediateLauncherArgs::curry_tree_hash` is not a `const fn`, so the alternative is a lazily
 /// initialised static. A literal is better than that here for a reason that outlives the ergonomics:
 /// it makes the value reviewable in the diff, and it turns the equivalence into a TEST rather than a
-/// tautology. [`the_intermediate_puzzle_hash_is_the_minters_own`] pins it to the minter's curry, and
+/// tautology. `the_intermediate_puzzle_hash_is_the_minters_own` pins it to the minter's curry, and
 /// `tests/profile_resolve_simulator.rs` pins it to the intermediate coin a real mint puts on a
 /// consensus validator. A `LazyLock` around the same call could never fail either check, because it
 /// would BE the thing being checked.
@@ -701,9 +701,10 @@ mod tests {
         }
 
         chain.remember(coin);
-        chain
-            .lineages
-            .insert(did_launcher_id, SingletonLineage::new(coin.coin_id(), members));
+        chain.lineages.insert(
+            did_launcher_id,
+            SingletonLineage::new(coin.coin_id(), members),
+        );
 
         Ok(Fixture {
             chain,
@@ -760,8 +761,7 @@ mod tests {
     /// published, which is exactly the kind of confident wrong answer this module exists to avoid.
     #[test]
     fn more_launches_than_the_cap_are_refused_outright() -> anyhow::Result<()> {
-        let fixture =
-            did_lineage(&[DidSpend::LaunchesAProfile; MAX_PROFILE_LAUNCHES_PER_DID + 1])?;
+        let fixture = did_lineage(&[DidSpend::LaunchesAProfile; MAX_PROFILE_LAUNCHES_PER_DID + 1])?;
 
         let error = resolve_profile_store(&fixture.chain, fixture.did_launcher_id)
             .expect_err("past the cap the scan stops");
@@ -784,7 +784,9 @@ mod tests {
         let resolved = resolve_profile_store(&fixture.chain, fixture.did_launcher_id)?;
 
         let ProfileStoreResolution::Ambiguous(ids) = resolved else {
-            panic!("the cap's worth of launches is still an answerable ambiguity; got {resolved:?}");
+            panic!(
+                "the cap's worth of launches is still an answerable ambiguity; got {resolved:?}"
+            );
         };
         assert_eq!(ids.len(), MAX_PROFILE_LAUNCHES_PER_DID);
         Ok(())
@@ -955,8 +957,7 @@ mod tests {
         }
 
         assert_eq!(
-            resolve_profile_store(&Silent, Bytes32::new([7; 32]))
-                .expect_err("nothing can be read"),
+            resolve_profile_store(&Silent, Bytes32::new([7; 32])).expect_err("nothing can be read"),
             ProfileResolveError::ChainUnreachable("no node answered".into())
         );
     }
@@ -981,10 +982,14 @@ mod tests {
 
     /// The cap is a real bound: zero would refuse every DID, and an unbounded one would leave the
     /// scan's cost set by the subject of the lookup.
+    ///
+    /// Asserted in `const` blocks, so a cap outside the band fails the BUILD rather than only this
+    /// test. The bound is a property of the constant, and a property of a constant should not be
+    /// checkable only by remembering to run something.
     #[test]
     fn the_launch_cap_is_bounded_and_admits_a_real_profile() {
-        assert!(MAX_PROFILE_LAUNCHES_PER_DID >= 1);
-        assert!(MAX_PROFILE_LAUNCHES_PER_DID <= 64);
+        const { assert!(MAX_PROFILE_LAUNCHES_PER_DID >= 1) };
+        const { assert!(MAX_PROFILE_LAUNCHES_PER_DID <= 64) };
     }
 
     /// A failed read is a failed read. This is the one projection every chain call in this module

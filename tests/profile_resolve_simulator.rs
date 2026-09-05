@@ -90,7 +90,12 @@ fn a_confirmed_profile(
     let ProfileMintStatus::Confirmed { did, store } = status else {
         panic!("both halves were farmed and buried, so the mint is confirmed; got {status:?}");
     };
-    Ok((account, did.launcher_id(), store.launcher_id(), store.did_coin_id()))
+    Ok((
+        account,
+        did.launcher_id(),
+        store.launcher_id(),
+        store.did_coin_id(),
+    ))
 }
 
 /// **The round trip.** A profile minted by the real minter resolves back to its own store, from
@@ -177,7 +182,9 @@ fn a_did_with_no_store_launch_reports_an_absence() -> anyhow::Result<()> {
 
     let status = minter.profile_mint_status(&registry, ProfileIx::ROOT, &chain)?;
     let ProfileMintStatus::DidConfirmedStoreNotLaunched(did) = status else {
-        panic!("the DID bundle was farmed and buried and the store was never launched; got {status:?}");
+        panic!(
+            "the DID bundle was farmed and buried and the store was never launched; got {status:?}"
+        );
     };
     let did_launcher_id = did.launcher_id();
 
@@ -211,8 +218,7 @@ fn a_did_that_was_never_launched_has_no_identity_singleton() -> anyhow::Result<(
 #[test]
 fn an_unreachable_chain_is_never_reported_as_an_absence() -> anyhow::Result<()> {
     let mut chain = SimulatorChain::new();
-    let (_account, did_launcher_id, store_launcher_id, did_coin_id) =
-        a_confirmed_profile(&chain)?;
+    let (_account, did_launcher_id, store_launcher_id, did_coin_id) = a_confirmed_profile(&chain)?;
     assert_eq!(
         resolve_profile_store(&chain, did_launcher_id)?,
         ProfileStoreResolution::Resolved {
