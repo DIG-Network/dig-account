@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.27.0] - 2026-09-05
+
+### Features
+- **profile_resolve:** Resolve a profile store from its DID by lineage (#56)
+
 ## [0.26.2] - 2026-09-04
 
 ### Bug Fixes
