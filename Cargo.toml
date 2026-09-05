@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.26.2"
+version = "0.27.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -49,6 +49,18 @@ dig-identity = "0.7.1"
 dig-keystore = "0.13"
 # The single dig-constants line: dig-session 0.9 and dig-wallet-backend 0.31 both require ^0.11, so
 # asking for it here upgrades that shared edge rather than resolving a second one beside it.
+#
+# HELD at ^0.11 DELIBERATELY, against §2.4b's "bring dig-* to latest". 0.13.1 is published, and
+# measured from the index on 2026-09-04: dig-session 0.9.1 declares `dig-constants ^0.11.1` and
+# dig-wallet-backend 0.31.1 declares `^0.11`. Neither has adopted 0.13. So bumping the caret HERE
+# would not upgrade that shared edge — it would resolve a SECOND dig-constants line beside it, one
+# 0.13 for this crate and one 0.11 for the session and money seams it hands values to. That is the
+# exact duplication this comment's first sentence exists to prevent, and §2.4b names it outright:
+# do not bump a dep whose new version drags in an old line; verify from the resolved lock.
+#
+# The order is release-first (§4.1): dig-session and dig-wallet-backend adopt ^0.13, and only then
+# does this line move. Tracked as a named child rather than folded in here, because that cascade is
+# two other repos wide and would dwarf this crate's change.
 dig-constants = "0.11"
 # Floor at 0.3.1, which is the first release on chia-bls ^0.36.1. 0.3.0 required ^0.26 and was the
 # ONLY edge in this tree resolving a chia-bls line other than 0.36.1 through a first-party crate —
