@@ -4155,7 +4155,7 @@ mod tests {
         match refused {
             Err(SimulatorError::Validation(ErrorCode::AssertCoinAnnouncementFailed)) => {}
             other => panic!(
-                "the orphaned subset must be refused for the UNSATISFIED ANNOUNCEMENT specifically,                  not for some other reason that would hide a missing binding: {other:?}"
+                "the orphaned subset must be refused for the UNSATISFIED ANNOUNCEMENT specifically, not for some other reason that would hide a missing binding: {other:?}"
             ),
         }
 
