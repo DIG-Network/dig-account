@@ -354,7 +354,7 @@ mod tests {
     /// STANDARD Chia wallet derives from it at wallet index 0. Both frozen literals, produced
     /// independently via `chia-wallet-sdk` — never computed live on both sides, or a dependency bump
     /// could move them together and mask a regression (dig_ecosystem #1759).
-    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon abandon          abandon abandon abandon abandon abandon abandon abandon art";
+    const TEST_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
     const TEST_ADDRESS_0: &str = "xch16grurcglcwcv6arjarr720yd9wqhp9gkx3k8h25lhwg8pl7vl6ysuax0gy";
 
     /// A SECOND account with unrelated entropy. [`TEST_PHRASE`] is all-ZERO entropy, which makes it
@@ -362,7 +362,7 @@ mod tests {
     /// derived from zeros would look correct. Every "the right account" assertion below therefore uses
     /// two accounts and a truthful control.
     const OTHER_PHRASE: &str =
-        "fog spot notable regret pizza coffee harvest ensure fog spot notable regret          pizza coffee harvest ensure fog spot notable regret pizza coffee harvest equal";
+        "fog spot notable regret pizza coffee harvest ensure fog spot notable regret pizza coffee harvest ensure fog spot notable regret pizza coffee harvest equal";
     const OTHER_ADDRESS_0: &str = "xch1vpxzuu6aqfu790qcrcppcr2gmju4f5tpuuznuv2lx3g79v2jxc7qxttpzt";
 
     fn restore(phrase: &str, id: &str) -> UnlockedAccount {

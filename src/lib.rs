@@ -44,6 +44,7 @@
 pub mod auth;
 pub mod chain_confirm;
 pub mod constants;
+mod continuation_guard;
 pub mod edit;
 pub mod error;
 pub mod id;

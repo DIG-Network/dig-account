@@ -396,7 +396,7 @@ impl PolicyAuthorizer {
         // i.e. hand allowance back under exactly the load that produced the pressure.
         if recent.len() >= MAX_LEDGER_ENTRIES {
             return Err(AccountError::PolicyIndeterminate(format!(
-                "the rolling auto-send ledger already holds {MAX_LEDGER_ENTRIES} approvals in this                  window, so the cap cannot be measured over any further spend"
+                "the rolling auto-send ledger already holds {MAX_LEDGER_ENTRIES} approvals in this window, so the cap cannot be measured over any further spend"
             )));
         }
 
@@ -1703,7 +1703,7 @@ mod tests {
         assert_eq!(
             summary.tier,
             SpendTier::Confirm,
-            "a spend moving a non-native asset is Confirm by rule, not by accident of where a              filter sits: {summary:?}"
+            "a spend moving a non-native asset is Confirm by rule, not by accident of where a filter sits: {summary:?}"
         );
 
         let pending = match gate.authorize_op(&coin_spends, SpendOpClass::Tip) {
@@ -1722,7 +1722,7 @@ mod tests {
             .expect("the ceremony must show the human WHICH asset is leaving");
         assert_eq!(
             paid.amount_mojos, 1_000_000_000,
-            "and HOW MUCH of it — an escalation to an uninformed prompt would be worse than a              refusal: {:?}",
+            "and HOW MUCH of it — an escalation to an uninformed prompt would be worse than a refusal: {:?}",
             pending.summary()
         );
     }
@@ -2278,7 +2278,7 @@ mod tests {
 
         assert!(
             matches!(&err, AccountError::Spend(_)),
-            "an unaccountable spend must be refused at the derivation, before any approval or              signature exists: {err}"
+            "an unaccountable spend must be refused at the derivation, before any approval or signature exists: {err}"
         );
     }
 
@@ -2305,7 +2305,7 @@ mod tests {
         let ruling = gate.authorize_op(&at_the_bound, SpendOpClass::Tip);
         assert!(
             !matches!(&ruling, Err(AccountError::Spend(_))),
-            "a spend whose outputs sum to exactly u64::MAX is accountable and must not be refused              as though it overflowed"
+            "a spend whose outputs sum to exactly u64::MAX is accountable and must not be refused as though it overflowed"
         );
         let _ = pending(ruling);
     }
@@ -2351,7 +2351,7 @@ mod tests {
         assert_ne!(
             std::mem::discriminant(&structural),
             std::mem::discriminant(&human),
-            "the wire mapping is a function only if these are different values; collapsing them              leaves a host unable to tell 'you said no' from 'the rules say no'"
+            "the wire mapping is a function only if these are different values; collapsing them leaves a host unable to tell 'you said no' from 'the rules say no'"
         );
     }
 }
