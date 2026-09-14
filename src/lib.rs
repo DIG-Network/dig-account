@@ -92,6 +92,10 @@ pub use mint::{
     PushTransport, SpendPublisher, COINSET_MAINNET_PUSH_URL, MAX_MINT_FEE_MOJOS,
     MIN_CONFIRMATION_DEPTH,
 };
+pub use mint::reward_distributor::{
+    begin_reward_distributor_mint, MintedRewardDistributor, RewardDistributorMintRequest,
+    OFFER_XCH_AMOUNT,
+};
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;
 pub use profile_resolve::{
