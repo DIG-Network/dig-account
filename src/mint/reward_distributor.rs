@@ -102,7 +102,7 @@ pub struct RewardDistributorMintRequest {
 /// literal: the only way to obtain one is [`begin_reward_distributor_mint`], which constructs it
 /// only after the signing loop ran to completion over every [`RequiredSignature`] drained from its
 /// own spends and the resulting aggregate was VERIFIED against those same `(public_key, message)`
-/// pairs, the launch's security key among them. See [`verify_aggregate_discharges`] for exactly
+/// pairs, the launch's security key among them. See `verify_aggregate_discharges` for exactly
 /// what that verification does and does not establish.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -205,8 +205,8 @@ fn required_xch(fee: u64) -> Option<u64> {
 ///
 /// Both coins are re-checked against what this crate derives from the wallet key — the funding
 /// coin's puzzle hash and the CAT's p2 puzzle hash — at the top, before a single spend exists. That
-/// is the same guard [`store_launch`](super::store_launch) opens with, and for the same reason:
-/// [`gate_reward_distributor_launch`] identifies the two permitted pre-existing coins by ID, so it
+/// is the same guard `store_launch` opens with, and for the same reason:
+/// `gate_reward_distributor_launch` identifies the two permitted pre-existing coins by ID, so it
 /// is only as strong as the ids it is handed. Checking ownership here is what stops the gate
 /// silently becoming a comparison of the bundle to itself.
 fn build_and_sign_reward_distributor_launch(
@@ -988,6 +988,11 @@ mod mutation_tests {
         .map(|omission| bundle_without(&minted, &wallet, &request, omission).1)
         .sum();
 
+        // `dropped == total` proves a partition only because the three omissions' predicates are
+        // mutually exclusive: `SecurityCoin` selects by public key, `FunderXch`/`FunderCat` select
+        // by the wallet key ANDed with a disjoint 32-byte coin-id prefix -- so no requirement is
+        // counted by more than one omission, and a sum equal to `total` means every requirement
+        // was counted by exactly one.
         assert_eq!(
             dropped, total,
             "the mutation suite covers {dropped} of {total} requirements; the rest are proven load-bearing by nothing"
