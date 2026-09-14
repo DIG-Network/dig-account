@@ -71,7 +71,20 @@ fn dig_reserve_asset_id() -> Bytes32 {
 /// received it, it did not mint it, and its CAT spends never run the TAIL. A test CAT with a
 /// TEST asset id would instead be modelling a distributor DIG clients would never recognise.
 fn wallet_owned_dig_cat(sim: &mut Simulator, wallet: &WalletKey, amount: u64) -> Cat {
-    let asset_id = dig_reserve_asset_id();
+    wallet_owned_cat(sim, wallet, dig_reserve_asset_id(), amount)
+}
+
+/// A CAT of ANY asset id, legitimately owned by `wallet` and present in the simulator.
+///
+/// The $DIG fixture is one instance of this. Having the general form is what makes a wrong-asset
+/// request expressible at all: every other fixture in this file derives its asset id FROM the
+/// production constants builder, so the wrong-asset path is structurally unreachable from them.
+fn wallet_owned_cat(
+    sim: &mut Simulator,
+    wallet: &WalletKey,
+    asset_id: Bytes32,
+    amount: u64,
+) -> Cat {
     let inner_puzzle_hash = wallet.puzzle_hash();
     let cat_puzzle_hash: Bytes32 =
         CatArgs::curry_tree_hash(asset_id, inner_puzzle_hash.into()).into();
@@ -292,4 +305,50 @@ fn the_change_coin_is_what_the_funding_coin_did_not_spend() {
         ),
         "the change coin must be exactly what the funding coin did not spend"
     );
+}
+
+/// An arbitrary NON-$DIG asset id: a value the production constants builder never produces.
+const OTHER_ASSET_ID: Bytes32 = Bytes32::new([0xC7; 32]);
+
+/// A CAT the wallet legitimately owns but which is NOT $DIG is refused BY THIS SEAM.
+///
+/// Measured against the unmodified seam first: a wrong-asset CAT already failed, three crates down,
+/// as `MintError::Build("distributor launch: chia driver error: custom driver error: Could not find
+/// required CAT in offer")` — `chia-sdk-driver` looks the reserve CAT up by the hardcoded $DIG asset
+/// id, so no bundle was ever built and nothing was ever signed. That is a real safety property, but
+/// it is a transitive crate's internal lookup behaviour, held at a caret range and one `cargo update`
+/// from moving, and it names the driver's problem rather than the caller's.
+///
+/// So this asserts the refusal is the SEAM'S OWN, by message. If the guard in
+/// `build_and_sign_reward_distributor_launch` were deleted, this test goes red on the variant
+/// (`Build`, not `Refused`) even though the mint would still, today, produce no bundle.
+#[test]
+fn a_non_dig_cat_is_refused() {
+    let ctx = &mut SpendContext::new();
+    let mut fixture = fixture(ctx, FUNDING_MOJOS);
+    let other_cat = wallet_owned_cat(
+        &mut fixture.sim,
+        &fixture.wallet,
+        OTHER_ASSET_ID,
+        RESERVE_BASE_UNITS,
+    );
+
+    let mut request = request(&fixture);
+    request.reward_cat = other_cat;
+    assert_eq!(
+        request.reward_cat.info.p2_puzzle_hash,
+        fixture.wallet.puzzle_hash(),
+        "the wrong-asset CAT must be one the wallet genuinely owns, or this tests the p2 guard"
+    );
+
+    let Err(error) =
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS)
+    else {
+        panic!("a non-$DIG CAT must not be locked into a DIG distributor's reserve");
+    };
+    assert!(
+        matches!(error, MintError::Refused(_)),
+        "the refusal must be this seam's own, not a transitive crate build failure: {error:?}"
+    );
+    assert!(error.to_string().contains("not $DIG"), "{error}");
 }

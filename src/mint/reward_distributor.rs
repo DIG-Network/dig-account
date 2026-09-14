@@ -162,6 +162,7 @@ impl MintedRewardDistributor {
 /// # Errors
 ///
 /// - [`MintError::Refused`] if the funding coin or the reward CAT is not this wallet's, if the
+///   reward CAT is not the $DIG asset the distributor's reserve requires, if the
 ///   gate finds a requirement this account must not sign, or if the bundle spends a pre-existing
 ///   coin the mint did not name.
 /// - [`MintError::InsufficientFunds`] if the funding coin cannot cover the offer mojo, the manager
@@ -265,10 +266,30 @@ fn build_and_sign_reward_distributor_launch(
         .spend(&mut ctx, request.funding, funding_conditions)
         .map_err(|e| MintError::Build(format!("funding spend: {e}")))?;
 
-    // Step 3: the whole reward CAT to the settlement puzzle. This is the offer's CAT half.
+    // Step 3: the distributor's constants table, built here rather than at its point of use so the
+    // reserve asset id is known BEFORE the reward CAT is spent into the settlement puzzle.
+    let constants = dig_distributor_constants(
+        manager.distributor_launch_terms(request.distributor_epoch_seconds),
+        wallet_puzzle_hash,
+    )
+    .map_err(|e| MintError::Build(format!("distributor constants: {e}")))?;
+
+    // A distributor's reserve is $DIG or it is not a DIG distributor. Today a wrong-asset CAT also
+    // fails three crates down, inside `chia-sdk-driver`'s offer lookup ("Could not find required
+    // CAT in offer") — but that is a property of a transitive crate's internals, one `cargo update`
+    // from not holding, and it names the driver's problem rather than the caller's. The refusal is
+    // stated here, by this seam, in the caller's own terms.
+    if request.reward_cat.info.asset_id != constants.reserve_asset_id {
+        return Err(MintError::Refused(
+            "the reward CAT is not $DIG; a DIG reward distributor's reserve is the $DIG asset, and locking any other CAT into one would strand it there"
+                .into(),
+        ));
+    }
+
+    // Step 4: the whole reward CAT to the settlement puzzle. This is the offer's CAT half.
     spend_reward_cat_into_settlement(&mut ctx, wallet, request.reward_cat)?;
 
-    // Step 4: split the two offer spends out of the context and put everything else back.
+    // Step 5: split the two offer spends out of the context and put everything else back.
     //
     // This is the one place the context is drained mid-build, and it is unavoidable: `Offer` is
     // constructed from CoinSpends, which only a drain produces. The spends go straight back into
@@ -302,13 +323,7 @@ fn build_and_sign_reward_distributor_launch(
     )
     .map_err(|e| MintError::Build(format!("launch offer: {e}")))?;
 
-    // Step 5: the distributor itself.
-    let constants = dig_distributor_constants(
-        manager.distributor_launch_terms(request.distributor_epoch_seconds),
-        wallet_puzzle_hash,
-    )
-    .map_err(|e| MintError::Build(format!("distributor constants: {e}")))?;
-
+    // Step 6: the distributor itself.
     let launched = launch_dig_distributor(
         &mut ctx,
         &offer,
