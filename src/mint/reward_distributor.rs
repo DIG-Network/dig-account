@@ -95,9 +95,12 @@ pub struct RewardDistributorMintRequest {
 ///
 /// Every field is private, there is no `Default`, no public constructor and no public struct
 /// literal: the only way to obtain one is [`begin_reward_distributor_mint`], which constructs it
-/// after every [`RequiredSignature`] in the drained spends has been discharged. An incomplete
-/// bundle therefore has no representation — "is the producer guarded" and "can its guard be forged"
-/// are different questions, and this type answers both.
+/// only after the aggregate it carries has been VERIFIED against the `(public_key, message)` pairs
+/// of every [`RequiredSignature`] drained from its own spends, the launch's security key among
+/// them. "Discharged every requirement the loop enumerated" would be the weaker claim, and it is
+/// the one an exhausted loop actually supports; this type's guarantee is the verification. An
+/// incomplete bundle therefore has no representation — "is the producer guarded" and "can its guard
+/// be forged" are different questions, and this type answers both.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct MintedRewardDistributor {
@@ -356,6 +359,7 @@ fn build_and_sign_reward_distributor_launch(
     // key. Adding both would aggregate one signature twice, and a doubled BLS signature does not
     // verify — the bundle would be rejected on chain while looking more complete, not less.
     let mut signature = chia_bls::Signature::default();
+    let mut signed = Vec::with_capacity(required_signatures.len());
     for requirement in &required_signatures {
         let RequiredSignature::Bls(bls) = requirement else {
             // Unreachable: the gate refuses a non-BLS requirement before any signing.
@@ -374,8 +378,12 @@ fn build_and_sign_reward_distributor_launch(
                 "a signature requirement under a key this mint cannot produce".into(),
             ));
         };
-        signature += &chia_bls::sign(secret_key, bls.message());
+        let message = bls.message();
+        signature += &chia_bls::sign(secret_key, &message);
+        signed.push((bls.public_key, message));
     }
+
+    verify_aggregate_discharges(&signature, &signed, security_public_key)?;
 
     Ok(MintedRewardDistributor {
         bundle: SpendBundle::new(coin_spends, signature),
@@ -385,6 +393,49 @@ fn build_and_sign_reward_distributor_launch(
         #[cfg(test)]
         security_coin_secret_key: launched.security_coin_secret_key,
     })
+}
+
+/// The aggregate must VERIFY against the enumeration it was built from, before any witness exists.
+///
+/// Running the signing loop to completion proves only that the loop was total over
+/// `required_signatures`. It says nothing about whether that aggregate is the one consensus will
+/// check, and it is silent on a second, separate risk: `LaunchedDistributor::signature` is
+/// deliberately not aggregated in here, which is sound only while the security coin's requirement
+/// is also emitted into `required_signatures`. Both of those are properties of `dig-rewards-coin`
+/// at a caret range — a 0.6.1 that moved where the security-coin requirement is emitted would flip
+/// them at `cargo update`, with no diff in this file and every test still compiling.
+///
+/// So the aggregate is verified against the `(public_key, message)` pairs it claims to discharge,
+/// and the launch's security key is required to appear among them. That turns "every enumerated
+/// requirement was visited" into a checked property of the artifact rather than a test result.
+fn verify_aggregate_discharges(
+    signature: &chia_bls::Signature,
+    signed: &[(chia_bls::PublicKey, Vec<u8>)],
+    security_public_key: chia_bls::PublicKey,
+) -> MintResult<()> {
+    if !signed
+        .iter()
+        .any(|(public_key, _)| *public_key == security_public_key)
+    {
+        return Err(MintError::Build(
+            "the launch's security coin requirement is absent from the drained spends; this mint does not aggregate `LaunchedDistributor::signature`, so its security coin would be unsigned"
+                .into(),
+        ));
+    }
+
+    if !chia_bls::aggregate_verify(
+        signature,
+        signed
+            .iter()
+            .map(|(public_key, message)| (public_key, message.as_slice())),
+    ) {
+        return Err(MintError::Build(
+            "the aggregated signature does not verify against the requirements it was built from"
+                .into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// Locks the whole reward CAT to the settlement puzzle — the CAT half of the launch offer.
