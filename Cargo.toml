@@ -179,6 +179,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # response MAPPING is deliberately independent of it, so the mempool-verdict logic is unit-tested
 # through the `PushTransport` seam with no client and no network at all.
 ureq = { version = "2", optional = true }
+dig-rewards-coin = "0.6"
 
 [dev-dependencies]
 # Test-only: the INDEPENDENT BIP-39 expansion used as the reference for the account root, so a
