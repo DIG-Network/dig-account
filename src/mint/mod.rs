@@ -23,10 +23,10 @@ pub mod did;
 pub mod error;
 pub mod evidence;
 pub mod profile;
+pub mod reward_distributor;
 pub mod seed;
 pub mod status;
 pub mod store_evidence;
-pub mod reward_distributor;
 mod store_launch;
 
 /// Real evidence values for tests in OTHER modules of this crate.

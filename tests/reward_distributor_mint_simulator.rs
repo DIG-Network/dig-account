@@ -73,7 +73,8 @@ fn dig_reserve_asset_id() -> Bytes32 {
 fn wallet_owned_dig_cat(sim: &mut Simulator, wallet: &WalletKey, amount: u64) -> Cat {
     let asset_id = dig_reserve_asset_id();
     let inner_puzzle_hash = wallet.puzzle_hash();
-    let cat_puzzle_hash: Bytes32 = CatArgs::curry_tree_hash(asset_id, inner_puzzle_hash.into()).into();
+    let cat_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(asset_id, inner_puzzle_hash.into()).into();
 
     let grandparent = Bytes32::new([0x11; 32]);
     let parent = Coin::new(grandparent, cat_puzzle_hash, amount);
@@ -214,18 +215,11 @@ fn a_foreign_funding_coin_is_refused() {
     let stranger = WalletKey::from_seed_at(&OTHER_SEED, ProfileIx::ROOT);
 
     let mut request = request(&fixture);
-    request.funding = Coin::new(
-        Bytes32::new([7; 32]),
-        stranger.puzzle_hash(),
-        FUNDING_MOJOS,
-    );
+    request.funding = Coin::new(Bytes32::new([7; 32]), stranger.puzzle_hash(), FUNDING_MOJOS);
 
-    let Err(error) = begin_reward_distributor_mint(
-        &fixture.wallet,
-        &request,
-        &network(),
-        &TESTNET11_CONSTANTS,
-    ) else {
+    let Err(error) =
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS)
+    else {
         panic!("a stranger's funding coin must not be signed");
     };
     assert!(matches!(error, MintError::Refused(_)), "{error:?}");
@@ -243,12 +237,9 @@ fn a_foreign_reward_cat_is_refused() {
     let mut request = request(&fixture);
     request.reward_cat.info.p2_puzzle_hash = stranger.puzzle_hash();
 
-    let Err(error) = begin_reward_distributor_mint(
-        &fixture.wallet,
-        &request,
-        &network(),
-        &TESTNET11_CONSTANTS,
-    ) else {
+    let Err(error) =
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS)
+    else {
         panic!("a stranger's CAT must not be signed into a reserve");
     };
     assert!(matches!(error, MintError::Refused(_)), "{error:?}");
@@ -266,13 +257,8 @@ fn a_first_epoch_start_in_the_past_produces_no_bundle() {
     request.now_unix_seconds = FIRST_EPOCH_START + 1;
 
     assert!(
-        begin_reward_distributor_mint(
-            &fixture.wallet,
-            &request,
-            &network(),
-            &TESTNET11_CONSTANTS,
-        )
-        .is_err(),
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS,)
+            .is_err(),
         "a distributor whose first epoch has already begun must not be minted"
     );
 }
@@ -288,13 +274,9 @@ fn the_change_coin_is_what_the_funding_coin_did_not_spend() {
     let mut request = request(&fixture);
     request.fee = 500;
 
-    let minted = begin_reward_distributor_mint(
-        &fixture.wallet,
-        &request,
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("a mint with a fee builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS)
+            .expect("a mint with a fee builds, gates and signs");
 
     let states = fixture
         .sim
@@ -304,9 +286,10 @@ fn the_change_coin_is_what_the_funding_coin_did_not_spend() {
     let expected_change =
         FUNDING_MOJOS - OFFER_XCH_AMOUNT - MANAGER_SINGLETON_AMOUNT_MOJOS - request.fee;
     assert!(
-        states.values().any(|state| state.coin.puzzle_hash
-            == fixture.wallet.puzzle_hash()
-            && state.coin.amount == expected_change),
+        states.values().any(
+            |state| state.coin.puzzle_hash == fixture.wallet.puzzle_hash()
+                && state.coin.amount == expected_change
+        ),
         "the change coin must be exactly what the funding coin did not spend"
     );
 }

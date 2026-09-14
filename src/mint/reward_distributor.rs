@@ -34,10 +34,10 @@
 use std::collections::HashSet;
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
+use chia_puzzle_types::CoinProof;
 use chia_wallet_sdk::chia::consensus::consensus_constants::ConsensusConstants;
 use chia_wallet_sdk::clvm_traits::{clvm_quote, ToClvm};
 use chia_wallet_sdk::driver::{Cat, Offer, SingleCatSpend, Spend, SpendContext, StandardLayer};
-use chia_puzzle_types::CoinProof;
 use chia_wallet_sdk::prelude::{Conditions, Memos};
 use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::signer::RequiredSignature;
@@ -105,6 +105,15 @@ pub struct MintedRewardDistributor {
     distributor_launcher_id: Bytes32,
     manager_launcher_id: Bytes32,
     reserve_base_units: u64,
+    /// The launch's ephemeral security-coin key, kept ONLY under `cfg(test)`.
+    ///
+    /// The mutation proofs have to rebuild this bundle's signature while omitting exactly one
+    /// contribution, and "which key signed that requirement" is not derivable from the bundle
+    /// alone. It is `cfg(test)` so a consumer's build carries no such field and no such accessor:
+    /// the key controls nothing after the launch, but a released type that handed it out would
+    /// still be a key-shaped hole in a custody crate.
+    #[cfg(test)]
+    security_coin_secret_key: chia_bls::SecretKey,
 }
 
 impl MintedRewardDistributor {
@@ -132,6 +141,13 @@ impl MintedRewardDistributor {
     #[must_use]
     pub const fn reserve_base_units(&self) -> u64 {
         self.reserve_base_units
+    }
+
+    /// The launch's ephemeral security-coin key. See the field's own docs for why this is
+    /// `cfg(test)` and nothing else.
+    #[cfg(test)]
+    pub(super) const fn security_coin_secret_key(&self) -> &chia_bls::SecretKey {
+        &self.security_coin_secret_key
     }
 }
 
@@ -351,6 +367,8 @@ fn build_and_sign_reward_distributor_launch(
         distributor_launcher_id: launched.distributor.info.constants.launcher_id,
         manager_launcher_id: manager.launcher_id(),
         reserve_base_units: request.reward_cat.coin.amount,
+        #[cfg(test)]
+        security_coin_secret_key: launched.security_coin_secret_key,
     })
 }
 
@@ -503,5 +521,195 @@ mod tests {
     fn both_launch_amounts_are_odd() {
         assert_eq!(OFFER_XCH_AMOUNT % 2, 1);
         assert_eq!(MANAGER_SINGLETON_AMOUNT_MOJOS % 2, 1);
+    }
+}
+
+/// **Mutation proofs**: each signature contribution is load-bearing, INDEPENDENTLY.
+///
+/// A bundle that submits green tells you the aggregate is sufficient. It does not tell you that
+/// every part of it mattered — a two-site fix on a sibling crate had one site whose revert left the
+/// whole suite green. So each of the three contributions is dropped ON ITS OWN, the rest kept, and
+/// the submit must turn red for that omission alone.
+///
+/// The omission is expressed over the drained requirements rather than by editing the production
+/// signer: `AGG_SIG_ME`'s `appended_info` begins with the coin id the requirement is bound to, which
+/// is what lets a test say "every requirement of the funding coin" without a second signer existing.
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    use crate::id::ProfileIx;
+    use chia_puzzle_types::cat::CatArgs;
+    use chia_puzzle_types::LineageProof;
+    use chia_sdk_test::Simulator;
+    use chia_wallet_sdk::driver::CatInfo;
+    use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+    use chia_wallet_sdk::signer::AggSigConstants;
+    use dig_rewards_coin::{
+        dig_distributor_constants, DistributorLaunchTerms, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+    };
+
+    const SEED: [u8; 32] = [0x5A; 32];
+    const FUNDING_MOJOS: u64 = 1_000_000;
+    const RESERVE_BASE_UNITS: u64 = 250_000;
+
+    fn network() -> MintNetwork {
+        MintNetwork::from_constants(AggSigConstants::from(&*TESTNET11_CONSTANTS))
+    }
+
+    /// Which single contribution a rebuilt signature leaves out.
+    #[derive(Debug, Clone, Copy)]
+    enum Omission {
+        /// Everything the launch's own security coin requires.
+        SecurityCoin,
+        /// Everything the wallet's XCH funding coin requires.
+        FunderXch,
+        /// Everything the reward CAT requires.
+        FunderCat,
+    }
+
+    /// A wallet holding one XCH coin and the whole $DIG reserve CAT on a fresh simulator.
+    ///
+    /// The CAT is INSERTED with the production reserve asset id rather than issued: a simulator
+    /// cannot run a TAIL that hashes to $DIG, and a test asset id would model a distributor no DIG
+    /// client would recognise.
+    fn fixture() -> (Simulator, WalletKey, RewardDistributorMintRequest) {
+        let mut sim = Simulator::new();
+        let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+        let wallet_puzzle_hash = wallet.puzzle_hash();
+
+        let payer = sim.bls(FUNDING_MOJOS);
+        let ctx = &mut SpendContext::new();
+        StandardLayer::new(payer.pk)
+            .spend(
+                ctx,
+                payer.coin,
+                Conditions::new().create_coin(wallet_puzzle_hash, FUNDING_MOJOS, Memos::None),
+            )
+            .expect("the payer funds the wallet");
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&payer.sk))
+            .expect("the fixture's own setup validates");
+
+        let asset_id = dig_distributor_constants(
+            DistributorLaunchTerms {
+                manager_singleton_launcher_id: Bytes32::new([1; 32]),
+                distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+            },
+            Bytes32::new([2; 32]),
+        )
+        .expect("the DIG constants table builds")
+        .reserve_asset_id;
+        let cat_puzzle_hash: Bytes32 =
+            CatArgs::curry_tree_hash(asset_id, wallet_puzzle_hash.into()).into();
+        let grandparent = Bytes32::new([0x11; 32]);
+        let cat_parent = Coin::new(grandparent, cat_puzzle_hash, RESERVE_BASE_UNITS);
+        let cat_coin = Coin::new(cat_parent.coin_id(), cat_puzzle_hash, RESERVE_BASE_UNITS);
+        sim.insert_coin(cat_coin);
+
+        let request = RewardDistributorMintRequest {
+            funding: Coin::new(payer.coin.coin_id(), wallet_puzzle_hash, FUNDING_MOJOS),
+            reward_cat: Cat::new(
+                cat_coin,
+                Some(LineageProof {
+                    parent_parent_coin_info: grandparent,
+                    parent_inner_puzzle_hash: wallet_puzzle_hash,
+                    parent_amount: RESERVE_BASE_UNITS,
+                }),
+                CatInfo::new(asset_id, None, wallet_puzzle_hash),
+            ),
+            manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(wallet.public_key()),
+            distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+            first_epoch_start: 1_234,
+            generation: LaunchComment::new(Bytes32::new([0xAA; 32]), Bytes32::new([0xBB; 32])),
+            fee: 0,
+            now_unix_seconds: 0,
+        };
+
+        (sim, wallet, request)
+    }
+
+    /// The honest bundle with exactly one contribution left out.
+    ///
+    /// Returns the rebuilt bundle and how many requirements the omission actually dropped — a
+    /// mutation that dropped nothing would make the test vacuous, so the caller asserts on it.
+    fn bundle_without(
+        minted: &MintedRewardDistributor,
+        wallet: &WalletKey,
+        request: &RewardDistributorMintRequest,
+        omission: Omission,
+    ) -> (SpendBundle, usize) {
+        let coin_spends = minted.bundle().coin_spends.clone();
+        let required = dig_merkle::required_signatures(&coin_spends, network().constants())
+            .expect("the honest bundle's requirements extract");
+        let security_public_key = minted.security_coin_secret_key().public_key();
+
+        let mut signature = chia_bls::Signature::default();
+        let mut dropped = 0;
+        for requirement in &required {
+            let RequiredSignature::Bls(bls) = requirement else {
+                panic!("a distributor launch produces only BLS requirements");
+            };
+            let bound_to = |coin: Coin| {
+                bls.appended_info
+                    .starts_with(coin.coin_id().as_ref() as &[u8])
+            };
+            let omit = match omission {
+                Omission::SecurityCoin => bls.public_key == security_public_key,
+                Omission::FunderXch => {
+                    bls.public_key == wallet.public_key() && bound_to(request.funding)
+                }
+                Omission::FunderCat => {
+                    bls.public_key == wallet.public_key() && bound_to(request.reward_cat.coin)
+                }
+            };
+            if omit {
+                dropped += 1;
+            } else {
+                let secret_key = if bls.public_key == wallet.public_key() {
+                    wallet.secret_key()
+                } else {
+                    minted.security_coin_secret_key()
+                };
+                signature += &chia_bls::sign(secret_key, bls.message());
+            }
+        }
+
+        (SpendBundle::new(coin_spends, signature), dropped)
+    }
+
+    /// The CONTROL. Without it every red below could be red for some unrelated reason.
+    #[test]
+    fn the_honest_bundle_submits() {
+        let (mut sim, wallet, request) = fixture();
+        let minted =
+            begin_reward_distributor_mint(&wallet, &request, &network(), &TESTNET11_CONSTANTS)
+                .expect("the launch builds, gates and signs");
+
+        sim.new_transaction(minted.bundle().clone())
+            .expect("consensus accepts the seam's own bundle");
+    }
+
+    /// Each contribution ALONE. Three separate simulators, three separate mints, one omission each.
+    #[test]
+    fn every_signature_contribution_is_independently_load_bearing() {
+        for omission in [
+            Omission::SecurityCoin,
+            Omission::FunderXch,
+            Omission::FunderCat,
+        ] {
+            let (mut sim, wallet, request) = fixture();
+            let minted =
+                begin_reward_distributor_mint(&wallet, &request, &network(), &TESTNET11_CONSTANTS)
+                    .expect("the launch builds, gates and signs");
+
+            let (mutated, dropped) = bundle_without(&minted, &wallet, &request, omission);
+            assert!(
+                dropped > 0,
+                "{omission:?} dropped no requirement at all, so this proof would be vacuous"
+            );
+            assert!(
+                sim.new_transaction(mutated).is_err(),
+                "consensus must reject a bundle missing the {omission:?} contribution"
+            );
+        }
     }
 }

@@ -855,3 +855,37 @@ fn the_spend_is_reparsed_in_exactly_one_module() {
         "and it must be the summary module: {call_sites:?}"
     );
 }
+
+/// NEGATIVE CONTROL for the REWARD-DISTRIBUTOR variant of the same door.
+///
+/// `src/mint/reward_distributor.rs` builds and signs in one function for exactly the reason
+/// `store_launch` does, and the shape a future contributor would most plausibly add beside it is a
+/// distributor-flavoured `build_and_sign_*_from(coin_spends)` — the #1698 exploit again, spelled
+/// with a new noun. The guard above is shape-based and file-agnostic, so it already refuses this;
+/// what was missing was a control PROVING it does, rather than a claim that it would.
+#[test]
+fn the_reward_distributor_variant_of_the_signing_door_is_refused() {
+    let injected = "pub fn build_and_sign_reward_distributor_from(
+    coin_spends: &[CoinSpend],
+) -> Signature { unimplemented!() }";
+
+    assert!(
+        !unauthorized_signing_doors(injected).is_empty(),
+        "a distributor-flavoured signing door over bare coin spends must be refused, in whichever          module it appears"
+    );
+}
+
+/// And the ONE distributor door that does exist is not one: the seam takes a request, never loose
+/// coin spends, so the guard has nothing to exempt in that module.
+#[test]
+fn the_distributor_seam_declares_no_signing_door_at_all() {
+    let (path, source) = production_sources()
+        .into_iter()
+        .find(|(path, _)| path.contains("reward_distributor.rs"))
+        .expect("the reward-distributor seam is production source");
+
+    assert!(
+        unauthorized_signing_doors_in(&path, &source).is_empty(),
+        "the distributor seam must reach a signature only through its own gate"
+    );
+}
