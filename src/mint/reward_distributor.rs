@@ -41,7 +41,7 @@ use chia_wallet_sdk::driver::{Cat, Offer, SingleCatSpend, Spend, SpendContext, S
 use chia_wallet_sdk::prelude::{Conditions, Memos};
 use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::signer::RequiredSignature;
-use clvmr::NodePtr;
+use clvmr::{NodePtr, SExp};
 use dig_rewards_coin::{
     dig_distributor_constants, launch_dig_distributor, launch_manager_singleton, LaunchComment,
     ManagerInnerPuzzle, MANAGER_SINGLETON_AMOUNT_MOJOS,
@@ -407,6 +407,52 @@ fn build_and_sign_reward_distributor_launch(
     })
 }
 
+/// Every spend of a coin at THIS wallet's puzzle hash must reveal a quote-form delegated puzzle.
+///
+/// `src/wallet/money_signer.rs` requires `(q . conditions)` for the reason this gate wants it too:
+/// a quoted delegated puzzle makes the signed message a tree-hash of the exact, inspectable
+/// conditions, while a non-quoted one is solution-malleable — the same signature then authorizes
+/// whatever conditions a different solution evaluates to.
+///
+/// Here the spends are built by this module through [`StandardLayer`], so today nothing else can
+/// reach the gate. That is a property of the SDK's internals, not of this crate, and the money
+/// signer does not accept the equivalent argument for its own path either.
+fn require_quote_form_wallet_spends(
+    coin_spends: &[CoinSpend],
+    wallet_puzzle_hash: Bytes32,
+) -> MintResult<()> {
+    let mut ctx = SpendContext::new();
+    for spend in coin_spends {
+        if spend.coin.puzzle_hash != wallet_puzzle_hash {
+            continue;
+        }
+
+        let solution = ctx
+            .alloc(&spend.solution)
+            .map_err(|e| MintError::Build(format!("wallet spend solution: {e}")))?;
+        let solution: chia_puzzle_types::standard::StandardSolution<NodePtr, NodePtr> = ctx
+            .extract(solution)
+            .map_err(|e| MintError::Build(format!("wallet spend solution shape: {e}")))?;
+
+        if !is_quote_form(&ctx, solution.delegated_puzzle) {
+            return Err(MintError::Refused(
+                "a wallet spend whose delegated puzzle is not quote-form; the signed message would pin a solution-malleable puzzle rather than exact conditions"
+                    .into(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a delegated puzzle is the canonical `(q . conditions)` quote.
+fn is_quote_form(ctx: &SpendContext, delegated_puzzle: NodePtr) -> bool {
+    match ctx.sexp(delegated_puzzle) {
+        SExp::Pair(operator, _) => ctx.small_number(operator) == Some(1),
+        SExp::Atom => false,
+    }
+}
+
 /// The aggregate must VERIFY against the enumeration it was built from, before any witness exists.
 ///
 /// Running the signing loop to completion proves only that the loop was total over
@@ -508,7 +554,10 @@ fn spend_reward_cat_into_settlement(
 ///
 /// 1. **Only this wallet's key and that one ephemeral key sign, and only `AGG_SIG_ME`.** An
 ///    `AGG_SIG_UNSAFE` requirement is a blank cheque reusable against any coin, and a requirement
-///    under any other key asks this account to authorize a stranger's spend.
+///    under any other key asks this account to authorize a stranger's spend. Every spend of
+///    a coin at this wallet's puzzle hash must also reveal a QUOTE-FORM delegated puzzle, so
+///    the signed message pins exact conditions rather than a solution-malleable puzzle —
+///    parity with `src/wallet/money_signer.rs`; see [`require_quote_form_wallet_spends`].
 /// 2. **Exactly the two enumerated pre-existing coins are spent**: the XCH funding coin and the
 ///    reward CAT, both already proven to be this wallet's. Every other spent coin must be created
 ///    by this same bundle — a third root could drain another of the account's coins.
@@ -546,6 +595,8 @@ fn gate_reward_distributor_launch(
             }
         }
     }
+
+    require_quote_form_wallet_spends(coin_spends, wallet.puzzle_hash())?;
 
     let spent: HashSet<Bytes32> = coin_spends
         .iter()
@@ -591,6 +642,41 @@ mod tests {
             None,
             "an overflowing fee is not a funded mint"
         );
+    }
+
+    /// A wallet spend whose delegated puzzle is NOT quoted is refused.
+    ///
+    /// Unreachable through this module's own build today, which is exactly why it is asserted over
+    /// a fabricated spend: the rule must be checked at runtime, not argued from the SDK's internals.
+    #[test]
+    fn a_non_quote_delegated_puzzle_in_a_wallet_spend_is_refused() {
+        use chia_puzzle_types::standard::StandardSolution;
+
+        let wallet_puzzle_hash = Bytes32::new([0x42; 32]);
+        let mut ctx = SpendContext::new();
+
+        // `(2)` — a PAIR whose operator is `a` (apply), not `q`. Deliberately not a bare atom: an
+        // atom is refused by the shape arm, which would leave the operator comparison — the part
+        // that separates a quote from every other program — proven by nothing.
+        let apply = ctx.new_small_number(2).unwrap();
+        let unquoted = ctx.new_pair(apply, NodePtr::NIL).unwrap();
+        let solution = ctx
+            .alloc(&StandardSolution {
+                original_public_key: None,
+                delegated_puzzle: unquoted,
+                solution: NodePtr::NIL,
+            })
+            .unwrap();
+        let spend = CoinSpend::new(
+            Coin::new(Bytes32::default(), wallet_puzzle_hash, 1),
+            chia_protocol::Program::default(),
+            ctx.serialize(&solution).unwrap(),
+        );
+
+        let error = require_quote_form_wallet_spends(&[spend], wallet_puzzle_hash)
+            .expect_err("a non-quote delegated puzzle must not be signed");
+        assert!(matches!(error, MintError::Refused(_)), "{error:?}");
+        assert!(error.to_string().contains("quote-form"), "{error}");
     }
 
     /// Both singleton amounts are ODD. An even-amount singleton can never be spent again, so a
@@ -764,6 +850,39 @@ mod mutation_tests {
 
         sim.new_transaction(minted.bundle().clone())
             .expect("consensus accepts the seam's own bundle");
+    }
+
+    /// The three omissions PARTITION the requirements: nothing is dropped by none of them.
+    ///
+    /// Proving each omission load-bearing only proves something about the requirements those
+    /// omissions name. A wallet-key requirement bound to a third coin — one this bundle creates and
+    /// spends — is dropped by no omission, so it is proven load-bearing by nothing and would sit
+    /// under the mutation suite unmeasured. The counts must add up to the whole enumeration.
+    #[test]
+    fn the_three_omissions_partition_every_requirement() {
+        let (_sim, wallet, request) = fixture();
+        let minted =
+            begin_reward_distributor_mint(&wallet, &request, &network(), &TESTNET11_CONSTANTS)
+                .expect("the launch builds, gates and signs");
+
+        let total =
+            dig_merkle::required_signatures(&minted.bundle().coin_spends, network().constants())
+                .expect("the honest bundle's requirements extract")
+                .len();
+
+        let dropped: usize = [
+            Omission::SecurityCoin,
+            Omission::FunderXch,
+            Omission::FunderCat,
+        ]
+        .into_iter()
+        .map(|omission| bundle_without(&minted, &wallet, &request, omission).1)
+        .sum();
+
+        assert_eq!(
+            dropped, total,
+            "the mutation suite covers {dropped} of {total} requirements; the rest are proven load-bearing by nothing"
+        );
     }
 
     /// Each contribution ALONE. Three separate simulators, three separate mints, one omission each.
