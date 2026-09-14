@@ -167,7 +167,23 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
     )
     .expect("the launch builds, gates and signs");
 
-    assert_eq!(minted.reserve_base_units(), RESERVE_BASE_UNITS);
+    // The witness echoes the REQUESTED reserve, so asserting it alone would compare the request to
+    // itself. The load-bearing half is the artifact: the bundle must actually spend that reward CAT
+    // coin, of that amount, into the offer.
+    assert_eq!(
+        minted.requested_reserve_base_units(),
+        RESERVE_BASE_UNITS,
+        "the witness reports the reserve this mint asked for"
+    );
+    assert!(
+        minted
+            .bundle()
+            .coin_spends
+            .iter()
+            .any(|spend| spend.coin == fixture.reward_cat.coin
+                && spend.coin.amount == RESERVE_BASE_UNITS),
+        "the requested reserve is only meaningful if the bundle spends that very CAT coin"
+    );
 
     fixture
         .sim

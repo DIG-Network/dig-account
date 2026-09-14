@@ -26,8 +26,8 @@
 //! # Building and signing are ONE function, on purpose
 //!
 //! There is deliberately no `sign(coin_spends)` seam here, for the same reason
-//! [`store_launch`](super::store_launch) has none: a helper that turned loose coin spends into a
-//! signature would be a route to the account's key that bypasses [`gate_reward_distributor_launch`].
+//! `store_launch` has none: a helper that turned loose coin spends into a signature would be a
+//! route to the account's key that bypasses this module's own pre-signing gate.
 //! `tests/the_shape_is_unwritable.rs` refuses that shape mechanically, this module's variant
 //! included.
 
@@ -64,7 +64,7 @@ pub const OFFER_XCH_AMOUNT: u64 = 1;
 /// `first_epoch_start`, `now_unix_seconds` and `distributor_epoch_seconds` are all seconds, so a
 /// positional call site is one transposition away from minting a distributor nobody asked for.
 ///
-/// Deliberately NOT `#[non_exhaustive]`, unlike [`MintedRewardDistributor`]: this is caller INPUT,
+/// Deliberately NOT `#[non_exhaustive]`, unlike [`SignedRewardDistributorMint`]: this is caller INPUT,
 /// and a caller that cannot write the literal cannot call the seam at all. The unforgeability
 /// property belongs on the WITNESS the seam returns, not on the request it accepts.
 #[derive(Debug, Clone)]
@@ -91,7 +91,12 @@ pub struct RewardDistributorMintRequest {
     pub now_unix_seconds: u64,
 }
 
-/// A **fully signed** reward-distributor mint bundle and the ids the launch derived.
+/// A **fully signed, not yet submitted** reward-distributor mint bundle and the ids the launch
+/// derived.
+///
+/// The name is deliberate: nothing here has reached a mempool, let alone confirmed. A type called
+/// `Minted` would assert an irreversible money act this seam never performs — the crate's
+/// `StoreLaunchBundle` names the same stage the same way.
 ///
 /// Every field is private, there is no `Default`, no public constructor and no public struct
 /// literal: the only way to obtain one is [`begin_reward_distributor_mint`], which constructs it
@@ -103,11 +108,13 @@ pub struct RewardDistributorMintRequest {
 /// be forged" are different questions, and this type answers both.
 #[derive(Debug)]
 #[non_exhaustive]
-pub struct MintedRewardDistributor {
+pub struct SignedRewardDistributorMint {
     bundle: SpendBundle,
     distributor_launcher_id: Bytes32,
     manager_launcher_id: Bytes32,
-    reserve_base_units: u64,
+    /// The reward CAT coin's amount, echoed from the request. See the accessor for why the name
+    /// carries `requested`.
+    requested_reserve_base_units: u64,
     /// The launch's ephemeral security-coin key, kept ONLY under `cfg(test)`.
     ///
     /// The mutation proofs have to rebuild this bundle's signature while omitting exactly one
@@ -119,7 +126,7 @@ pub struct MintedRewardDistributor {
     security_coin_secret_key: chia_bls::SecretKey,
 }
 
-impl MintedRewardDistributor {
+impl SignedRewardDistributorMint {
     /// The signed bundle, ready for the [`SpendPublisher`](super::chain::SpendPublisher) seam.
     #[must_use]
     pub const fn bundle(&self) -> &SpendBundle {
@@ -140,10 +147,15 @@ impl MintedRewardDistributor {
         self.manager_launcher_id
     }
 
-    /// The $DIG base units this launch put into the distributor's reserve.
+    /// The $DIG base units this mint REQUESTED go into the distributor's reserve: the reward CAT
+    /// coin's amount, read back from the request.
+    ///
+    /// Named for what it is. It is not an observation of the launched distributor's reserve state,
+    /// and nothing here could make it one — no reserve exists until this bundle confirms. A caller
+    /// wanting the reserve as it ended up must read the confirmed distributor from the chain.
     #[must_use]
-    pub const fn reserve_base_units(&self) -> u64 {
-        self.reserve_base_units
+    pub const fn requested_reserve_base_units(&self) -> u64 {
+        self.requested_reserve_base_units
     }
 
     /// The launch's ephemeral security-coin key. See the field's own docs for why this is
@@ -176,7 +188,7 @@ pub fn begin_reward_distributor_mint(
     request: &RewardDistributorMintRequest,
     network: &MintNetwork,
     consensus_constants: &ConsensusConstants,
-) -> MintResult<MintedRewardDistributor> {
+) -> MintResult<SignedRewardDistributorMint> {
     build_and_sign_reward_distributor_launch(wallet, request, network, consensus_constants)
 }
 
@@ -204,7 +216,7 @@ fn build_and_sign_reward_distributor_launch(
     request: &RewardDistributorMintRequest,
     network: &MintNetwork,
     consensus_constants: &ConsensusConstants,
-) -> MintResult<MintedRewardDistributor> {
+) -> MintResult<SignedRewardDistributorMint> {
     let wallet_puzzle_hash = wallet.puzzle_hash();
 
     if request.funding.puzzle_hash != wallet_puzzle_hash {
@@ -385,11 +397,11 @@ fn build_and_sign_reward_distributor_launch(
 
     verify_aggregate_discharges(&signature, &signed, security_public_key)?;
 
-    Ok(MintedRewardDistributor {
+    Ok(SignedRewardDistributorMint {
         bundle: SpendBundle::new(coin_spends, signature),
         distributor_launcher_id: launched.distributor.info.constants.launcher_id,
         manager_launcher_id: manager.launcher_id(),
-        reserve_base_units: request.reward_cat.coin.amount,
+        requested_reserve_base_units: request.reward_cat.coin.amount,
         #[cfg(test)]
         security_coin_secret_key: launched.security_coin_secret_key,
     })
@@ -698,7 +710,7 @@ mod mutation_tests {
     /// Returns the rebuilt bundle and how many requirements the omission actually dropped — a
     /// mutation that dropped nothing would make the test vacuous, so the caller asserts on it.
     fn bundle_without(
-        minted: &MintedRewardDistributor,
+        minted: &SignedRewardDistributorMint,
         wallet: &WalletKey,
         request: &RewardDistributorMintRequest,
         omission: Omission,

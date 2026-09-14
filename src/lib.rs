@@ -84,7 +84,7 @@ pub use id::{AccountId, ProfileIx};
 pub use keys::dek::profile_dek;
 pub use keys::wallet_key::WalletKey;
 pub use mint::reward_distributor::{
-    begin_reward_distributor_mint, MintedRewardDistributor, RewardDistributorMintRequest,
+    begin_reward_distributor_mint, RewardDistributorMintRequest, SignedRewardDistributorMint,
     OFFER_XCH_AMOUNT,
 };
 #[cfg(feature = "coinset-push")]
