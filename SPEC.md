@@ -1660,6 +1660,58 @@ Unchanged from §6A.6 and absolute: signing happens in-process against the unloc
 wallet key, residency is re-checked before every derivation, and the `SpendPublisher` seam takes an
 ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never enters it.
 
+## 6BB. The reward-distributor mint (`begin_reward_distributor_mint`)
+
+`begin_reward_distributor_mint` is the ONLY path by which this crate signs a DIG reward-distributor
+launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH
+funding coin and the whole $DIG reserve CAT, both locked to the settlement puzzle), the distributor
+launcher, the eve singleton, the reserve CAT and the launch's ephemeral security coin — into ONE
+`SpendContext`, and returns a `MintedRewardDistributor` or an error.
+
+### 6BB.1 The bundle is complete or there is no bundle
+
+The returned `SpendBundle`'s `aggregated_signature` MUST cover EVERY signature requirement the
+drained coin spends carry: the wallet's `AGG_SIG_ME` requirements on the funding coin and the
+reserve CAT, and the launch security coin's own requirement. A requirement this account cannot
+produce is an error; a bundle carrying a short signature is never returned.
+
+`LaunchedDistributor::signature` is deliberately NOT aggregated in. It signs the security coin's
+message, which already appears in the extracted requirements and is signed there with the same
+ephemeral key; aggregating one signature twice yields an aggregate that does not verify.
+
+### 6BB.2 The witness is unforgeable
+
+`MintedRewardDistributor` has private fields, no `Default`, no public constructor and is
+`#[non_exhaustive]`. Its only constructor is the signing path, reached only after every
+`RequiredSignature` has been discharged. `RewardDistributorMintRequest` — caller INPUT — is
+deliberately NOT `#[non_exhaustive]`, because a request a caller cannot write is a seam a caller
+cannot call.
+
+### 6BB.3 The pre-signing whitelist
+
+Before any signature exists, `gate_reward_distributor_launch` states what IS allowed:
+
+1. every requirement is `AGG_SIG_ME` (never `AGG_SIG_UNSAFE`, never `secp`) under either this
+   wallet's key or the launch's own ephemeral security-coin key, permitted by VALUE from that
+   launch;
+2. the bundle spends EXACTLY the two pre-existing coins the mint named — the XCH funding coin and
+   the reward CAT. Every other spent coin MUST be created by this same bundle.
+
+Both coins are re-checked against the wallet's own puzzle hash at the top of the build, before a
+single spend is staged, so rule 2 can never degrade into comparing the bundle to itself.
+
+### 6BB.4 Building and signing are one function
+
+There is no `sign(coin_spends)` seam, for the same reason §6B has none: a helper turning loose coin
+spends into a signature is a route to the account's key that bypasses the gate.
+`tests/the_shape_is_unwritable.rs` refuses that shape, distributor variant included.
+
+### 6BB.5 Custody boundary
+
+Unchanged from §6A.6 and §6B.5. The seam does NOT push: a bundle that reached a mempool is not a
+confirmed distributor, so broadcasting stays with the `SpendPublisher` seam and confirmation stays
+with a chain read.
+
 ## 6C. `CoinsetPublisher` — the optional coinset.org broadcast seam
 
 An OPTIONAL `SpendPublisher` over a Chia `push_tx` HTTP endpoint, provided so a host with no node of its
