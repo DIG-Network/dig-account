@@ -740,6 +740,61 @@ mod tests {
         assert_eq!(OFFER_XCH_AMOUNT % 2, 1);
         assert_eq!(MANAGER_SINGLETON_AMOUNT_MOJOS % 2, 1);
     }
+
+    /// `verify_aggregate_discharges` refuses when the launch's security coin key is absent from
+    /// `signed`, naming the security-coin requirement -- one of its two independent guard arms.
+    #[test]
+    fn verify_aggregate_discharges_refuses_when_the_security_key_is_absent() {
+        let signer = chia_bls::SecretKey::from_seed(&[0x11; 32]);
+        let security = chia_bls::SecretKey::from_seed(&[0x22; 32]);
+        let message = b"a requirement".to_vec();
+        let signature = chia_bls::sign(&signer, &message);
+        let signed = vec![(signer.public_key(), message)];
+
+        let error = verify_aggregate_discharges(&signature, &signed, security.public_key())
+            .expect_err("the security key never appears among the signed pairs");
+        assert!(matches!(error, MintError::Build(_)), "{error:?}");
+        assert!(error.to_string().contains("security coin"), "{error}");
+    }
+
+    /// `verify_aggregate_discharges` refuses when the aggregate does not verify against `signed`
+    /// -- its other independent guard arm.
+    #[test]
+    fn verify_aggregate_discharges_refuses_when_the_signature_does_not_verify() {
+        let signer = chia_bls::SecretKey::from_seed(&[0x11; 32]);
+        let claimed_message = b"the message signed does not verify against".to_vec();
+        // Sign a DIFFERENT message than the one claimed in `signed`, so the aggregate carries a
+        // signature that cannot verify against the claimed pair.
+        let signature = chia_bls::sign(&signer, b"a different message entirely");
+        let signed = vec![(signer.public_key(), claimed_message)];
+
+        let error = verify_aggregate_discharges(&signature, &signed, signer.public_key())
+            .expect_err("a signature over a different message must not verify");
+        assert!(matches!(error, MintError::Build(_)), "{error:?}");
+        assert!(error.to_string().contains("does not verify"), "{error}");
+    }
+
+    /// A correctly aggregated signature over exactly the enumerated pairs, security key present,
+    /// verifies.
+    #[test]
+    fn verify_aggregate_discharges_accepts_a_correctly_aggregated_signature() {
+        let wallet_sk = chia_bls::SecretKey::from_seed(&[0x11; 32]);
+        let security_sk = chia_bls::SecretKey::from_seed(&[0x22; 32]);
+        let wallet_message = b"the funding coin's requirement".to_vec();
+        let security_message = b"the security coin's requirement".to_vec();
+
+        let mut signature = chia_bls::Signature::default();
+        signature += &chia_bls::sign(&wallet_sk, &wallet_message);
+        signature += &chia_bls::sign(&security_sk, &security_message);
+
+        let signed = vec![
+            (wallet_sk.public_key(), wallet_message),
+            (security_sk.public_key(), security_message),
+        ];
+
+        verify_aggregate_discharges(&signature, &signed, security_sk.public_key())
+            .expect("a correctly aggregated signature over the exact enumerated pairs verifies");
+    }
 }
 
 /// **Mutation proofs**: each signature contribution is load-bearing, INDEPENDENTLY.
