@@ -1672,8 +1672,7 @@ launcher, the eve singleton, the reserve CAT and the launch's ephemeral security
 
 The returned `SpendBundle`'s `aggregated_signature` MUST cover EVERY signature requirement the
 drained coin spends carry: the wallet's `AGG_SIG_ME` requirements on the funding coin and the
-reserve CAT, and the launch security coin's own requirement. A requirement this account cannot
-produce is an error; a bundle carrying a short signature is never returned.
+reserve CAT, and the launch security coin's own requirement.
 
 The implementation MUST NOT rest this on the signing loop having run to completion, which proves
 only that the loop was total over the requirements it enumerated. Before the witness is constructed
@@ -1686,6 +1685,14 @@ ephemeral key; aggregating one signature twice yields an aggregate that does not
 argument holds only while `dig-rewards-coin` emits the security coin's requirement into the
 extracted set, which is a property of a dependency at a caret range — so the seam MUST also refuse
 when the launch's security public key does not appear among the requirements it discharged.
+
+This verification's input is the enumeration `required_signatures` itself produced, so it CANNOT
+establish that the enumeration was complete relative to what consensus will require — a
+requirement the enumeration under-lists is invisible to it. Completeness relative to consensus is
+established by
+`tests/reward_distributor_mint_simulator.rs::the_seams_own_bundle_submits_with_zero_caller_supplied_keys`,
+where the consensus validator re-derives the requirement set independently and would reject a
+short aggregate.
 
 ### 6BB.2 The witness is unforgeable
 

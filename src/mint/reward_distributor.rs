@@ -100,12 +100,10 @@ pub struct RewardDistributorMintRequest {
 ///
 /// Every field is private, there is no `Default`, no public constructor and no public struct
 /// literal: the only way to obtain one is [`begin_reward_distributor_mint`], which constructs it
-/// only after the aggregate it carries has been VERIFIED against the `(public_key, message)` pairs
-/// of every [`RequiredSignature`] drained from its own spends, the launch's security key among
-/// them. "Discharged every requirement the loop enumerated" would be the weaker claim, and it is
-/// the one an exhausted loop actually supports; this type's guarantee is the verification. An
-/// incomplete bundle therefore has no representation — "is the producer guarded" and "can its guard
-/// be forged" are different questions, and this type answers both.
+/// only after the signing loop ran to completion over every [`RequiredSignature`] drained from its
+/// own spends and the resulting aggregate was VERIFIED against those same `(public_key, message)`
+/// pairs, the launch's security key among them. See [`verify_aggregate_discharges`] for exactly
+/// what that verification does and does not establish.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SignedRewardDistributorMint {
@@ -464,8 +462,16 @@ fn is_quote_form(ctx: &SpendContext, delegated_puzzle: NodePtr) -> bool {
 /// them at `cargo update`, with no diff in this file and every test still compiling.
 ///
 /// So the aggregate is verified against the `(public_key, message)` pairs it claims to discharge,
-/// and the launch's security key is required to appear among them. That turns "every enumerated
-/// requirement was visited" into a checked property of the artifact rather than a test result.
+/// and the launch's security key is required to appear among them. That check catches: (a) a
+/// future edit that also aggregates `LaunchedDistributor::signature`, producing an aggregate that
+/// no longer verifies against this enumeration; (b) a `WalletKey` whose secret and public halves
+/// are inconsistent, so the signature it produces does not verify against its own public key; (c)
+/// a `continue` that skips `sign` but still pushes the `(public_key, message)` pair, leaving a
+/// pair verified against with no contribution in the aggregate.
+///
+/// It CANNOT establish completeness. Its input is `signed`, which this same loop populates from
+/// `required_signatures`; an enumeration that under-lists a requirement is invisible to it — the
+/// loop, the accumulator and the verification all see the same short list.
 fn verify_aggregate_discharges(
     signature: &chia_bls::Signature,
     signed: &[(chia_bls::PublicKey, Vec<u8>)],
