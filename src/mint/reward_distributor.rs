@@ -685,6 +685,54 @@ mod tests {
         assert!(error.to_string().contains("quote-form"), "{error}");
     }
 
+    /// The quote-form check runs INSIDE `gate_reward_distributor_launch`, before the
+    /// permitted-roots check -- not merely that the helper refuses when called directly (the test
+    /// above calls only `require_quote_form_wallet_spends`, never the gate). `required` is empty
+    /// and `permitted_roots` is a fabricated pair that matches nothing below: if the gate reached
+    /// the roots check first, it would refuse for the wrong reason (or not at all).
+    #[test]
+    fn gate_reward_distributor_launch_refuses_a_non_quote_wallet_spend_before_the_roots_check() {
+        use crate::id::ProfileIx;
+        use chia_puzzle_types::standard::StandardSolution;
+        use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+        use chia_wallet_sdk::signer::AggSigConstants;
+
+        let wallet = WalletKey::from_seed_at(&[0x5A; 32], ProfileIx::ROOT);
+        let wallet_puzzle_hash = wallet.puzzle_hash();
+        let mut ctx = SpendContext::new();
+
+        // Same fabricated non-quote delegated puzzle as the helper-level test above.
+        let apply = ctx.new_small_number(2).unwrap();
+        let unquoted = ctx.new_pair(apply, NodePtr::NIL).unwrap();
+        let solution = ctx
+            .alloc(&StandardSolution {
+                original_public_key: None,
+                delegated_puzzle: unquoted,
+                solution: NodePtr::NIL,
+            })
+            .unwrap();
+        let spend = CoinSpend::new(
+            Coin::new(Bytes32::default(), wallet_puzzle_hash, 1),
+            chia_protocol::Program::default(),
+            ctx.serialize(&solution).unwrap(),
+        );
+
+        let network = MintNetwork::from_constants(AggSigConstants::from(&*TESTNET11_CONSTANTS));
+
+        let error = gate_reward_distributor_launch(
+            &wallet,
+            &[spend],
+            &[],
+            wallet.public_key(),
+            [Bytes32::new([0xEE; 32]), Bytes32::new([0xFF; 32])],
+            &network,
+        )
+        .expect_err("a non-quote wallet spend must be refused before the roots check runs");
+
+        assert!(matches!(error, MintError::Refused(_)), "{error:?}");
+        assert!(error.to_string().contains("quote-form"), "{error}");
+    }
+
     /// Both singleton amounts are ODD. An even-amount singleton can never be spent again, so a
     /// drift here would mint a distributor whose reserve is unreachable forever.
     #[test]
