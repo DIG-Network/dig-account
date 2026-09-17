@@ -55,6 +55,7 @@ pub mod model;
 pub mod profile_mint;
 pub mod profile_resolve;
 pub mod registry;
+pub mod reward_distributor_mint;
 pub mod session;
 pub mod session_residency;
 pub mod signer;
@@ -107,6 +108,7 @@ pub use registry::{
     PendingMintRecord, PendingStoreLaunchRecord, ProfileAnchor, ProfileEnd, ProfileEndOutcome,
     ProfileEntry, ProfileMintInProgress, ProfileRegistry, ProfileVisibility,
 };
+pub use reward_distributor_mint::RewardDistributorMinter;
 pub use session::AccountSession;
 pub use session_residency::Residency;
 pub use signer::ProfileSigner;
@@ -116,9 +118,9 @@ pub use wallet::approval::{PendingApproval, SpendApproval, SpendRuling};
 pub use wallet::authorizer::WalletOps;
 pub use wallet::autosend::{AutoSendPolicy, OpClassLimits, SpendOpClass, DEFAULT_PERIOD_SECONDS};
 pub use wallet::cat_transfer::{
-    amount_in_dig, cat_curried_puzzle_hash, dig_curried_puzzle_hash, CatTransferError,
-    CatTransferPlan, CatTransferRequest, CatTransferResult, DIG_BASE_UNITS_PER_TOKEN,
-    MAX_CAT_TRANSFER_INPUT_COINS,
+    amount_in_dig, cat_coins, cat_curried_puzzle_hash, dig_cat_coins, dig_curried_puzzle_hash,
+    CatTransferError, CatTransferPlan, CatTransferRequest, CatTransferResult,
+    DIG_BASE_UNITS_PER_TOKEN, MAX_CAT_TRANSFER_INPUT_COINS,
 };
 pub use wallet::clock::{Clock, FixedClock, SystemClock};
 pub use wallet::enforcer::PolicyAuthorizer;

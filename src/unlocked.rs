@@ -16,6 +16,7 @@ use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
 use crate::melt::ProfileMelter;
 use crate::profile_mint::ProfileMinter;
+use crate::reward_distributor_mint::RewardDistributorMinter;
 use crate::session_residency::Residency;
 use crate::signer::ProfileSigner;
 use crate::wallet::authorizer::WalletOps;
@@ -136,6 +137,22 @@ impl UnlockedAccount {
     /// (`SPEC.md` §6A.2).
     pub fn profile_minter(&self) -> ProfileMinter {
         ProfileMinter::new(self.seed.clone(), self.residency.clone())
+    }
+
+    /// A reward-distributor-mint handle for the default profile (§6BB, driven through §6F's facade).
+    ///
+    /// Like [`profile_minter`](Self::profile_minter), the returned [`RewardDistributorMinter`]
+    /// observes this unlock's [`Residency`]: a reward-distributor mint spends real XCH and a real
+    /// $DIG reserve, so it stops the moment [`lock`](Self::lock) is called. It is not a way to keep
+    /// a relocked account spendable, and it hands out no key at any point (`SPEC.md` §6F).
+    pub fn reward_distributor_minter(&self) -> RewardDistributorMinter {
+        self.reward_distributor_minter_at(self.default_profile_ix)
+    }
+
+    /// The reward-distributor-mint handle for the profile at `ix`. See
+    /// [`reward_distributor_minter`](Self::reward_distributor_minter).
+    pub fn reward_distributor_minter_at(&self, ix: ProfileIx) -> RewardDistributorMinter {
+        RewardDistributorMinter::new(self.seed.clone(), ix, self.residency.clone())
     }
 
     /// An editor for the profiles this account already owns.

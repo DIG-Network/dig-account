@@ -213,6 +213,14 @@ pub enum CatTransferError {
     /// Building the unsigned spend failed inside the SDK drivers.
     #[error("could not build the $DIG transfer spend: {0}")]
     Build(String),
+
+    /// The account that owns this call has been relocked. No key was derived, no coins were read.
+    ///
+    /// Exists for capabilities layered ON this module — `RewardDistributorMinter`
+    /// (`crate::reward_distributor_mint`) refuses with this BEFORE deriving a puzzle hash to select
+    /// against, so a relocked account cannot even name which coins it would have asked for.
+    #[error("this account has been relocked; no coin selection is authorized")]
+    Locked,
 }
 
 impl From<UnconfirmedInput> for CatTransferError {
@@ -344,6 +352,66 @@ pub fn cat_curried_puzzle_hash(asset_id: Bytes32, p2_puzzle_hash: Bytes32) -> By
 /// different asset id and be handed a puzzle hash the wallet's $DIG is not at.
 pub fn dig_curried_puzzle_hash(p2_puzzle_hash: Bytes32) -> Bytes32 {
     cat_curried_puzzle_hash(DIG_ASSET_ID, p2_puzzle_hash)
+}
+
+/// Every UNSPENT, lineage-proven CAT coin of `asset_id` locked to `p2_puzzle_hash`.
+///
+/// This is the public counterpart to [`select_cat_coins`]'s selection: where that helper picks
+/// JUST ENOUGH coins to cover an amount, this lists every spendable one — what a balance display or
+/// a coin-control UI needs, and what
+/// [`RewardDistributorMinter::dig_cat_coins`](crate::reward_distributor_mint::RewardDistributorMinter::dig_cat_coins)
+/// delegates to.
+///
+/// # Unspent only
+///
+/// A coin with a `spent_height` is never returned. Reading the wallet's spendable CAT balance must
+/// not include a coin somebody — or this very wallet — already spent.
+///
+/// # Lineage proven or the WHOLE call refuses
+///
+/// Each candidate's parent spend is read and parsed as a CAT via [`resolve_lineage`], the same
+/// helper [`build_cat_transfer`](WalletOps::build_cat_transfer) uses for its own inputs. A coin
+/// whose lineage cannot be established is [`CatTransferError::LineageUnavailable`] for the ENTIRE
+/// call — never a partial `Vec` with the unprovable coin quietly dropped, and never a [`Cat`]
+/// carrying a fabricated or absent lineage proof. A source that cannot answer for one coin is not
+/// evidence about the others.
+///
+/// # Errors
+///
+/// [`CatTransferError::ChainUnreachable`] if the chain could not be read at all;
+/// [`CatTransferError::LineageUnavailable`] if any candidate's lineage cannot be proven.
+pub fn cat_coins<C>(
+    chain: &C,
+    asset_id: Bytes32,
+    p2_puzzle_hash: Bytes32,
+) -> CatTransferResult<Vec<Cat>>
+where
+    C: ChainSource + ?Sized,
+{
+    let cat_puzzle_hash = cat_curried_puzzle_hash(asset_id, p2_puzzle_hash);
+    let records = chain
+        .coin_records_by_puzzle_hash(cat_puzzle_hash, false)
+        .map_err(|e| CatTransferError::ChainUnreachable(e.to_string()))?;
+
+    let unspent: Vec<Coin> = records
+        .into_iter()
+        .filter(|record| record.spent_height.is_none())
+        .map(|record| record.coin)
+        .collect();
+
+    resolve_lineage(chain, asset_id, &unspent)
+}
+
+/// [`cat_coins`] pinned to [`DIG_ASSET_ID`] — every unspent, lineage-proven $DIG coin at
+/// `p2_puzzle_hash`.
+///
+/// Agrees with [`dig_curried_puzzle_hash`] by construction: both derive their outer puzzle hash from
+/// `cat_curried_puzzle_hash(DIG_ASSET_ID, p2_puzzle_hash)`, which the tests pin directly.
+pub fn dig_cat_coins<C>(chain: &C, p2_puzzle_hash: Bytes32) -> CatTransferResult<Vec<Cat>>
+where
+    C: ChainSource + ?Sized,
+{
+    cat_coins(chain, DIG_ASSET_ID, p2_puzzle_hash)
 }
 
 /// Render an amount of $DIG base units as whole $DIG plus the remaining thousandths.

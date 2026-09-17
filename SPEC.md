@@ -1984,6 +1984,53 @@ registry.
 
 The §908 boundary binds unchanged: `SpendPublisher` takes an ALREADY-SIGNED bundle.
 
+## 6F. `RewardDistributorMinter` — the facade that keeps the key inside
+
+`UnlockedAccount::reward_distributor_minter()` / `reward_distributor_minter_at(ix)` are the ONLY way to
+obtain a `RewardDistributorMinter`. It is a twin of `ProfileMinter` (§6B) and `WalletOps` (§6): its fields
+(`seed`, `profile_ix`, `residency`) are private, its constructor is `pub(crate)`, and it derives no key
+material until a method is called.
+
+**Per-call derivation, checked BEFORE it happens.** Every method — `begin`, `public_key`, `puzzle_hash`,
+`dig_cat_coins` — re-reads its `Residency` and returns `MintError::Locked` (or the CAT-transfer error's
+equivalent refusal) FIRST, before deriving a `WalletKey` from the live seed. A relocked account therefore
+produces no key, no puzzle hash and no bundle through this facade, for the same reason `ProfileMinter`'s
+`ensure_live` runs ahead of derivation (§6B): the ceremony consults the chain between deriving a key and
+signing, and a lock during that window must stop the signature, not merely refuse to have started one.
+
+**No method returns a `WalletKey`, a `SecretKey` or the master seed.** The facade's only public surface is
+`public_key()`, `puzzle_hash()`, `begin(...)` and `dig_cat_coins(...)` — none of which can hand the caller
+anything that signs. This is a structural property, not a convention: `src/reward_distributor_mint.rs`
+contains no `pub fn` returning key material, and a compile-fail case (`tests/compile_fail/`) proves the
+struct cannot be constructed or its fields read from outside this crate.
+
+**`begin` is a pure pass-through to §6BB.** `RewardDistributorMinter::begin` calls
+`begin_reward_distributor_mint(&key, request, network, consensus_constants)` and nothing else — it adds no
+refusal and removes none. Every §6BB guard (unowned funding coin, unowned or wrong-asset reward CAT, a
+zero epoch, `InsufficientFunds`, a gate refusal) reaches the caller through the facade UNCHANGED.
+`dig_cat_coins` is likewise a pass-through: it calls §6G's `dig_cat_coins(chain, self.puzzle_hash()?)` and
+adds only the residency check ahead of it.
+
+## 6G. Public $DIG CAT coin selection
+
+`cat_coins(chain, asset_id, p2_puzzle_hash)` and `dig_cat_coins(chain, p2_puzzle_hash)` (the latter pinned
+to `DIG_ASSET_ID`, agreeing with `dig_curried_puzzle_hash`) are the public counterpart to the CAT-transfer
+builder's private coin selection (§6): given a chain and a p2 puzzle hash, they list the UNSPENT CAT coins
+of that asset at that address, each with a proven lineage.
+
+**Unspent only.** A coin record with a `spent_height` is never returned — a caller asking "what can this
+wallet spend" must not be handed a coin somebody, or the wallet itself, already spent.
+
+**Lineage is proven or the WHOLE call refuses.** Each candidate coin's parent spend is read and parsed as
+a CAT (reusing the CAT-transfer builder's `resolve_lineage`); a coin whose parent spend is missing, does
+not parse as a CAT, or does not create that coin as a CAT child is `CatTransferError::LineageUnavailable`
+for the entire call — never a partial `Vec` with the unprovable coin silently dropped, and never a `Cat`
+carrying a fabricated or absent lineage proof. A source that cannot answer for one coin is not evidence
+about the others (the same rule §6's transfer builder already applies to its own inputs).
+
+A chain that cannot be reached at all is `CatTransferError::ChainUnreachable`, distinct from an empty,
+successfully-read result.
+
 ## 7. The injected UI/auth-provider seam (host boundary)
 
 The host harness implements `AuthProvider`: `collect_factors(UnlockRequest) -> AuthFactors` (the unlock
