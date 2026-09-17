@@ -203,12 +203,12 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
 
     let found = discovered
         .iter()
-        .find(|d| d.launcher_id() == minted.distributor_launcher_id())
+        .find(|d| d.launcher_id() == minted.predicted_distributor_launcher_id())
         .expect("the launched distributor is discoverable from the bundle's own spends");
     assert_eq!(found.generation().store_id, STORE_ID);
     assert_eq!(found.generation().root, GENERATION_ROOT);
     assert_ne!(
-        minted.manager_launcher_id(),
+        minted.predicted_manager_launcher_id(),
         Bytes32::default(),
         "the manager singleton's launcher id is derived from a real launch spend"
     );

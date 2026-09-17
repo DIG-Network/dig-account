@@ -22,6 +22,9 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   callers; state only what the check catches (a re-aggregated security signature, an inconsistent
   wallet key, a skipped `sign`) and name the test that proves completeness relative to consensus
   (#58)
+- **mint:** Rename `SignedRewardDistributorMint::distributor_launcher_id`/`manager_launcher_id`
+  to `predicted_distributor_launcher_id`/`predicted_manager_launcher_id` and state the
+  pre-confirmation truth: no coin with either id exists until the bundle confirms (#58)
 
 ## [0.27.1] - 2026-09-08
 

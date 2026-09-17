@@ -136,17 +136,21 @@ impl SignedRewardDistributorMint {
         &self.bundle
     }
 
-    /// The distributor singleton's launcher id — the value every later read of this distributor
-    /// starts from.
+    /// The distributor singleton's launcher id.
+    ///
+    /// Derived from this bundle's own spends. No coin with this id exists until the bundle
+    /// confirms; a bundle that is never submitted, or is rejected, leaves this id naming nothing.
     #[must_use]
-    pub const fn distributor_launcher_id(&self) -> Bytes32 {
+    pub const fn predicted_distributor_launcher_id(&self) -> Bytes32 {
         self.distributor_launcher_id
     }
 
-    /// The manager singleton's launcher id, derived from the launch spend rather than echoed back
-    /// from the caller.
+    /// The manager singleton's launcher id.
+    ///
+    /// Derived from this bundle's own spends. No coin with this id exists until the bundle
+    /// confirms; a bundle that is never submitted, or is rejected, leaves this id naming nothing.
     #[must_use]
-    pub const fn manager_launcher_id(&self) -> Bytes32 {
+    pub const fn predicted_manager_launcher_id(&self) -> Bytes32 {
         self.manager_launcher_id
     }
 
