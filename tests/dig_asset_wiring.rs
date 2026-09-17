@@ -131,3 +131,32 @@ fn amounts_convert_to_whole_dig_and_thousandths() {
         "the largest representable amount converts exactly, with no rounding"
     );
 }
+
+/// **The two `dig-constants` lines agree about $DIG.**
+///
+/// This crate resolves `dig-constants` twice. `src/wallet/cat_transfer.rs` pays $DIG using 0.11.1's
+/// `DIG_ASSET_ID` (the line `dig-session` and `dig-wallet-backend` share), while the
+/// reward-distributor mint takes its reserve asset id from `dig-rewards-coin`, which is built
+/// against 0.13.1. The bytes are identical today — and each side only ever asserts against its own
+/// copy, so nothing in either suite would notice if one line moved.
+///
+/// A divergence would not fail loudly: `cat_transfer` would keep paying the old id while a
+/// distributor's reserve expected the new one, and a wallet holding "$DIG" could not fund a mint.
+#[test]
+fn both_dig_constants_lines_agree_on_the_dig_asset_id() {
+    let reserve_asset_id = dig_rewards_coin::dig_distributor_constants(
+        dig_rewards_coin::DistributorLaunchTerms {
+            manager_singleton_launcher_id: Bytes32::new([1; 32]),
+            distributor_epoch_seconds: dig_rewards_coin::DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+        },
+        Bytes32::new([2; 32]),
+    )
+    .expect("the DIG constants table builds")
+    .reserve_asset_id;
+
+    assert_eq!(
+        reserve_asset_id,
+        Bytes32::from(DIG_ASSET_ID),
+        "the $DIG asset id this crate PAYS with (dig-constants 0.11.1, via cat_transfer) and the one a reward distributor's reserve REQUIRES (dig-constants 0.13.1, via dig-rewards-coin) have diverged; every $DIG balance this crate shows is then about a different asset than the one a distributor mint will accept"
+    );
+}

@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "dig-account"
-version = "0.27.1"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1337,12 +1337,13 @@ dependencies = [
  "clvmr",
  "data-encoding",
  "dig-chainsource-interface",
- "dig-constants",
+ "dig-constants 0.11.1",
  "dig-did",
  "dig-identity",
  "dig-ipc-protocol",
  "dig-keystore",
  "dig-merkle",
+ "dig-rewards-coin",
  "dig-session",
  "dig-social-profile",
  "dig-wallet-backend",
@@ -1401,6 +1402,17 @@ name = "dig-constants"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "981cf9ffbc910c8558b519d04b91bb3aca3dd168d01da5ec20de978df61dee5e"
+dependencies = [
+ "chia-consensus",
+ "chia-protocol",
+ "hex-literal",
+]
+
+[[package]]
+name = "dig-constants"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51f0a8f7e2258d26b6c61090967c34d8ba14b5846786b62af01f3069be91b74a"
 dependencies = [
  "chia-consensus",
  "chia-protocol",
@@ -1500,13 +1512,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-rewards-coin"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b9ed98a581202162e010fa5693b3712d6775474e402268c2d3a565cb555c8f"
+dependencies = [
+ "chia-bls 0.36.1",
+ "chia-consensus",
+ "chia-protocol",
+ "chia-puzzle-types",
+ "chia-sdk-driver",
+ "chia-sdk-types",
+ "clvm-traits 0.36.1",
+ "clvmr",
+ "dig-chainsource-interface",
+ "dig-constants 0.13.1",
+ "hex",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "dig-session"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef37516658a3deb6591356993aac7cc21caa0b0ff1f48886be3095429cb4c6eb"
 dependencies = [
  "bip39",
- "dig-constants",
+ "dig-constants 0.11.1",
  "dig-identity",
  "dig-keystore",
  "hkdf",
@@ -1583,7 +1615,7 @@ dependencies = [
  "clvm-traits 0.36.1",
  "clvm-utils",
  "clvmr",
- "dig-constants",
+ "dig-constants 0.11.1",
  "dig-events-protocol",
  "dig-identity",
  "enumset",
