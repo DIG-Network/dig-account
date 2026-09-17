@@ -292,6 +292,37 @@ fn a_first_epoch_start_in_the_past_produces_no_bundle() {
     );
 }
 
+/// A zero `distributor_epoch_seconds` is refused BY THIS SEAM, before anything is staged.
+///
+/// The refusal cannot be left to the dependency: `dig-rewards-coin`'s constants builder rejects a
+/// zero epoch today, but this seam only reaches it because of where the statements happen to sit,
+/// and the range on that dependency is a caret. If the check ever moved, a zero epoch would reach
+/// `chia-sdk-driver`'s incentive commit, which does not terminate on it — a hang inside a seam
+/// holding the wallet's key, with nothing to report and no `.await` for a timeout to cancel.
+///
+/// So this asserts the refusal is the SEAM'S OWN, by variant and message: deleting the guard in
+/// `build_and_sign_reward_distributor_launch` turns this from `Refused` into whatever the
+/// dependency does that day.
+#[test]
+fn a_zero_epoch_length_produces_no_bundle() {
+    let ctx = &mut SpendContext::new();
+    let fixture = fixture(ctx, FUNDING_MOJOS);
+
+    let mut request = request(&fixture);
+    request.distributor_epoch_seconds = 0;
+
+    let Err(error) =
+        begin_reward_distributor_mint(&fixture.wallet, &request, &network(), &TESTNET11_CONSTANTS)
+    else {
+        panic!("a distributor whose epoch can never advance must not be minted");
+    };
+    assert!(matches!(error, MintError::Refused(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("epoch length is zero"),
+        "the seam states this refusal itself: {error}"
+    );
+}
+
 /// The bundle's own arithmetic: the funding coin's change is exactly what is left after the offer
 /// mojo, the manager singleton's mojo and the fee. Asserted on the SUBMITTED bundle, so a silent
 /// over-spend would show up as a missing change coin rather than as a comment.

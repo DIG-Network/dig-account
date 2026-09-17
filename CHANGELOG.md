@@ -11,6 +11,12 @@ This project adheres to [Semantic Versioning](https://semver.org) and
   signs the whole launch composition in one function, with a `SignedRewardDistributorMint` witness
   obtainable only after the aggregate signature is verified against the drained requirements (#58)
 
+### Bug Fixes
+- **mint:** Refuse a zero `distributor_epoch_seconds` in the seam itself, before anything is
+  staged. It was refused only by the statement order of a caret-ranged dependency's check; a
+  zero epoch reaching the driver's incentive commit does not terminate, and nothing on that
+  path is `.await`ed, so the process would hang holding the wallet's key (#58)
+
 ### Documentation
 - **mint:** Delete the overclaiming completeness doc on `verify_aggregate_discharges` and its
   callers; state only what the check catches (a re-aggregated security signature, an inconsistent

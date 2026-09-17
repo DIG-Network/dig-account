@@ -79,6 +79,11 @@ pub struct RewardDistributorMintRequest {
     /// entry set freezes forever, so there is no default and the caller must choose.
     pub manager_inner_puzzle: ManagerInnerPuzzle,
     /// The distributor's epoch length, curried into its action puzzles.
+    ///
+    /// Zero is REFUSED before anything is staged. An epoch length of zero is an epoch that can
+    /// never advance, and committing incentives to such a distributor does not terminate inside
+    /// the driver: there is no `.await` on that path, so no timeout can cancel it and the
+    /// process would hang inside a seam holding this account's key, with no error to report.
     pub distributor_epoch_seconds: u64,
     /// The unix second the first distributor epoch starts. Must be strictly in the future.
     pub first_epoch_start: u64,
@@ -228,6 +233,23 @@ fn build_and_sign_reward_distributor_launch(
         return Err(MintError::Refused(
             "the reward CAT is not at this wallet's puzzle hash; this account cannot authorize a \
              stranger's CAT into a reserve"
+                .into(),
+        ));
+    }
+
+    // A zero epoch length is refused HERE, ahead of every call into the dependency and before a
+    // single spend is staged. `dig-rewards-coin`'s constants builder happens to refuse it today,
+    // but that is a transitive crate's internal check held at a caret range, and this seam calls
+    // it only because of where the statements happen to sit. If either ever moves, a zero epoch
+    // reaches `chia-sdk-driver`'s incentive commit, which does NOT terminate on it
+    // (xch-dev/chia-wallet-sdk#436). Nothing on that path is `.await`ed, so no timeout can
+    // cancel it: the process would hang inside a seam holding the wallet's key, with no error
+    // to report. The refusal is stated by this seam, in the caller's own terms.
+    if request.distributor_epoch_seconds == 0 {
+        return Err(MintError::Refused(
+            "the distributor's epoch length is zero; an epoch that can never advance is a \
+             distributor no reward can ever be paid out of, and building one would hang the \
+             signing seam rather than fail it"
                 .into(),
         ));
     }

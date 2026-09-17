@@ -1722,6 +1722,14 @@ and the seam MUST state that refusal ITSELF. Today a wrong-asset CAT also fails 
 `chia-sdk-driver`'s offer lookup, so no bundle is built — but that is a transitive crate's internal
 behaviour at a caret range, and it names the driver's problem rather than the caller's.
 
+The request's `distributor_epoch_seconds` MUST be non-zero, and the seam MUST state that
+refusal ITSELF, before anything is staged. A zero epoch length is an epoch that can never
+advance; today `dig-rewards-coin`'s constants builder also refuses it, but that is a transitive
+crate's check at a caret range reached only because of this function's statement order. Were it
+to move, a zero epoch would reach `chia-sdk-driver`'s incentive commit, which does not
+terminate on it — and with no `.await` on that path, no timeout can cancel a seam holding the
+wallet's key. A refusal a caller can act on MUST NOT depend on either.
+
 ### 6BB.3a Two lifetime-scoped authorities are chosen at mint time (normative)
 
 A reward-distributor mint silently fixes two things for the distributor's whole life. Both MUST be
