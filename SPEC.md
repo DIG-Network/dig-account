@@ -1752,9 +1752,259 @@ spends into a signature is a route to the account's key that bypasses the gate.
 
 ### 6BB.5 Custody boundary
 
-Unchanged from §6A.6 and §6B.5. The seam does NOT push: a bundle that reached a mempool is not a
-confirmed distributor, so broadcasting stays with the `SpendPublisher` seam and confirmation stays
-with a chain read.
+Unchanged from §6A.6 and §6B.5. `begin_reward_distributor_mint` does NOT push: a bundle that reached
+a mempool is not a confirmed distributor. Broadcasting is `SignedRewardDistributorMint::submit`
+(§6BB.8) — the ONE explicit door, which takes a `SpendPublisher` and a `ChainSource` and no key —
+and confirmation is `PendingRewardDistributor::status` (§6BB.8), a chain read. Neither call can
+sign: everything that needed the account's key has already happened by the time either value exists.
+
+Three names mark the three stages of the launcher id and never blur them:
+`SignedRewardDistributorMint::predicted_distributor_launcher_id()` (signed, nothing pushed),
+`PendingRewardDistributor::distributor_launcher_id()` (pushed, unproven) and
+`ConfirmedRewardDistributor::distributor_launcher_id()` (proven on chain). They are the same 32
+bytes, derived once from the bundle's own spends; a reader MAY treat the value as a distributor's
+permanent identifier only when it arrives through the third.
+
+### 6BB.6 `PendingRewardDistributor` — pushed is not confirmed (normative)
+
+`PendingRewardDistributor` is the distributor twin of `PendingStoreLaunch` (§6B): a bundle that
+reached a mempool, as a value that names what to look for and nothing more. It has private fields,
+exactly one crate-private constructor (`new`), public getters, no `Default`, no `Deserialize` and no
+public constructor of any kind; `submit` (§6BB.8) is the only way to obtain one. Nothing in this
+crate or in a consumer MAY treat it as a distributor.
+
+A public constructor is refused for a sharper reason than tidiness: it would make `status` an
+evidence oracle. A caller supplying ANOTHER distributor's launcher id and generation would receive a
+`ConfirmedRewardDistributor` for a distributor this account never funded — proving a record exists
+is not proving it is yours. The pending value is therefore obtainable only from a bundle this crate
+built and pushed.
+
+Every field comes from the mint's OWN values — the bundle this crate built, the request it was
+built from, and one peak read — never from a chain answer, so a chain source cannot choose what
+`status` later compares its answers against:
+
+| field | type | source |
+|---|---|---|
+| `distributor_launcher_id` | `Bytes32` | the bundle's own spends (= `predicted_distributor_launcher_id()`) |
+| `manager_launcher_id` | `Bytes32` | the bundle's own spends (= `predicted_manager_launcher_id()`) |
+| `funding_coin_id` | `Bytes32` | `RewardDistributorMintRequest::funding.coin_id()` |
+| `reward_cat_coin_id` | `Bytes32` | `RewardDistributorMintRequest::reward_cat.coin.coin_id()` |
+| `requested_reserve_base_units` | `u64` | the reward CAT's amount in $DIG base units (1 $DIG = 1,000 base units); a REQUEST, not a reserve |
+| `generation` | `LaunchComment` | `RewardDistributorMintRequest::generation` — the `store_id:root` the launch comment advertises |
+| `pushed_at_height` | `u32` | the chain's peak, read immediately BEFORE the push |
+
+`funding_coin_id` and `reward_cat_coin_id` are the bundle's only two pre-existing inputs (§6BB.3
+rule 2). They are carried because they are the ONLY proof of death the chain can attest to: the
+bundle is atomic, so an input reported spent while the launcher coin does not exist can only have
+been consumed by a DIFFERENT spend (§6BB.8, step 3).
+
+`pushed_at_height()` is a real elapsed measure: `peak - pushed_at_height` is how many blocks the
+launch has been waiting. A caller sets its own deadline in blocks on it and re-mints when the
+deadline elapses (§6BB.8); it MUST NOT poll without one.
+
+This seam keeps NO journal and NO registry. The profile mint's journal (§6B.2) exists to make a
+two-bundle ceremony resumable; a distributor mint is one bundle with one confirmation, and the host
+(dig-app) owns whatever persistence its flow needs. `PendingRewardDistributor` is `Clone +
+PartialEq + Eq + Debug` so a host can hold, compare and log it; this crate does not serialise it.
+
+### 6BB.7 `ConfirmedRewardDistributor` — the evidence invariant (normative)
+
+**A distributor is reported only from evidence of an actual on-chain launch.**
+`ConfirmedRewardDistributor` carries `confirmed_height: u32` — not an `Option` — has private
+fields, exactly ONE crate-private constructor,
+`from_confirmed(pending, launcher_record, discovered, peak) -> Option<Self>`, no `Default`, no
+`Deserialize` and no public constructor. It is `Clone + PartialEq + Eq + Debug`. There is no way to
+assemble one from a key, a push receipt, a request or optimism; a host reaches one only as the
+payload of `RewardDistributorStatus::Confirmed` (§6BB.8). `tests/the_shape_is_unwritable.rs` holds
+this with a `trybuild` compile-fail case (`tests/compile_fail/a_distributor_needs_chain_evidence.rs`):
+a struct literal of either type, and a call to `from_confirmed` or `new` from outside the crate, do
+not compile.
+
+Its inputs are the `PendingRewardDistributor`; the `CoinRecord` the chain returned for the launcher
+id; the `DiscoveredDistributor` that `dig_rewards_coin::discover_distributor(chain, launcher_id)`
+returned for the same id — which decodes the launcher's PARENT spend's `CREATE_COIN` memos, never
+the launcher's own solution; and the chain's peak. `from_confirmed` returns `None` — never a
+partially populated value — unless every one of these five rules holds:
+
+1. **(a) It is the launcher coin.** `launcher_record.coin.coin_id() == pending.distributor_launcher_id()`.
+   A record of any other coin proves nothing about this launch.
+2. **(b) It is confirmed, not at genesis, and not before the push.** `confirmed_height` is `Some`,
+   is not `0` (no coin is created in block 0) and is `>= pending.pushed_at_height()` (a launch
+   cannot appear in a block that already existed when it was broadcast). An unconfirmed record is a
+   mempool observation, not evidence.
+3. **(c) It is buried.** `peak.saturating_sub(confirmed_height).saturating_add(1) >=
+   MIN_CONFIRMATION_DEPTH` (`= 6`; the confirming block is the first of the depth). This also
+   rejects a height PAST the peak, whose depth is at most 1, and `u32::MAX`, which a naive
+   subtraction would turn into an enormous depth.
+4. **(d) The discovery is for this launcher.** `discovered.launcher_id() ==
+   pending.distributor_launcher_id()`. `discover_distributor` derives that id from the `CREATE_COIN`
+   it decoded, so this compares a chain-derived value against the mint's own — never the caller's
+   id against itself.
+5. **(e) The generation matches.** `discovered.generation() == pending.generation()`: the
+   `store_id` AND `root` the launch comment on chain advertises are the ones this mint was asked to
+   pay mirrors of.
+
+Rules (a)–(c) are `ConfirmedStore::from_confirmed`'s (§6B), unchanged; (d) and (e) are what a
+distributor adds — a confirmed coin at the launcher id is some singleton's launcher, and only the
+decoded launch comment says it is a DIG rewards distributor for THIS generation. Each rule MUST be
+independently mutation-testable: one test per rule that removes exactly one contribution and asserts
+`None`, beside a control that produces `Some`. The genesis fixture pushes at height `0` so no other
+rule can be the one that rejects; the depth rule is pinned from BOTH sides (one block short refused,
+exactly at the bound accepted).
+
+Rules (a) and (d) cannot fail through `status` against a source that honours `coin_record`'s
+contract and a decoder that honours `discover_distributor`'s: the record was fetched by the very id
+(a) compares, and the discovery was selected by the very id (d) compares. They exist so that
+`from_confirmed` is sound on its own inputs, whoever supplies them; a `Failed` naming either means
+the source contradicted itself.
+
+The value carries `distributor_launcher_id`, `manager_launcher_id`, `confirmed_height`,
+`generation` and `requested_reserve_base_units` — every one copied from `pending` except
+`confirmed_height`, which is the record's. Each has a public getter; nothing else is exposed.
+
+### 6BB.8 `submit` and `status` — the four answers stay distinct (normative)
+
+#### The broadcast door
+
+`SignedRewardDistributorMint::submit<C: ChainSource + ?Sized, P: SpendPublisher + ?Sized>(&self,
+chain: &C, publisher: &P) -> MintResult<PendingRewardDistributor>` is the ONE way a signed
+distributor mint reaches a mempool through this crate. It takes no key, no seed and no account; it
+cannot sign, and it changes nothing in the bundle.
+
+It MUST read `chain.peak_height()` FIRST and refuse with `MintError::ChainUnreachable` BEFORE any
+broadcast when the chain cannot answer or reports no peak: without a peak a later confirmation
+height cannot be bounded, and a bundle pushed against an unbounded chain would be a pending that
+nothing could ever confirm. Then it pushes:
+
+| `SpendPublisher::push` answer | `submit` returns | meaning |
+|---|---|---|
+| `Ok(Accepted)` | `Ok(PendingRewardDistributor)` with `pushed_at_height = peak` | in flight |
+| `Ok(AlreadyInMempool)` | `Ok(PendingRewardDistributor)` — the same success | in flight, and already was |
+| `Ok(Rejected { reason })` | `Err(MintError::Rejected(reason))` | the network ANSWERED no; funds did not move; the same bundle fails the same way |
+| `Err(ChainUnavailable)` | `Err(MintError::ChainUnreachable)` | the outcome is UNKNOWN; the bundle may yet be included |
+
+`submit` takes `&self`, not `self`, deliberately. After `ChainUnreachable` the bundle MUST still be
+in the caller's hands to push again — a mempool is idempotent over an identical bundle, and
+`AlreadyInMempool` is the same success — so an unknown outcome never strands a signed bundle.
+Consuming `self` would turn every timeout into a re-mint, and a re-mint spends the same inputs.
+
+What a caller MAY NOT conclude from a re-submit: a `Rejected` answer to a SECOND push of a bundle
+whose first push had an unknown outcome does not retire the first push — a bundle already included
+in a block is rejected as a double spend, and it is the FIRST `PendingRewardDistributor`'s `status`
+that reports it `Confirmed`. A caller that re-submits MUST keep polling the pending from its
+EARLIEST successful `submit`: only that `pushed_at_height` is a true lower bound on the confirming
+block, and a later pending can see a genuine confirmation as a height that predates its own push
+(rule (b)), which step 5 below renders `Failed`.
+
+#### The confirmation read
+
+`PendingRewardDistributor::status<C: ChainSource + ?Sized>(&self, chain: &C) ->
+MintResult<RewardDistributorStatus>` spends, pushes and writes nothing. `RewardDistributorStatus`
+is a NEW enum — not `MintStatus`, whose `Confirmed` carries a `MintedDid`:
+
+```
+RewardDistributorStatus::Confirmed(ConfirmedRewardDistributor)
+RewardDistributorStatus::Awaiting { blocks_since_push: u32 }
+RewardDistributorStatus::Failed { reason: String }
+```
+
+Together, `submit` and `status` distinguish the four answers the seam owes its caller, and MUST NOT
+collapse any pair of them:
+
+| answer | where it appears | the caller's move |
+|---|---|---|
+| **not yet** | `Ok(Awaiting { blocks_since_push })` | keep polling; time out on `blocks_since_push`, then re-mint |
+| **rejected by the mempool** | `submit` → `Err(MintError::Rejected)` | the bundle is dead at submit time; there is nothing to poll |
+| **confirmed** | `Ok(Confirmed(evidence))` | record the distributor from the evidence |
+| **the read itself failed** | `Err(MintError::ChainUnreachable)` | nothing is known; retry the read; never record, never re-mint |
+
+An absence is never rendered as a zero or a benign pending: a chain that cannot be asked is an
+`Err`, not `Awaiting { blocks_since_push: 0 }`; a launcher that will never appear is `Failed`, not
+an `Awaiting` whose counter grows forever.
+
+`status` evaluates in this order. The order is normative: a discovery attempted against a coin the
+chain has not confirmed, or an input read before the launcher, would misreport.
+
+1. `peak_height(chain)` — an error, or `Ok(None)`, ⇒ `Err(ChainUnreachable)`.
+2. `chain.coin_record(distributor_launcher_id)` — an error ⇒ `Err(ChainUnreachable)`.
+3. **Launcher record ABSENT.** Read `coin_record(funding_coin_id)` and
+   `coin_record(reward_cat_coin_id)`; an error on either ⇒ `Err(ChainUnreachable)`. If either
+   record `is_spent()` ⇒ `Failed` (proof of death: "the funding coin / the reward CAT was spent by
+   a different spend; this mint can never confirm"). Otherwise ⇒
+   `Awaiting { blocks_since_push: peak.saturating_sub(pushed_at_height) }` — a source whose peak
+   is behind the push's reads `0`, never an underflow.
+4. **Launcher record PRESENT, `confirmed_height` is `None`.** ⇒ `Awaiting`. A mempool observation
+   is "not yet"; discovery is NOT attempted, since the parent spend of an unconfirmed coin need not
+   be readable and its absence would be misread as a contradiction.
+5. **Launcher record PRESENT and confirmed.** Call
+   `discover_distributor(chain, distributor_launcher_id)`. `Err(_)` — `RewardsError::ChainUnavailable`,
+   `RewardsError::Malformed` or any other variant — ⇒ `Err(ChainUnreachable)`: the READ failed or
+   could not be decoded, and that is never a status. `Ok(None)` ⇒ `Failed` ("the launcher coin is
+   confirmed, but the spend that created it advertises no DIG rewards distributor for it"): a
+   confirmed launcher that is not a distributor is a contradiction, not "not yet".
+   `Ok(Some(discovered))` ⇒ apply §6BB.7:
+   - all five rules hold ⇒ `Confirmed(evidence)`;
+   - (a), (b), (d) and (e) hold and only depth (c) is short ⇒ `Awaiting { blocks_since_push }`;
+   - (a), (b), (d) or (e) fails ⇒ `Failed { reason }` naming the rule — NEVER `Awaiting`. A
+     confirmed coin that is not this distributor, or a confirmation the chain places at genesis or
+     before this push, will not become this distributor by waiting.
+
+The five rules MUST be evaluated once, by one crate-private checker whose result names the failing
+rule; `from_confirmed` and `status` both consume it, so the constructor and the status query cannot
+drift apart.
+
+`Failed` has two classes, and its `reason` MUST make the class legible to a reader of the string:
+
+- **Proof of death** (step 3): an input was spent by a different spend. The chain attests that this
+  bundle can never be included. This is the only class the DID and store twins have (§6A.2a).
+- **Contradiction** (step 5): the chain's answers do not describe this pending — no distributor at a
+  confirmed launcher, a different launcher id or generation, a wrong coin, a confirmation at
+  genesis or before this push. Polling further changes nothing.
+
+`Failed` is NOT a general death signal. The likelier death — eviction from a mempool the bundle
+never left, with a zero fee on a busy chain — leaves both inputs unspent and is, on chain,
+identical to a slow mint; it MUST report `Awaiting`, and the caller's block deadline retires it.
+The contract is that a caller always holds a proof of death, a named contradiction, or a
+monotonically growing number to time out on — never an unchanging absence.
+
+`status` MUST NOT report `Failed` for a mint whose launcher coin exists and satisfies the rules: an
+included mint has spent its inputs by way of its own bundle, and calling that a different spend
+would make a caller re-mint a distributor it had already funded. This is why the launcher is read
+(step 2) before either input (step 3).
+
+Generic bounds: `status` is generic over `C: ChainSource + ?Sized`, like `mint_status` (§6A.2a).
+`discover_distributor` takes `&impl ChainSource`, which is `Sized`, so the implementation reaches it
+through a crate-private by-reference adapter that forwards every `ChainSource` method; the bound on
+the public seam does not narrow to fit a dependency's signature.
+
+### 6BB.9 What confirmation does NOT prove (normative)
+
+`ConfirmedRewardDistributor` is the chain source's testimony, checked for internal consistency. A
+reader MAY conclude from it that a coin with the launcher id exists, is buried
+`MIN_CONFIRMATION_DEPTH` deep according to that source, and was created by a spend whose launch
+comment names this generation. A reader MAY NOT conclude:
+
+1. **That the source is honest.** The five rules close the DEGENERATE fabrications — genesis, the
+   future, a height predating the push, an unrelated coin, a different generation — and buy real
+   reorg safety against an HONEST source. They cost a dishonest one nothing: in a typical deployment
+   the source is the same node the bundle was pushed to. The mitigation is the caller's — a trusted
+   or aggregating `ChainSource`.
+2. **Anything about the generation's CONTENT.** `generation()` is the `store_id:root` the launch
+   comment advertised, carried from the request this crate built the bundle from. The chain proves
+   the comment was written, not that any store has that root or that any bytes hash to it.
+3. **That a reserve of `requested_reserve_base_units` exists or is spendable.** The value is the
+   reward CAT's amount echoed from the request, in $DIG base units. The distributor's live reserve,
+   its entries and its epoch state are read through `dig-rewards-coin`'s own state readers, never
+   inferred from this evidence.
+4. **That the manager is reachable.** `manager_launcher_id()` is the id this mint derived; whether
+   the key behind `manager_inner_puzzle` still exists is the caller's for the distributor's lifetime
+   (§6BB.3a).
+5. **That `Failed` means "no distributor exists".** A proof-of-death `Failed` proves THIS bundle was
+   not included, and the caller mints again from inputs it re-reads from chain. A contradiction
+   `Failed` proves only that the source's answers do not describe this pending — the launcher coin
+   it names IS confirmed — so a caller MUST NOT re-mint from a second set of inputs on its strength
+   alone; re-reading the first bundle's inputs (spent, or not) is what says whether a reserve was
+   funded.
 
 ## 6C. `CoinsetPublisher` — the optional coinset.org broadcast seam
 
