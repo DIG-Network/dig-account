@@ -47,21 +47,21 @@ dig-session = "0.9"
 # no dig-identity type can meet a different one across a seam.
 dig-identity = "0.7.1"
 dig-keystore = "0.13"
-# The single dig-constants line: dig-session 0.9 and dig-wallet-backend 0.31 both require ^0.11, so
-# asking for it here upgrades that shared edge rather than resolving a second one beside it.
+# Bumped to ^0.13 (§2.4b, #3341): the hold recorded below stopped applying the moment
+# dig-rewards-coin adopted `dig-constants ^0.13.1` (every published 0.4.x-0.7.x line does) — a
+# SECOND dig-constants line was already resolving through that edge regardless of what this line
+# said, so holding here no longer avoided the duplication it was written to avoid; it only kept
+# this crate's OWN reads on the older half of an already-split graph. dig-session 0.9.1 and
+# dig-wallet-backend 0.31.1 still declare `^0.11.1` / `^0.11`, so the duplicate persists across
+# that edge — moving this line does not remove it, it only unifies dig-account's direct use with
+# the line dig-rewards-coin already forces. This crate reads only `PROFILE_SEALING_X`,
+# `PROFILE_DEK_LABEL` and `DIG_ASSET_ID` from it, all present unchanged on 0.13.1 (measured).
 #
-# HELD at ^0.11 DELIBERATELY, against §2.4b's "bring dig-* to latest". 0.13.1 is published, and
-# measured from the index on 2026-09-04: dig-session 0.9.1 declares `dig-constants ^0.11.1` and
-# dig-wallet-backend 0.31.1 declares `^0.11`. Neither has adopted 0.13. So bumping the caret HERE
-# would not upgrade that shared edge — it would resolve a SECOND dig-constants line beside it, one
-# 0.13 for this crate and one 0.11 for the session and money seams it hands values to. That is the
-# exact duplication this comment's first sentence exists to prevent, and §2.4b names it outright:
-# do not bump a dep whose new version drags in an old line; verify from the resolved lock.
-#
-# The order is release-first (§4.1): dig-session and dig-wallet-backend adopt ^0.13, and only then
-# does this line move. Tracked as a named child rather than folded in here, because that cascade is
-# two other repos wide and would dwarf this crate's change.
-dig-constants = "0.11"
+# Original hold, kept for the session/wallet-backend edge which is UNCHANGED by this bump: The
+# single dig-constants line for those two: dig-session 0.9 and dig-wallet-backend 0.31 both
+# require ^0.11, so asking for it there upgrades that shared edge rather than resolving a second
+# one beside it. That pair still needs to move release-first (§4.1) before ITS line can follow.
+dig-constants = "0.13"
 # Floor at 0.3.1, which is the first release on chia-bls ^0.36.1. 0.3.0 required ^0.26 and was the
 # ONLY edge in this tree resolving a chia-bls line other than 0.36.1 through a first-party crate —
 # the remaining duplicates are internal to clvmr and chialisp and reach no public signature. The
@@ -113,15 +113,16 @@ dig-chainsource-interface = { version = "0.3.3", features = ["lineage-walk"] }
 # the eve store and the owner-discovery memos all come from here, and the parent conditions it hands
 # back are folded into the DID's own spend so the two ride in one atomic bundle.
 #
-# ^0.9 IS the index latest (0.9.1, re-measured 2026-09-04) and the tree resolves exactly one
-# dig-merkle line. That cascade is finished; this note used to say "DO NOT bump to ^0.8" and to hold
-# at ^0.6, which described a tree that no longer exists.
+# 0.9.1 IS the index latest (re-measured 2026-09-17, §2.4b/#3341) and the tree resolves exactly
+# one dig-merkle line at that version already. Pinned to the patch rather than left at the `0.9`
+# caret so this line states what is actually resolved, not just what would still be permitted.
 #
-# The lesson it recorded is the part worth keeping, because the shape recurs: dig-merkle is reached
-# BOTH directly and through dig-social-profile -> dig-store, so bumping the caret here does not
-# upgrade those edges — it resolves a SECOND line beside them. The order is always dig-store first,
-# then dig-social-profile, then here. Re-check with `cargo tree -d` before moving this line.
-dig-merkle = "0.9"
+# The lesson kept from the caret era, because the shape recurs: dig-merkle is reached BOTH
+# directly and through dig-social-profile -> dig-store, so bumping this line does not upgrade
+# those edges on its own — it resolves a SECOND line beside them if they have not moved too. The
+# order is always dig-store first, then dig-social-profile, then here. Re-check with
+# `cargo tree -d` before moving this line further.
+dig-merkle = "0.9.1"
 # The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
 #
 # 0.4 is the first release on the chia 0.36.1 / chia-wallet-sdk 0.34 family. Before it, this crate
@@ -179,7 +180,11 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # response MAPPING is deliberately independent of it, so the mempool-verdict logic is unit-tested
 # through the `PushTransport` seam with no client and no network at all.
 ureq = { version = "2", optional = true }
-dig-rewards-coin = "0.6"
+# Bumped to ^0.7 (§2.4b, #3341): 0.7.0 is additive over 0.6.0 — the only change is
+# `DECODE_MAX_SERIALIZED_BYTES` (measured against the index) — and this crate's reward-distributor
+# publish/confirm half (`discover_distributor`, `DiscoveredDistributor`) is new code, so there is no
+# existing call site to adapt.
+dig-rewards-coin = "0.7"
 
 [dev-dependencies]
 # Test-only: the INDEPENDENT BIP-39 expansion used as the reference for the account root, so a
