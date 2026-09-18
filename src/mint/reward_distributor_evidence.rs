@@ -394,7 +394,10 @@ mod tests {
             evidence.distributor_launcher_id(),
             pending.distributor_launcher_id()
         );
-        assert_eq!(evidence.manager_launcher_id(), pending.manager_launcher_id());
+        assert_eq!(
+            evidence.manager_launcher_id(),
+            pending.manager_launcher_id()
+        );
         assert_eq!(evidence.confirmed_height(), PUSHED_AT);
         assert_eq!(evidence.generation(), pending.generation());
         assert_eq!(
@@ -410,10 +413,13 @@ mod tests {
         let (pending, launcher_coin, discovered) = matching_scenario(2);
         let unconfirmed = record(launcher_coin, None);
 
-        assert!(
-            ConfirmedRewardDistributor::from_confirmed(&pending, &unconfirmed, &discovered, PEAK)
-                .is_none()
-        );
+        assert!(ConfirmedRewardDistributor::from_confirmed(
+            &pending,
+            &unconfirmed,
+            &discovered,
+            PEAK
+        )
+        .is_none());
         // Asserted on the specific rule, not just `None`: `unwrap_or(0)` in place of the `?` would
         // also yield `None` here (falling through to the Genesis check), which an `is_none()`-only
         // assertion cannot tell apart from this rule actually firing.
@@ -584,7 +590,10 @@ mod tests {
             wrong_generation_discovered.launcher_id(),
             pending.distributor_launcher_id()
         );
-        assert_ne!(wrong_generation_discovered.generation(), pending.generation());
+        assert_ne!(
+            wrong_generation_discovered.generation(),
+            pending.generation()
+        );
 
         assert!(ConfirmedRewardDistributor::from_confirmed(
             &pending,

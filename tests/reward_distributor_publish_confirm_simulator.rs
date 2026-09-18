@@ -56,7 +56,12 @@ fn dig_reserve_asset_id() -> Bytes32 {
     .reserve_asset_id
 }
 
-fn wallet_owned_cat(chain: &SimulatorChain, wallet: &WalletKey, asset_id: Bytes32, amount: u64) -> Cat {
+fn wallet_owned_cat(
+    chain: &SimulatorChain,
+    wallet: &WalletKey,
+    asset_id: Bytes32,
+    amount: u64,
+) -> Cat {
     let inner_puzzle_hash = wallet.puzzle_hash();
     let cat_puzzle_hash: Bytes32 =
         CatArgs::curry_tree_hash(asset_id, inner_puzzle_hash.into()).into();
@@ -145,13 +150,9 @@ fn request(fixture: &Fixture) -> RewardDistributorMintRequest {
 #[test]
 fn a_submitted_mint_is_awaiting_then_confirmed_after_burial() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
 
     let pending = minted
         .submit(&f.chain, &f.chain)
@@ -190,7 +191,10 @@ fn a_submitted_mint_is_awaiting_then_confirmed_after_burial() {
         .expect("a reachable chain never errors on a read");
     match status {
         RewardDistributorStatus::Confirmed(evidence) => {
-            assert_eq!(evidence.distributor_launcher_id(), pending.distributor_launcher_id());
+            assert_eq!(
+                evidence.distributor_launcher_id(),
+                pending.distributor_launcher_id()
+            );
             assert_eq!(evidence.generation(), pending.generation());
             assert!(
                 evidence.confirmed_height() >= pending.pushed_at_height(),
@@ -205,13 +209,9 @@ fn a_submitted_mint_is_awaiting_then_confirmed_after_burial() {
 #[test]
 fn an_offline_chain_refuses_before_any_broadcast() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
 
     let offline = SimulatorChain::offline();
     let result = minted.submit(&offline, &offline);
@@ -232,13 +232,9 @@ fn an_offline_chain_refuses_before_any_broadcast() {
 #[test]
 fn a_rejected_push_is_rejected_not_unreachable() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
 
     let rejecting = SimulatorChain::rejecting("mempool full");
     let result = minted.submit(&rejecting, &rejecting);
@@ -251,13 +247,9 @@ fn a_rejected_push_is_rejected_not_unreachable() {
 #[test]
 fn a_re_submit_of_the_same_bundle_is_the_same_success() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
 
     let first = minted
         .submit(&f.chain, &f.chain)
@@ -277,13 +269,9 @@ fn a_re_submit_of_the_same_bundle_is_the_same_success() {
 #[test]
 fn an_input_spent_elsewhere_is_failed_not_awaiting_funding() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
     let pending = minted
         .submit(&f.chain, &f.chain)
         .expect("submits before the input is reported spent");
@@ -303,13 +291,9 @@ fn an_input_spent_elsewhere_is_failed_not_awaiting_funding() {
 #[test]
 fn an_input_spent_elsewhere_is_failed_not_awaiting_reward_cat() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
     let pending = minted
         .submit(&f.chain, &f.chain)
         .expect("submits before the input is reported spent");
@@ -330,16 +314,10 @@ fn an_input_spent_elsewhere_is_failed_not_awaiting_reward_cat() {
 #[test]
 fn a_read_failure_mid_poll_is_an_error_not_a_status() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
-    let pending = minted
-        .submit(&f.chain, &f.chain)
-        .expect("submits");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted.submit(&f.chain, &f.chain).expect("submits");
     f.chain.farm().expect("confirms and buries");
 
     // Discovery must be attempted (the launcher is confirmed) and must fail: the parent spend read
@@ -366,16 +344,10 @@ fn a_read_failure_mid_poll_is_an_error_not_a_status() {
 #[test]
 fn a_mempool_observation_of_the_launcher_is_awaiting() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
-    let pending = minted
-        .submit(&f.chain, &f.chain)
-        .expect("submits");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted.submit(&f.chain, &f.chain).expect("submits");
 
     // A coin's id is a hash of its own fields, so "the launcher coin" cannot be fabricated with an
     // arbitrary id: it must be `Launcher::new(parent_id, 1).coin()` for the REAL parent this
@@ -386,7 +358,9 @@ fn a_mempool_observation_of_the_launcher_is_awaiting() {
         .coin_spends
         .iter()
         .map(|spend| spend.coin.coin_id())
-        .find(|&candidate| Launcher::new(candidate, 1).coin().coin_id() == pending.distributor_launcher_id())
+        .find(|&candidate| {
+            Launcher::new(candidate, 1).coin().coin_id() == pending.distributor_launcher_id()
+        })
         .expect("one of the bundle's own spent coins is the launcher's real parent");
     let launcher_coin = Launcher::new(parent_id, 1).coin();
     f.chain.observe_in_mempool(launcher_coin);
@@ -405,16 +379,12 @@ fn a_mempool_observation_of_the_launcher_is_awaiting() {
 #[test]
 fn an_eviction_stays_awaiting_with_a_growing_count() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
-    let pending = minted
-        .submit(&f.chain, &f.chain)
-        .expect("submits, then is silently evicted -- the mempool below is never drained by a block");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted.submit(&f.chain, &f.chain).expect(
+        "submits, then is silently evicted -- the mempool below is never drained by a block",
+    );
 
     let RewardDistributorStatus::Awaiting {
         blocks_since_push: first,
@@ -453,10 +423,7 @@ struct FailingParentRead<'a> {
 impl ChainSource for FailingParentRead<'_> {
     type Error = String;
 
-    fn coin_record(
-        &self,
-        coin_id: Bytes32,
-    ) -> Result<Option<CoinRecord>, Self::Error> {
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
         self.inner.coin_record(coin_id)
     }
 
@@ -469,10 +436,7 @@ impl ChainSource for FailingParentRead<'_> {
             .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
     }
 
-    fn coin_records_by_parent(
-        &self,
-        parent: Bytes32,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
         self.inner.coin_records_by_parent(parent)
     }
 
@@ -516,10 +480,7 @@ struct SubstitutedParentSpend<'a> {
 impl ChainSource for SubstitutedParentSpend<'_> {
     type Error = String;
 
-    fn coin_record(
-        &self,
-        coin_id: Bytes32,
-    ) -> Result<Option<CoinRecord>, Self::Error> {
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
         self.inner.coin_record(coin_id)
     }
 
@@ -532,10 +493,7 @@ impl ChainSource for SubstitutedParentSpend<'_> {
             .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
     }
 
-    fn coin_records_by_parent(
-        &self,
-        parent: Bytes32,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
         self.inner.coin_records_by_parent(parent)
     }
 
@@ -607,16 +565,10 @@ fn fabricate_launch_spend(parent: Coin, generation: LaunchComment) -> CoinSpend 
 #[test]
 fn a_confirmed_launcher_advertising_another_generation_is_failed() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
-    let pending = minted
-        .submit(&f.chain, &f.chain)
-        .expect("submits");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted.submit(&f.chain, &f.chain).expect("submits");
     f.chain.farm().expect("confirms and buries");
 
     let launcher_id = pending.distributor_launcher_id();
@@ -657,16 +609,10 @@ fn a_confirmed_launcher_advertising_another_generation_is_failed() {
 #[test]
 fn a_confirmation_at_genesis_is_failed_not_awaiting() {
     let f = fixture(FUNDING_MOJOS);
-    let minted = begin_reward_distributor_mint(
-        &f.wallet,
-        &request(&f),
-        &network(),
-        &TESTNET11_CONSTANTS,
-    )
-    .expect("the launch builds, gates and signs");
-    let pending = minted
-        .submit(&f.chain, &f.chain)
-        .expect("submits");
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted.submit(&f.chain, &f.chain).expect("submits");
     f.chain.farm().expect("confirms and buries");
 
     let launcher_id = pending.distributor_launcher_id();
@@ -706,13 +652,11 @@ struct GenesisConfirmed<'a> {
 impl ChainSource for GenesisConfirmed<'_> {
     type Error = String;
 
-    fn coin_record(
-        &self,
-        coin_id: Bytes32,
-    ) -> Result<Option<CoinRecord>, Self::Error> {
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
         let record = self.inner.coin_record(coin_id)?;
         Ok(record.map(|mut record| {
-            if coin_id == self.launcher_id && record.confirmed_height == Some(self.real_confirmed_height)
+            if coin_id == self.launcher_id
+                && record.confirmed_height == Some(self.real_confirmed_height)
             {
                 record.confirmed_height = Some(0);
             }
@@ -729,10 +673,7 @@ impl ChainSource for GenesisConfirmed<'_> {
             .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
     }
 
-    fn coin_records_by_parent(
-        &self,
-        parent: Bytes32,
-    ) -> Result<Vec<CoinRecord>, Self::Error> {
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
         self.inner.coin_records_by_parent(parent)
     }
 

@@ -247,7 +247,8 @@ impl<C: ChainSource + ?Sized> ChainSource for ByRef<'_, C> {
         puzzle_hash: Bytes32,
         include_spent: bool,
     ) -> Result<Vec<CoinRecord>, Self::Error> {
-        self.0.coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+        self.0
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
     }
 
     fn coin_records_by_parent(
@@ -1246,10 +1247,7 @@ mod status_tests {
         // `funding_coin_id`/`reward_cat_coin_id` are reported SPENT — if the launcher were not
         // read first, this would misreport as proof-of-death `Failed`.
         let mut records = HashMap::new();
-        records.insert(
-            launcher_id,
-            record(launcher_coin, Some(PUSHED_AT), None),
-        );
+        records.insert(launcher_id, record(launcher_coin, Some(PUSHED_AT), None));
         records.insert(
             p.funding_coin_id(),
             record(
