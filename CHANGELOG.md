@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.0] - 2026-09-17
+
+### Features
+- **account:** `reward_distributor_minter()` facade over the reward-distributor mint seam (#60)
+- **cat_transfer:** Public `cat_coins` / `dig_cat_coins` unspent, lineage-proven CAT selection (#59)
+
 ## [0.28.0] - 2026-09-17
 
 ### Features
