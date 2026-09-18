@@ -1,7 +1,12 @@
 //! Genuine mint evidence for crate-internal tests (see the module doc on [`super::fixtures`]).
 
-use chia_protocol::{Bytes32, Coin};
+use chia_protocol::{Bytes32, Coin, CoinSpend};
+use chia_wallet_sdk::clvm_traits::{clvm_quote, ToClvm};
+use chia_wallet_sdk::driver::{Launcher, SpendContext};
+use chia_wallet_sdk::types::Conditions;
+use chia_wallet_sdk::clvmr::NodePtr;
 use dig_chainsource_interface::CoinRecord;
+use dig_rewards_coin::{discovered_distributors_in_spend, DiscoveredDistributor, LaunchComment};
 
 use super::evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 use super::store_evidence::{ConfirmedStore, PendingStoreLaunch};
@@ -94,4 +99,69 @@ pub(crate) fn bound_mint(seed: u8) -> (MintedDid, ConfirmedStore) {
     let did = minted_did(seed);
     let store = store_launched_from(seed.wrapping_add(1), did.coin_id());
     (did, store)
+}
+
+/// The exact hint atom `dig-rewards-coin` looks for on a launcher-creating `CREATE_COIN`'s memos
+/// (`dig_rewards_coin::discovery`). Not exported by that crate, so restated here — the same way
+/// its own tests restate it — because a genuine [`DiscoveredDistributor`] can only be produced by
+/// decoding a real spend, and there is no other way to build one.
+const REWARD_DISTRIBUTOR_HINT: &str = "Reward Distributor v1";
+
+/// Build a REAL, genuinely-decoded [`DiscoveredDistributor`] plus the parent `CoinSpend` it was
+/// decoded from: a quote-puzzle spend of `parent` whose `CREATE_COIN` targets the singleton
+/// launcher hash with `generation` rendered into the memo `discover_distributor` decodes.
+///
+/// Mirrors the idiom `dig-rewards-coin`'s own `discovery.rs` tests use to build a well-formed
+/// launcher-creating parent spend. The returned [`DiscoveredDistributor::launcher_id`] is
+/// `Launcher::new(parent.coin_id(), 1).coin().coin_id()`, never a caller-chosen id — the whole
+/// point of using the real decoder rather than fabricating a value directly.
+pub(crate) fn discovered_distributor(
+    parent: &Coin,
+    generation: LaunchComment,
+) -> (DiscoveredDistributor, CoinSpend) {
+    let mut ctx = SpendContext::new();
+
+    let launcher = Launcher::new(parent.coin_id(), 1);
+
+    // The memo's first atom is the HINT'S TREE HASH, not the string itself -- mirroring
+    // `chia-sdk-driver`'s own `launch_reward_distributor`, whose decode counterpart
+    // (`discover_distributor_in_spend`) extracts this atom as a `Bytes32` and compares it against
+    // a freshly recomputed tree hash. A raw string atom here would be the wrong shape and would
+    // simply fail to decode.
+    let raw_hint_ptr = ctx
+        .alloc(&REWARD_DISTRIBUTOR_HINT)
+        .expect("allocating a string literal cannot fail");
+    let hint_hash: Bytes32 = ctx.tree_hash(raw_hint_ptr).into();
+    let hint_ptr = ctx
+        .alloc(&hint_hash)
+        .expect("allocating a Bytes32 cannot fail");
+    let comment_ptr = ctx
+        .alloc(&generation.to_string())
+        .expect("allocating a rendered LaunchComment cannot fail");
+    let memos = ctx
+        .memos(&(hint_ptr, (comment_ptr, ())))
+        .expect("allocating the memo tuple cannot fail");
+
+    let conditions =
+        Conditions::<NodePtr>::new().create_coin(launcher.coin().puzzle_hash, 1, memos);
+    let puzzle_ptr = clvm_quote!(conditions)
+        .to_clvm(&mut ctx)
+        .expect("quoting a condition list cannot fail");
+    let puzzle_reveal = ctx
+        .serialize(&puzzle_ptr)
+        .expect("serializing an allocated puzzle cannot fail");
+    let solution = ctx
+        .serialize(&NodePtr::NIL)
+        .expect("serializing NIL cannot fail");
+
+    let observed = CoinSpend::new(*parent, puzzle_reveal, solution);
+
+    let discoveries = discovered_distributors_in_spend(&observed)
+        .expect("a well-formed quote-puzzle spend always decodes");
+    let discovered = discoveries
+        .into_iter()
+        .find(|d| d.launcher_id() == launcher.coin().coin_id())
+        .expect("the CREATE_COIN this fixture built targets exactly the launcher it derives");
+
+    (discovered, observed)
 }
