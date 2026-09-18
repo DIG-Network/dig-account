@@ -451,8 +451,16 @@ fn dig_cat_coins_lists_only_unspent_coins_at_the_curried_hash() {
     f.chain.bury(1);
 
     let result = cat_coins(&f.chain, asset_id, f.p2).expect("the chain reads cleanly");
-    assert_eq!(result.cats().len(), 1, "only the unspent coin must be listed");
-    assert_eq!(result.omitted(), 0, "well under the bound, nothing is omitted");
+    assert_eq!(
+        result.cats().len(),
+        1,
+        "only the unspent coin must be listed"
+    );
+    assert_eq!(
+        result.omitted(),
+        0,
+        "well under the bound, nothing is omitted"
+    );
     assert_eq!(result.cats()[0].coin, survivor.coin);
     assert!(result.cats()[0].lineage_proof.is_some());
 }
@@ -600,8 +608,8 @@ fn a_record_at_another_puzzle_hash_is_excluded_not_attributed() {
         .expect("the stranger's coin is a real, confirmed record");
     let hostile = AdversarialChain::honest(&f.chain).planting(planted);
 
-    let result = cat_coins(&hostile, asset_id, f.p2)
-        .expect("this wallet's own genuine coin still resolves");
+    let result =
+        cat_coins(&hostile, asset_id, f.p2).expect("this wallet's own genuine coin still resolves");
     assert_eq!(
         result.cats().len(),
         1,
@@ -695,13 +703,21 @@ fn a_dust_flood_is_bounded_and_the_omission_is_counted() {
     let flood_count = MAX_LISTED_CAT_COINS + 3;
     let amounts: Vec<u64> = (0..flood_count).map(|i| 1_000 + i as u64).collect();
     let (asset_id, children) = issue_cats(&f, &mut ctx, &amounts);
-    assert_eq!(children.len(), flood_count, "every dust coin must be genuinely provable");
+    assert_eq!(
+        children.len(),
+        flood_count,
+        "every dust coin must be genuinely provable"
+    );
 
     let counting = AdversarialChain::honest(&f.chain);
     let result = cat_coins(&counting, asset_id, f.p2).expect("the bounded set still resolves");
 
     assert_eq!(result.cats().len(), MAX_LISTED_CAT_COINS);
-    assert_eq!(result.omitted(), 3, "the 3 candidates past the bound must be counted, not dropped");
+    assert_eq!(
+        result.omitted(),
+        3,
+        "the 3 candidates past the bound must be counted, not dropped"
+    );
     assert_eq!(
         counting.coin_spend_reads(),
         MAX_LISTED_CAT_COINS,
