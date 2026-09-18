@@ -359,11 +359,18 @@ fn a_cat_whose_parent_spend_is_missing_is_refused_not_fabricated() {
 }
 
 /// `dig_cat_coins` is `cat_coins` fixed to `DIG_ASSET_ID`, and its curried puzzle hash agrees with
-/// `dig_curried_puzzle_hash` — the same known-answer pin the transfer builder runs, now for the
+/// `dig_curried_puzzle_hash` -- the same known-answer pin the transfer builder runs, now for the
 /// public read path.
 ///
-/// MUTATION PROOF: swapping `DIG_ASSET_ID` for a different asset id inside `dig_cat_coins` makes this
-/// test fail (the puzzle-hash equality breaks, and the two calls stop agreeing).
+/// A WITNESS coin is what makes this test able to fail: an empty wallet reads `Ok(vec![])` no matter
+/// which asset id the call curried, so the two calls would agree vacuously. A test cannot issue a
+/// CAT that hashes to $DIG's own TAIL, so the witness is instead a parentless coin placed at the
+/// $DIG curried puzzle hash -- `dig_cat_coins` proves it looked THERE by refusing for that coin by
+/// name.
+///
+/// MUTATION PROOF (run): swapping `DIG_ASSET_ID` for a foreign asset id inside `dig_cat_coins` makes
+/// this test fail -- the call then curries a different puzzle hash, never sees the witness, and
+/// returns `Ok(vec![])` where a refusal is required.
 #[test]
 fn dig_cat_coins_is_cat_coins_fixed_to_the_dig_asset() {
     let p2 = Bytes32::new([0x33; 32]);
@@ -374,7 +381,25 @@ fn dig_cat_coins_is_cat_coins_fixed_to_the_dig_asset() {
     );
 
     let f = fixture();
-    let a = dig_cat_coins(&f.chain, f.p2).expect("an empty wallet reads cleanly");
-    let b = cat_coins(&f.chain, DIG_ASSET_ID, f.p2).expect("an empty wallet reads cleanly");
-    assert_eq!(a, b, "dig_cat_coins must be cat_coins pinned to DIG_ASSET_ID, nothing more");
+    let witness = Coin::new(Bytes32::new([0xEE; 32]), dig_curried_puzzle_hash(f.p2), 9_000);
+    f.chain.sim.borrow_mut().insert_coin(witness);
+
+    let via_dig =
+        dig_cat_coins(&f.chain, f.p2).expect_err("the witness coin at the $DIG hash has no lineage");
+    let via_cat_coins = cat_coins(&f.chain, DIG_ASSET_ID, f.p2)
+        .expect_err("the explicit $DIG call must refuse for the same coin");
+
+    match &via_dig {
+        CatTransferError::LineageUnavailable { coin_id, .. } => assert_eq!(
+            *coin_id,
+            witness.coin_id(),
+            "dig_cat_coins must read the $DIG curried puzzle hash"
+        ),
+        other => panic!("expected LineageUnavailable for the witness coin, got {other:?}"),
+    }
+    assert_eq!(
+        via_dig.to_string(),
+        via_cat_coins.to_string(),
+        "dig_cat_coins must be cat_coins pinned to DIG_ASSET_ID, nothing more"
+    );
 }
