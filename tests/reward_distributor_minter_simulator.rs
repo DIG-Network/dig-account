@@ -5,8 +5,9 @@
 //! `UnlockedAccount::reward_distributor_minter()` behaves identically to the raw §6BB seam it wraps,
 //! refuses the moment the account relocks, and hands out no key anywhere along the way. Tests 4-9
 //! prove what the public CAT selection §6G is built on: unspent-only (even against a source that
-//! ignores `include_spent`), whole-call refusal on an unprovable lineage, `dig_cat_coins` fixed to
-//! the $DIG asset, puzzle-hash re-attribution refused, and reads bounded by `MAX_LISTED_CAT_COINS`.
+//! answers with a spent coin anyway), whole-call refusal on an unprovable lineage, `dig_cat_coins`
+//! fixed to the $DIG asset, puzzle-hash re-attribution refused, and reads bounded by
+//! `MAX_LISTED_CAT_COINS`.
 
 use std::cell::Cell;
 
@@ -37,21 +38,25 @@ mod common;
 use common::{unlocked_account, wallet_puzzle_hash, SimulatorChain};
 
 /// A `ChainSource` that wraps a genuine [`SimulatorChain`] and, independently:
-/// - splices one extra real coin record into every `coin_records_by_puzzle_hash` answer -- a
-///   hint-indexing (or malicious) source answering a puzzle-hash query with a coin that genuinely
-///   exists on chain but is not actually at the queried hash;
-/// - ignores the caller's `include_spent = false` and answers with spent records anyway -- a source
-///   that does not honour the flag;
+/// - splices extra real coin records into every `coin_records_by_puzzle_hash` answer, regardless of
+///   the puzzle hash or `include_spent` actually queried -- a hint-indexing (or malicious, or simply
+///   non-conforming) source answering with a coin that is genuinely real and on chain, but which
+///   `cat_coins` must not trust blindly: one planted coin at another puzzle hash models a
+///   misattribution, one planted SPENT coin models a source that ignores `include_spent`;
 /// - counts every `coin_spend` read, so a bound on the coins `cat_coins` returns can be measured as
 ///   a bound on remote READS, not just on the length of the returned `Vec`.
 ///
+/// `SimulatorChain::coin_records_by_puzzle_hash` itself calls `Simulator::unspent_coins`, which
+/// excludes spent coins unconditionally -- so an honest wrapper cannot make it answer with a spent
+/// record merely by passing `include_spent = true` through; the record must be planted directly,
+/// exactly as a non-conforming real source's answer would be observed.
+///
 /// Every other read delegates to `inner` untouched. Named for what it models, not for which test
-/// uses it -- one double, three independent knobs, so the honest (default) path is provably the
-/// same object as the one every adversarial variant starts from.
+/// uses it -- one double, two independent knobs, so the honest (default) path is provably the same
+/// object as the one every adversarial variant starts from.
 struct AdversarialChain<'a> {
     inner: &'a SimulatorChain,
-    planted_record: Option<CoinRecord>,
-    ignore_include_spent: bool,
+    planted_records: Vec<CoinRecord>,
     coin_spend_reads: Cell<usize>,
 }
 
@@ -59,23 +64,15 @@ impl<'a> AdversarialChain<'a> {
     fn honest(inner: &'a SimulatorChain) -> Self {
         Self {
             inner,
-            planted_record: None,
-            ignore_include_spent: false,
+            planted_records: Vec::new(),
             coin_spend_reads: Cell::new(0),
         }
     }
 
     /// Every `coin_records_by_puzzle_hash` answer additionally includes `record`, regardless of the
-    /// puzzle hash actually queried.
+    /// puzzle hash or `include_spent` actually queried.
     fn planting(mut self, record: CoinRecord) -> Self {
-        self.planted_record = Some(record);
-        self
-    }
-
-    /// `coin_records_by_puzzle_hash` always answers as though `include_spent = true`, whatever the
-    /// caller actually asked for.
-    fn ignoring_include_spent(mut self) -> Self {
-        self.ignore_include_spent = true;
+        self.planted_records.push(record);
         self
     }
 
@@ -100,10 +97,8 @@ impl ChainSource for AdversarialChain<'_> {
     ) -> Result<Vec<CoinRecord>, Self::Error> {
         let mut records = self
             .inner
-            .coin_records_by_puzzle_hash(puzzle_hash, include_spent || self.ignore_include_spent)?;
-        if let Some(record) = &self.planted_record {
-            records.push(record.clone());
-        }
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)?;
+        records.extend(self.planted_records.iter().cloned());
         Ok(records)
     }
 
@@ -625,7 +620,7 @@ fn a_record_at_another_puzzle_hash_is_excluded_not_attributed() {
 /// `dig_cat_coins_lists_only_unspent_coins_at_the_curried_hash` green, because that test's
 /// `SimulatorChain` already excludes the spent coin at the source before `cat_coins` runs at all.
 #[test]
-fn a_source_that_ignores_include_spent_still_yields_unspent_only() {
+fn a_spent_coin_answered_anyway_is_still_excluded() {
     let f = fixture();
     let mut ctx = SpendContext::new();
     let (asset_id, children) = issue_cats(&f, &mut ctx, &[1_000, 2_000]);
@@ -656,12 +651,25 @@ fn a_source_that_ignores_include_spent_still_yields_unspent_only() {
         .expect("the CAT spend validates");
     f.chain.bury(1);
 
-    let hostile = AdversarialChain::honest(&f.chain).ignoring_include_spent();
+    // `SimulatorChain::coin_records_by_puzzle_hash` excludes spent coins unconditionally at the
+    // source (via `Simulator::unspent_coins`), so a source that ignores `include_spent` and answers
+    // with the spent coin anyway is modelled by planting its now-spent record directly.
+    let spent_record = f
+        .chain
+        .coin_record(to_spend.coin.coin_id())
+        .expect("the chain reads cleanly")
+        .expect("the spent coin is a real, recorded coin");
+    assert!(
+        spent_record.spent_height.is_some(),
+        "the fixture must actually spend this coin, or the test proves nothing"
+    );
+
+    let hostile = AdversarialChain::honest(&f.chain).planting(spent_record);
     let result = cat_coins(&hostile, asset_id, f.p2).expect("the chain reads cleanly");
     assert_eq!(
         result.cats().len(),
         1,
-        "the spent coin must be excluded even from a source that ignores include_spent"
+        "the spent coin must be excluded even from a source that answers with it anyway"
     );
     assert_eq!(result.cats()[0].coin, survivor.coin);
 }
