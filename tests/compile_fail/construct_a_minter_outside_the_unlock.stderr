@@ -1,0 +1,14 @@
+error[E0624]: associated function `new` is private
+  --> tests/compile_fail/construct_a_minter_outside_the_unlock.rs:16:70
+   |
+16 |       let _build_a_minter_without_an_unlock = RewardDistributorMinter::new;
+   |                                                                        ^^^ private associated function
+   |
+  ::: src/reward_distributor_mint.rs
+   |
+   | /     pub(crate) fn new(
+   | |         seed: Arc<UnlockedMasterSeed>,
+   | |         profile_ix: ProfileIx,
+   | |         residency: Arc<Residency>,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
