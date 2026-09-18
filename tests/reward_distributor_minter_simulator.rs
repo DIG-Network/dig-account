@@ -3,12 +3,15 @@
 //!
 //! Tests 1-3 prove the FACADE: a reward-distributor mint driven through
 //! `UnlockedAccount::reward_distributor_minter()` behaves identically to the raw §6BB seam it wraps,
-//! refuses the moment the account relocks, and hands out no key anywhere along the way. Tests 4-6
-//! prove what the public CAT selection §6G is built on: unspent-only, whole-call refusal on an
-//! unprovable lineage, and `dig_cat_coins` fixed to the $DIG asset.
+//! refuses the moment the account relocks, and hands out no key anywhere along the way. Tests 4-9
+//! prove what the public CAT selection §6G is built on: unspent-only (even against a source that
+//! ignores `include_spent`), whole-call refusal on an unprovable lineage, `dig_cat_coins` fixed to
+//! the $DIG asset, puzzle-hash re-attribution refused, and reads bounded by `MAX_LISTED_CAT_COINS`.
+
+use std::cell::Cell;
 
 use chia_bls::SecretKey;
-use chia_protocol::{Bytes32, Coin};
+use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_puzzle_types::cat::CatArgs;
 use chia_puzzle_types::LineageProof;
 use chia_sdk_test::Simulator;
@@ -21,7 +24,9 @@ use dig_account::mint::error::MintError;
 use dig_account::{
     begin_reward_distributor_mint, cat_coins, dig_cat_coins, dig_curried_puzzle_hash,
     CatTransferError, MintNetwork, ProfileIx, RewardDistributorMintRequest, WalletKey,
+    MAX_LISTED_CAT_COINS,
 };
+use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_constants::DIG_ASSET_ID;
 use dig_rewards_coin::{
     dig_distributor_constants, DistributorLaunchTerms, LaunchComment, ManagerInnerPuzzle,
@@ -30,6 +35,102 @@ use dig_rewards_coin::{
 
 mod common;
 use common::{unlocked_account, wallet_puzzle_hash, SimulatorChain};
+
+/// A `ChainSource` that wraps a genuine [`SimulatorChain`] and, independently:
+/// - splices one extra real coin record into every `coin_records_by_puzzle_hash` answer -- a
+///   hint-indexing (or malicious) source answering a puzzle-hash query with a coin that genuinely
+///   exists on chain but is not actually at the queried hash;
+/// - ignores the caller's `include_spent = false` and answers with spent records anyway -- a source
+///   that does not honour the flag;
+/// - counts every `coin_spend` read, so a bound on the coins `cat_coins` returns can be measured as
+///   a bound on remote READS, not just on the length of the returned `Vec`.
+///
+/// Every other read delegates to `inner` untouched. Named for what it models, not for which test
+/// uses it -- one double, three independent knobs, so the honest (default) path is provably the
+/// same object as the one every adversarial variant starts from.
+struct AdversarialChain<'a> {
+    inner: &'a SimulatorChain,
+    planted_record: Option<CoinRecord>,
+    ignore_include_spent: bool,
+    coin_spend_reads: Cell<usize>,
+}
+
+impl<'a> AdversarialChain<'a> {
+    fn honest(inner: &'a SimulatorChain) -> Self {
+        Self {
+            inner,
+            planted_record: None,
+            ignore_include_spent: false,
+            coin_spend_reads: Cell::new(0),
+        }
+    }
+
+    /// Every `coin_records_by_puzzle_hash` answer additionally includes `record`, regardless of the
+    /// puzzle hash actually queried.
+    fn planting(mut self, record: CoinRecord) -> Self {
+        self.planted_record = Some(record);
+        self
+    }
+
+    /// `coin_records_by_puzzle_hash` always answers as though `include_spent = true`, whatever the
+    /// caller actually asked for.
+    fn ignoring_include_spent(mut self) -> Self {
+        self.ignore_include_spent = true;
+        self
+    }
+
+    /// How many times `coin_spend` -- the read `parent_spend`'s default impl performs once per
+    /// candidate whose lineage is actually resolved -- has been called so far.
+    fn coin_spend_reads(&self) -> usize {
+        self.coin_spend_reads.get()
+    }
+}
+
+impl ChainSource for AdversarialChain<'_> {
+    type Error = String;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        let mut records = self
+            .inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent || self.ignore_include_spent)?;
+        if let Some(record) = &self.planted_record {
+            records.push(record.clone());
+        }
+        Ok(records)
+    }
+
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.coin_spend_reads.set(self.coin_spend_reads.get() + 1);
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        self.inner.resolve_singleton_lineage(launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.inner.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.inner.block_timestamp(height)
+    }
+}
 
 const FUNDING_MOJOS: u64 = 1_000_000_000;
 const RESERVE_BASE_UNITS: u64 = 250_000;
@@ -437,5 +538,175 @@ fn dig_cat_coins_is_cat_coins_fixed_to_the_dig_asset() {
         via_dig.to_string(),
         via_cat_coins.to_string(),
         "dig_cat_coins must be cat_coins pinned to DIG_ASSET_ID, nothing more"
+    );
+}
+
+/// **ACCEPTANCE (#59, gate finding B).** A record a hostile source claims is at the queried puzzle
+/// hash, but which is actually a REAL, genuinely provable coin at a DIFFERENT puzzle hash, must be
+/// excluded rather than attributed to the caller's wallet.
+///
+/// Both coins come from the SAME single-issuance CAT spend, so the stranger's coin is not a
+/// fabrication `resolve_lineage` could catch on its own -- it has a perfectly genuine lineage, just
+/// not at the hash the caller asked about. Only `cat_coins`'s own `record.coin.puzzle_hash ==
+/// cat_puzzle_hash` re-check (mirroring `select_cat_coins`'s) can tell the two apart.
+///
+/// MUTATION PROOF (run): deleting the `.filter(|record| record.coin.puzzle_hash ==
+/// cat_puzzle_hash)` line from `cat_coins` makes this test fail --
+/// `result.cats().len()` becomes 2, attributing the stranger's coin to this wallet.
+#[test]
+fn a_record_at_another_puzzle_hash_is_excluded_not_attributed() {
+    let f = fixture();
+    let mut ctx = SpendContext::new();
+
+    let stranger_p2 = Bytes32::new([0x77; 32]);
+    let mine = 1_000u64;
+    let strangers = 3_000u64;
+    let total = mine + strangers;
+    let issuer = f.chain.sim.borrow_mut().bls(total);
+    let hint_mine = ctx.hint(f.p2).expect("a hint encodes");
+    let hint_stranger = ctx.hint(stranger_p2).expect("a hint encodes");
+    let payouts = Conditions::new()
+        .create_coin(f.p2, mine, hint_mine)
+        .create_coin(stranger_p2, strangers, hint_stranger);
+
+    let (issue_conditions, children) =
+        Cat::single_issuance(&mut ctx, issuer.coin.coin_id(), None, total, payouts)
+            .expect("single-issuance CAT builds");
+    StandardLayer::new(issuer.pk)
+        .spend(&mut ctx, issuer.coin, issue_conditions)
+        .expect("the issuer's own coin spends to launch the CAT");
+    f.chain
+        .sim
+        .borrow_mut()
+        .spend_coins(ctx.take(), &[issuer.sk])
+        .expect("the issuance validates against consensus");
+    f.chain.bury(1);
+
+    let asset_id = children
+        .first()
+        .expect("at least one CAT child")
+        .info
+        .asset_id;
+    let genuine = children
+        .iter()
+        .find(|c| c.coin.amount == mine)
+        .copied()
+        .expect("this wallet's own child exists");
+    let strangers_coin = children
+        .iter()
+        .find(|c| c.coin.amount == strangers)
+        .copied()
+        .expect("the stranger's child exists");
+
+    let planted = f
+        .chain
+        .coin_record(strangers_coin.coin.coin_id())
+        .expect("the chain reads cleanly")
+        .expect("the stranger's coin is a real, confirmed record");
+    let hostile = AdversarialChain::honest(&f.chain).planting(planted);
+
+    let result = cat_coins(&hostile, asset_id, f.p2)
+        .expect("this wallet's own genuine coin still resolves");
+    assert_eq!(
+        result.cats().len(),
+        1,
+        "the stranger's coin at another puzzle hash must be excluded, not attributed"
+    );
+    assert_eq!(result.cats()[0].coin, genuine.coin);
+}
+
+/// **ACCEPTANCE (#59, gate finding A).** A source that IGNORES the caller's `include_spent = false`
+/// and answers with a spent coin anyway must still not have that coin listed -- `cat_coins`'s own
+/// unspent filter is real defense-in-depth, not dead code the test double's honesty happens to make
+/// unreachable.
+///
+/// MUTATION PROOF (run): deleting `.filter(|record| record.spent_height.is_none())` from `cat_coins`
+/// makes this test fail (the spent coin appears in the result), even though the SAME mutation left
+/// `dig_cat_coins_lists_only_unspent_coins_at_the_curried_hash` green, because that test's
+/// `SimulatorChain` already excludes the spent coin at the source before `cat_coins` runs at all.
+#[test]
+fn a_source_that_ignores_include_spent_still_yields_unspent_only() {
+    let f = fixture();
+    let mut ctx = SpendContext::new();
+    let (asset_id, children) = issue_cats(&f, &mut ctx, &[1_000, 2_000]);
+
+    let to_spend = children
+        .iter()
+        .find(|c| c.coin.amount == 1_000)
+        .copied()
+        .expect("the 1_000 child exists");
+    let survivor = children
+        .iter()
+        .find(|c| c.coin.amount == 2_000)
+        .copied()
+        .expect("the 2_000 child exists");
+
+    let stranger = Bytes32::new([0x42; 32]);
+    let spend = StandardLayer::new(f.sk.public_key())
+        .spend_with_conditions(
+            &mut ctx,
+            Conditions::new().create_coin(stranger, 1_000, chia_puzzle_types::Memos::None),
+        )
+        .expect("the p2 spend builds");
+    Cat::spend_all(&mut ctx, &[CatSpend::new(to_spend, spend)]).expect("the CAT spend builds");
+    f.chain
+        .sim
+        .borrow_mut()
+        .spend_coins(ctx.take(), std::slice::from_ref(&f.sk))
+        .expect("the CAT spend validates");
+    f.chain.bury(1);
+
+    let hostile = AdversarialChain::honest(&f.chain).ignoring_include_spent();
+    let result = cat_coins(&hostile, asset_id, f.p2).expect("the chain reads cleanly");
+    assert_eq!(
+        result.cats().len(),
+        1,
+        "the spent coin must be excluded even from a source that ignores include_spent"
+    );
+    assert_eq!(result.cats()[0].coin, survivor.coin);
+}
+
+/// **ACCEPTANCE (#59, gate finding: unbounded reads).** A dust flood past `MAX_LISTED_CAT_COINS` is
+/// bounded, largest-first, with the shortfall counted rather than silently dropped or refused --
+/// and the bound must bound the remote READS `cat_coins` performs, not merely the length of the
+/// `Vec` it returns.
+///
+/// `MAX_LISTED_CAT_COINS + 3` genuinely provable CAT coins are issued in one single-issuance spend
+/// (one real chain-provable child per amount). Only the 64 LARGEST may have their lineage resolved;
+/// `AdversarialChain::coin_spend_reads` proves the 3 smallest were never even read for it.
+///
+/// MUTATION PROOF (run): removing the `candidates.truncate(MAX_LISTED_CAT_COINS)` line (and reading
+/// `omitted` as always `0`) makes this test fail -- `result.cats().len()` becomes 67 and
+/// `coin_spend_reads()` becomes 67, proving the bound was bounding reads, not just decoration on the
+/// returned `Vec`.
+#[test]
+fn a_dust_flood_is_bounded_and_the_omission_is_counted() {
+    let f = fixture();
+    let mut ctx = SpendContext::new();
+
+    let flood_count = MAX_LISTED_CAT_COINS + 3;
+    let amounts: Vec<u64> = (0..flood_count).map(|i| 1_000 + i as u64).collect();
+    let (asset_id, children) = issue_cats(&f, &mut ctx, &amounts);
+    assert_eq!(children.len(), flood_count, "every dust coin must be genuinely provable");
+
+    let counting = AdversarialChain::honest(&f.chain);
+    let result = cat_coins(&counting, asset_id, f.p2).expect("the bounded set still resolves");
+
+    assert_eq!(result.cats().len(), MAX_LISTED_CAT_COINS);
+    assert_eq!(result.omitted(), 3, "the 3 candidates past the bound must be counted, not dropped");
+    assert_eq!(
+        counting.coin_spend_reads(),
+        MAX_LISTED_CAT_COINS,
+        "the bound must bound remote reads, not just the returned Vec's length"
+    );
+
+    let mut expected: Vec<u64> = amounts;
+    expected.sort_unstable_by(|a, b| b.cmp(a));
+    expected.truncate(MAX_LISTED_CAT_COINS);
+    let mut returned: Vec<u64> = result.cats().iter().map(|c| c.coin.amount).collect();
+    returned.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(
+        returned, expected,
+        "the omitted candidates must be the SMALLEST, never an arbitrary subset"
     );
 }
