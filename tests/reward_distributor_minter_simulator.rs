@@ -355,9 +355,10 @@ fn dig_cat_coins_lists_only_unspent_coins_at_the_curried_hash() {
     f.chain.bury(1);
 
     let result = cat_coins(&f.chain, asset_id, f.p2).expect("the chain reads cleanly");
-    assert_eq!(result.len(), 1, "only the unspent coin must be listed");
-    assert_eq!(result[0].coin, survivor.coin);
-    assert!(result[0].lineage_proof.is_some());
+    assert_eq!(result.cats().len(), 1, "only the unspent coin must be listed");
+    assert_eq!(result.omitted(), 0, "well under the bound, nothing is omitted");
+    assert_eq!(result.cats()[0].coin, survivor.coin);
+    assert!(result.cats()[0].lineage_proof.is_some());
 }
 
 /// **ACCEPTANCE (#59).** A coin whose parent spend is missing is REFUSED, never fabricated — even

@@ -12,7 +12,6 @@ use std::sync::Arc;
 use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::chia::consensus::consensus_constants::ConsensusConstants;
-use chia_wallet_sdk::driver::Cat;
 use dig_chainsource_interface::ChainSource;
 use dig_session::UnlockedMasterSeed;
 
@@ -24,7 +23,7 @@ use crate::mint::reward_distributor::{
 };
 use crate::mint::MintNetwork;
 use crate::session_residency::Residency;
-use crate::wallet::cat_transfer::{self, CatTransferError, CatTransferResult};
+use crate::wallet::cat_transfer::{self, CatCoinListing, CatTransferError, CatTransferResult};
 
 /// Drives a `dig-rewards-coin` reward-distributor mint for one profile of an unlocked account.
 ///
@@ -121,7 +120,7 @@ impl RewardDistributorMinter {
     ///
     /// Refuses with [`CatTransferError::Locked`] before deriving anything if the account has
     /// relocked — a relocked account cannot even name which puzzle hash to ask the chain about.
-    pub fn dig_cat_coins<C>(&self, chain: &C) -> CatTransferResult<Vec<Cat>>
+    pub fn dig_cat_coins<C>(&self, chain: &C) -> CatTransferResult<CatCoinListing>
     where
         C: ChainSource + ?Sized,
     {
@@ -167,9 +166,16 @@ mod tests {
     }
 
     /// A source-scan proof, not a convention: no `pub fn` in this module's PRODUCTION half may
-    /// return `WalletKey`, `SecretKey` or the master seed. Mirrors
-    /// `tests/the_shape_is_unwritable.rs::production_half`'s split so an in-crate test helper (which
-    /// legitimately reaches into internals) is never mistaken for a public leak.
+    /// return `WalletKey`, `SecretKey`, the master seed, or its container
+    /// [`UnlockedMasterSeed`](dig_session::UnlockedMasterSeed) (whose own `master_seed()` is
+    /// public, so handing out the container leaks the seed just as directly as handing out the
+    /// bytes). Mirrors `tests/the_shape_is_unwritable.rs::production_half`'s split so an in-crate
+    /// test helper (which legitimately reaches into internals) is never mistaken for a public leak.
+    ///
+    /// The container/`Arc<` needles are checked against the RETURN TYPE only, not the whole
+    /// signature: the struct's own `seed: Arc<UnlockedMasterSeed>` field legitimately names both,
+    /// and a whole-signature scan would have nothing left to distinguish a leaking accessor from
+    /// the field it wraps.
     #[test]
     fn no_method_hands_out_the_key() {
         const TEST_MODULE: &str = "#[cfg(test)]\nmod tests {";
@@ -184,11 +190,14 @@ mod tests {
         let mut checked = 0;
         for chunk in production.split("pub fn ").skip(1) {
             let signature = chunk.split('{').next().unwrap_or_default();
+            let return_type = signature.split("->").nth(1).unwrap_or_default();
             checked += 1;
             assert!(
                 !signature.contains("WalletKey")
                     && !signature.contains("SecretKey")
-                    && !signature.contains("master_seed"),
+                    && !signature.contains("master_seed")
+                    && !return_type.contains("UnlockedMasterSeed")
+                    && !return_type.contains("Arc<"),
                 "a public method hands out key material: pub fn {signature}"
             );
         }

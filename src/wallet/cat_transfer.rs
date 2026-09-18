@@ -85,6 +85,17 @@ pub const DIG_BASE_UNITS_PER_TOKEN: u64 = 1_000;
 /// [`MAX_TRANSFER_INPUT_COINS`].
 pub const MAX_CAT_TRANSFER_INPUT_COINS: usize = MAX_TRANSFER_INPUT_COINS;
 
+/// The most CAT coins [`cat_coins`] will resolve lineage for and return in one call.
+///
+/// [`cat_coins`] is reachable with no amount to select toward — a caller only needs to know a
+/// puzzle hash, which anyone can compute — so unlike [`select_cat_coins`], its candidate count is
+/// not bounded by what the caller needs. Each candidate costs a real chain read
+/// ([`ChainSource::parent_spend`]) plus a CLVM parse, so an unbounded listing lets dust sent to a
+/// public address turn one call into an arbitrarily large number of reads: a cost-asymmetry denial
+/// of service. This bounds the READS, not just the returned `Vec` — [`CatCoinListing::omitted`]
+/// reports how many candidates past the bound were never even resolved.
+pub const MAX_LISTED_CAT_COINS: usize = 64;
+
 /// The message the lead CAT announces and the XCH fee coin asserts.
 const FEE_BINDING_MESSAGE: &[u8] = b"dig-account:cat-transfer";
 
@@ -354,7 +365,40 @@ pub fn dig_curried_puzzle_hash(p2_puzzle_hash: Bytes32) -> Bytes32 {
     cat_curried_puzzle_hash(DIG_ASSET_ID, p2_puzzle_hash)
 }
 
-/// Every UNSPENT, lineage-proven CAT coin of `asset_id` locked to `p2_puzzle_hash`.
+/// The result of listing a wallet's CAT coins: what could be returned, plus an explicit count of
+/// what the [`MAX_LISTED_CAT_COINS`] bound left unresolved.
+///
+/// `omitted` is deliberately a COUNT, never a silently truncated `Vec` and never a whole-call
+/// refusal: a caller sees the bound was hit and by how much, rather than either an invisible
+/// shortfall or a balance display that stops working the moment dust arrives.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct CatCoinListing {
+    cats: Vec<Cat>,
+    omitted: usize,
+}
+
+impl CatCoinListing {
+    /// Every coin resolved, largest amount first (see [`cat_coins`]).
+    pub fn cats(&self) -> &[Cat] {
+        &self.cats
+    }
+
+    /// Consumes the listing, returning the resolved coins.
+    pub fn into_cats(self) -> Vec<Cat> {
+        self.cats
+    }
+
+    /// How many further candidates existed at the queried puzzle hash beyond
+    /// [`MAX_LISTED_CAT_COINS`] and were never even read for lineage. Zero when every candidate was
+    /// resolved.
+    pub fn omitted(&self) -> usize {
+        self.omitted
+    }
+}
+
+/// Every UNSPENT, lineage-proven CAT coin of `asset_id` locked to `p2_puzzle_hash`, up to
+/// [`MAX_LISTED_CAT_COINS`].
 ///
 /// This is the public counterpart to `select_cat_coins`'s selection: where that helper picks
 /// JUST ENOUGH coins to cover an amount, this lists every spendable one — what a balance display or
@@ -365,26 +409,46 @@ pub fn dig_curried_puzzle_hash(p2_puzzle_hash: Bytes32) -> Bytes32 {
 /// # Unspent only
 ///
 /// A coin with a `spent_height` is never returned. Reading the wallet's spendable CAT balance must
-/// not include a coin somebody — or this very wallet — already spent.
+/// not include a coin somebody — or this very wallet — already spent. This is checked here again,
+/// even though every `SimulatorChain`/coinset-style source already applies its own
+/// `include_spent = false` filter: a source is free to ignore that flag, and a defence this
+/// money-critical must not depend on the honesty of the thing it is reading.
+///
+/// # Attributed only to the coin actually at the puzzle hash
+///
+/// Each candidate's own `record.coin.puzzle_hash` is re-checked against the puzzle hash just
+/// queried — the same re-check [`select_cat_coins`] runs locally, and for the same reason: a
+/// hint-indexing (or otherwise malicious) source can answer with a coin at a DIFFERENT puzzle hash
+/// that merely hints at this one, and a caller that trusted the index would attribute a stranger's
+/// CAT coin to this wallet's address. A stranger must not be able to make that happen by hinting
+/// one coin at it, so this is exclusion rather than refusal.
+///
+/// # Bounded, largest first
+///
+/// After the unspent and puzzle-hash filters, candidates are sorted by amount, largest first (ties
+/// broken by coin id, for a deterministic order), and only the first [`MAX_LISTED_CAT_COINS`] have
+/// their lineage resolved at all — see [`MAX_LISTED_CAT_COINS`] for why. The rest are counted in
+/// [`CatCoinListing::omitted`], never silently dropped from an unbounded `Vec` and never a reason to
+/// refuse the whole call.
 ///
 /// # Lineage proven or the WHOLE call refuses
 ///
-/// Each candidate's parent spend is read and parsed as a CAT via `resolve_lineage`, the same
-/// helper [`build_cat_transfer`](WalletOps::build_cat_transfer) uses for its own inputs. A coin
-/// whose lineage cannot be established is [`CatTransferError::LineageUnavailable`] for the ENTIRE
-/// call — never a partial `Vec` with the unprovable coin quietly dropped, and never a [`Cat`]
-/// carrying a fabricated or absent lineage proof. A source that cannot answer for one coin is not
-/// evidence about the others.
+/// Each resolved candidate's parent spend is read and parsed as a CAT via `resolve_lineage`, the
+/// same helper [`build_cat_transfer`](WalletOps::build_cat_transfer) uses for its own inputs. A
+/// coin whose lineage cannot be established is [`CatTransferError::LineageUnavailable`] for the
+/// ENTIRE call — never a partial `Vec` with the unprovable coin quietly dropped, and never a
+/// [`Cat`] carrying a fabricated or absent lineage proof. A source that cannot answer for one coin
+/// is not evidence about the others.
 ///
 /// # Errors
 ///
 /// [`CatTransferError::ChainUnreachable`] if the chain could not be read at all;
-/// [`CatTransferError::LineageUnavailable`] if any candidate's lineage cannot be proven.
+/// [`CatTransferError::LineageUnavailable`] if any resolved candidate's lineage cannot be proven.
 pub fn cat_coins<C>(
     chain: &C,
     asset_id: Bytes32,
     p2_puzzle_hash: Bytes32,
-) -> CatTransferResult<Vec<Cat>>
+) -> CatTransferResult<CatCoinListing>
 where
     C: ChainSource + ?Sized,
 {
@@ -393,13 +457,22 @@ where
         .coin_records_by_puzzle_hash(cat_puzzle_hash, false)
         .map_err(|e| CatTransferError::ChainUnreachable(e.to_string()))?;
 
-    let unspent: Vec<Coin> = records
+    let mut candidates: Vec<Coin> = records
         .into_iter()
         .filter(|record| record.spent_height.is_none())
+        // A record at any other puzzle hash is not this wallet's $DIG. A hint-indexing source
+        // returns coins an attacker chose, so this is exclusion rather than refusal — a stranger
+        // must not be able to attribute their coin to this wallet by hinting one at it.
+        .filter(|record| record.coin.puzzle_hash == cat_puzzle_hash)
         .map(|record| record.coin)
         .collect();
+    candidates.sort_by_cached_key(|coin| (std::cmp::Reverse(coin.amount), coin.coin_id()));
 
-    resolve_lineage(chain, asset_id, &unspent)
+    let omitted = candidates.len().saturating_sub(MAX_LISTED_CAT_COINS);
+    candidates.truncate(MAX_LISTED_CAT_COINS);
+
+    let cats = resolve_lineage(chain, asset_id, &candidates)?;
+    Ok(CatCoinListing { cats, omitted })
 }
 
 /// [`cat_coins`] pinned to [`DIG_ASSET_ID`] — every unspent, lineage-proven $DIG coin at
@@ -407,7 +480,7 @@ where
 ///
 /// Agrees with [`dig_curried_puzzle_hash`] by construction: both derive their outer puzzle hash from
 /// `cat_curried_puzzle_hash(DIG_ASSET_ID, p2_puzzle_hash)`, which the tests pin directly.
-pub fn dig_cat_coins<C>(chain: &C, p2_puzzle_hash: Bytes32) -> CatTransferResult<Vec<Cat>>
+pub fn dig_cat_coins<C>(chain: &C, p2_puzzle_hash: Bytes32) -> CatTransferResult<CatCoinListing>
 where
     C: ChainSource + ?Sized,
 {

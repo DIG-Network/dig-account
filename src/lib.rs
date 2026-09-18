@@ -119,8 +119,8 @@ pub use wallet::authorizer::WalletOps;
 pub use wallet::autosend::{AutoSendPolicy, OpClassLimits, SpendOpClass, DEFAULT_PERIOD_SECONDS};
 pub use wallet::cat_transfer::{
     amount_in_dig, cat_coins, cat_curried_puzzle_hash, dig_cat_coins, dig_curried_puzzle_hash,
-    CatTransferError, CatTransferPlan, CatTransferRequest, CatTransferResult,
-    DIG_BASE_UNITS_PER_TOKEN, MAX_CAT_TRANSFER_INPUT_COINS,
+    CatCoinListing, CatTransferError, CatTransferPlan, CatTransferRequest, CatTransferResult,
+    DIG_BASE_UNITS_PER_TOKEN, MAX_CAT_TRANSFER_INPUT_COINS, MAX_LISTED_CAT_COINS,
 };
 pub use wallet::clock::{Clock, FixedClock, SystemClock};
 pub use wallet::enforcer::PolicyAuthorizer;
