@@ -408,14 +408,19 @@ mod tests {
     #[test]
     fn an_unconfirmed_launcher_record_is_not_evidence() {
         let (pending, launcher_coin, discovered) = matching_scenario(2);
+        let unconfirmed = record(launcher_coin, None);
 
-        assert!(ConfirmedRewardDistributor::from_confirmed(
-            &pending,
-            &record(launcher_coin, None),
-            &discovered,
-            PEAK
-        )
-        .is_none());
+        assert!(
+            ConfirmedRewardDistributor::from_confirmed(&pending, &unconfirmed, &discovered, PEAK)
+                .is_none()
+        );
+        // Asserted on the specific rule, not just `None`: `unwrap_or(0)` in place of the `?` would
+        // also yield `None` here (falling through to the Genesis check), which an `is_none()`-only
+        // assertion cannot tell apart from this rule actually firing.
+        assert_eq!(
+            check(&pending, &unconfirmed, &discovered, PEAK),
+            Err(EvidenceDefect::Unconfirmed)
+        );
     }
 
     /// A CONFIRMED record of a DIFFERENT coin proves nothing about this launch. Mutation: delete
