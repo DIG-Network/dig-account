@@ -53,6 +53,8 @@ fn the_unauthorized_call_shapes_do_not_compile() {
     // and an active-profile handle cannot survive the switch that invalidates it.
     cases.compile_fail("tests/compile_fail/an_anchor_needs_both_halves.rs");
     cases.compile_fail("tests/compile_fail/a_stale_active_handle.rs");
+    // #60: a `RewardDistributorMinter` can only ever come from an unlocked account.
+    cases.compile_fail("tests/compile_fail/construct_a_minter_outside_the_unlock.rs");
 }
 
 /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module stripped.
