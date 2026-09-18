@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.30.0] - 2026-09-20
+
+### Features
+- **mint:** Publish + confirm half of a reward-distributor mint (#3341) — `SignedRewardDistributorMint::submit`, `PendingRewardDistributor`, `ConfirmedRewardDistributor`, `RewardDistributorStatus`
+
 ## [0.29.0] - 2026-09-20
 
 ### Features
