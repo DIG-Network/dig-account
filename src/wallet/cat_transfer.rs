@@ -356,7 +356,7 @@ pub fn dig_curried_puzzle_hash(p2_puzzle_hash: Bytes32) -> Bytes32 {
 
 /// Every UNSPENT, lineage-proven CAT coin of `asset_id` locked to `p2_puzzle_hash`.
 ///
-/// This is the public counterpart to [`select_cat_coins`]'s selection: where that helper picks
+/// This is the public counterpart to `select_cat_coins`'s selection: where that helper picks
 /// JUST ENOUGH coins to cover an amount, this lists every spendable one — what a balance display or
 /// a coin-control UI needs, and what
 /// [`RewardDistributorMinter::dig_cat_coins`](crate::reward_distributor_mint::RewardDistributorMinter::dig_cat_coins)
@@ -369,7 +369,7 @@ pub fn dig_curried_puzzle_hash(p2_puzzle_hash: Bytes32) -> Bytes32 {
 ///
 /// # Lineage proven or the WHOLE call refuses
 ///
-/// Each candidate's parent spend is read and parsed as a CAT via [`resolve_lineage`], the same
+/// Each candidate's parent spend is read and parsed as a CAT via `resolve_lineage`, the same
 /// helper [`build_cat_transfer`](WalletOps::build_cat_transfer) uses for its own inputs. A coin
 /// whose lineage cannot be established is [`CatTransferError::LineageUnavailable`] for the ENTIRE
 /// call — never a partial `Vec` with the unprovable coin quietly dropped, and never a [`Cat`]

@@ -173,13 +173,13 @@ mod tests {
     #[test]
     fn no_method_hands_out_the_key() {
         const TEST_MODULE: &str = "#[cfg(test)]\nmod tests {";
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/reward_distributor_mint.rs");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/reward_distributor_mint.rs"
+        );
         let text = std::fs::read_to_string(path).expect("this module's own source is readable");
         let production = text.replace('\r', "");
-        let production = production
-            .split(TEST_MODULE)
-            .next()
-            .unwrap_or_default();
+        let production = production.split(TEST_MODULE).next().unwrap_or_default();
 
         let mut checked = 0;
         for chunk in production.split("pub fn ").skip(1) {
@@ -192,6 +192,9 @@ mod tests {
                 "a public method hands out key material: pub fn {signature}"
             );
         }
-        assert!(checked >= 4, "the scan found no public methods to check at all");
+        assert!(
+            checked >= 4,
+            "the scan found no public methods to check at all"
+        );
     }
 }

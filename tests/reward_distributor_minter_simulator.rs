@@ -12,7 +12,9 @@ use chia_protocol::{Bytes32, Coin};
 use chia_puzzle_types::cat::CatArgs;
 use chia_puzzle_types::LineageProof;
 use chia_sdk_test::Simulator;
-use chia_wallet_sdk::driver::{Cat, CatInfo, CatSpend, SpendContext, SpendWithConditions, StandardLayer};
+use chia_wallet_sdk::driver::{
+    Cat, CatInfo, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+};
 use chia_wallet_sdk::prelude::{Conditions, TESTNET11_CONSTANTS};
 use chia_wallet_sdk::signer::AggSigConstants;
 use dig_account::mint::error::MintError;
@@ -57,7 +59,11 @@ fn dig_reserve_asset_id() -> Bytes32 {
 
 /// The request every test 1-3 fixture builds, differing only in `funding`/`reward_cat`/the manager
 /// key.
-fn request_for(funding: Coin, reward_cat: Cat, manager_pubkey: chia_bls::PublicKey) -> RewardDistributorMintRequest {
+fn request_for(
+    funding: Coin,
+    reward_cat: Cat,
+    manager_pubkey: chia_bls::PublicKey,
+) -> RewardDistributorMintRequest {
     RewardDistributorMintRequest {
         funding,
         reward_cat,
@@ -75,7 +81,12 @@ fn request_for(funding: Coin, reward_cat: Cat, manager_pubkey: chia_bls::PublicK
 /// supplied `Cat` directly and never re-derives its lineage from the chain itself. Only tests 1-3
 /// (the #60 facade) use this; tests 4-6 (the #59 public selection) issue real, chain-provable CATs
 /// instead, because THAT lineage is exactly the thing under test there.
-fn reward_cat_for(sim: &mut Simulator, asset_id: Bytes32, p2_puzzle_hash: Bytes32, amount: u64) -> Cat {
+fn reward_cat_for(
+    sim: &mut Simulator,
+    asset_id: Bytes32,
+    p2_puzzle_hash: Bytes32,
+    amount: u64,
+) -> Cat {
     let cat_puzzle_hash: Bytes32 = CatArgs::curry_tree_hash(asset_id, p2_puzzle_hash.into()).into();
     let grandparent = Bytes32::new([0x11; 32]);
     let parent = Coin::new(grandparent, cat_puzzle_hash, amount);
@@ -124,12 +135,20 @@ fn a_real_mint_is_driven_through_the_unlocked_account_not_a_raw_key() {
     let mut sim = Simulator::new();
 
     let minter = account.reward_distributor_minter();
-    let p2 = minter.puzzle_hash().expect("a live account derives a puzzle hash");
-    assert_eq!(p2, wallet_puzzle_hash(&account), "the facade's key is the account's own");
+    let p2 = minter
+        .puzzle_hash()
+        .expect("a live account derives a puzzle hash");
+    assert_eq!(
+        p2,
+        wallet_puzzle_hash(&account),
+        "the facade's key is the account's own"
+    );
 
     let funding = fund_wallet(&mut sim, p2, FUNDING_MOJOS);
     let reward_cat = reward_cat_for(&mut sim, dig_reserve_asset_id(), p2, RESERVE_BASE_UNITS);
-    let manager_pubkey = minter.public_key().expect("a live account derives a public key");
+    let manager_pubkey = minter
+        .public_key()
+        .expect("a live account derives a public key");
     let request = request_for(funding, reward_cat, manager_pubkey);
 
     let minted = minter
@@ -152,10 +171,14 @@ fn a_relocked_account_produces_no_bundle() {
     let mut sim = Simulator::new();
 
     let minter = account.reward_distributor_minter();
-    let p2 = minter.puzzle_hash().expect("a live account derives a puzzle hash");
+    let p2 = minter
+        .puzzle_hash()
+        .expect("a live account derives a puzzle hash");
     let funding = fund_wallet(&mut sim, p2, FUNDING_MOJOS);
     let reward_cat = reward_cat_for(&mut sim, dig_reserve_asset_id(), p2, RESERVE_BASE_UNITS);
-    let manager_pubkey = minter.public_key().expect("a live account derives a public key");
+    let manager_pubkey = minter
+        .public_key()
+        .expect("a live account derives a public key");
     let request = request_for(funding, reward_cat, manager_pubkey);
 
     account.lock();
@@ -197,7 +220,9 @@ fn the_facade_adds_and_removes_no_refusal() {
 
     let account = unlocked_account();
     let minter = account.reward_distributor_minter();
-    let p2 = minter.puzzle_hash().expect("a live account derives a puzzle hash");
+    let p2 = minter
+        .puzzle_hash()
+        .expect("a live account derives a puzzle hash");
     assert_eq!(
         p2,
         raw_key.puzzle_hash(),
@@ -211,8 +236,9 @@ fn the_facade_adds_and_removes_no_refusal() {
     let reward_cat = reward_cat_for(&mut sim, dig_reserve_asset_id(), p2, RESERVE_BASE_UNITS);
     let request = request_for(foreign_funding, reward_cat, raw_key.public_key());
 
-    let raw_err = begin_reward_distributor_mint(&raw_key, &request, &network(), &TESTNET11_CONSTANTS)
-        .expect_err("a foreign funding coin must be refused");
+    let raw_err =
+        begin_reward_distributor_mint(&raw_key, &request, &network(), &TESTNET11_CONSTANTS)
+            .expect_err("a foreign funding coin must be refused");
     let facade_err = minter
         .begin(&request, &network(), &TESTNET11_CONSTANTS)
         .expect_err("the facade must refuse identically");
@@ -228,8 +254,9 @@ fn the_facade_adds_and_removes_no_refusal() {
     let reward_cat = reward_cat_for(&mut sim, dig_reserve_asset_id(), p2, RESERVE_BASE_UNITS);
     let request = request_for(funding, reward_cat, raw_key.public_key());
 
-    let raw_mint = begin_reward_distributor_mint(&raw_key, &request, &network(), &TESTNET11_CONSTANTS)
-        .expect("the raw seam builds this request");
+    let raw_mint =
+        begin_reward_distributor_mint(&raw_key, &request, &network(), &TESTNET11_CONSTANTS)
+            .expect("the raw seam builds this request");
     let facade_mint = minter
         .begin(&request, &network(), &TESTNET11_CONSTANTS)
         .expect("the facade builds this request identically");
@@ -283,7 +310,11 @@ fn issue_cats(f: &CatFixture, ctx: &mut SpendContext, amounts: &[u64]) -> (Bytes
         .expect("the issuance validates against consensus");
     f.chain.bury(1);
 
-    let asset_id = children.first().expect("at least one CAT child").info.asset_id;
+    let asset_id = children
+        .first()
+        .expect("at least one CAT child")
+        .info
+        .asset_id;
     (asset_id, children)
 }
 
@@ -319,7 +350,7 @@ fn dig_cat_coins_lists_only_unspent_coins_at_the_curried_hash() {
     f.chain
         .sim
         .borrow_mut()
-        .spend_coins(ctx.take(), &[f.sk.clone()])
+        .spend_coins(ctx.take(), std::slice::from_ref(&f.sk))
         .expect("the CAT spend validates");
     f.chain.bury(1);
 
@@ -381,11 +412,15 @@ fn dig_cat_coins_is_cat_coins_fixed_to_the_dig_asset() {
     );
 
     let f = fixture();
-    let witness = Coin::new(Bytes32::new([0xEE; 32]), dig_curried_puzzle_hash(f.p2), 9_000);
+    let witness = Coin::new(
+        Bytes32::new([0xEE; 32]),
+        dig_curried_puzzle_hash(f.p2),
+        9_000,
+    );
     f.chain.sim.borrow_mut().insert_coin(witness);
 
-    let via_dig =
-        dig_cat_coins(&f.chain, f.p2).expect_err("the witness coin at the $DIG hash has no lineage");
+    let via_dig = dig_cat_coins(&f.chain, f.p2)
+        .expect_err("the witness coin at the $DIG hash has no lineage");
     let via_cat_coins = cat_coins(&f.chain, DIG_ASSET_ID, f.p2)
         .expect_err("the explicit $DIG call must refuse for the same coin");
 
