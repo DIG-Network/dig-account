@@ -53,6 +53,9 @@ fn the_unauthorized_call_shapes_do_not_compile() {
     // and an active-profile handle cannot survive the switch that invalidates it.
     cases.compile_fail("tests/compile_fail/an_anchor_needs_both_halves.rs");
     cases.compile_fail("tests/compile_fail/a_stale_active_handle.rs");
+    // The reward-distributor evidence types: neither can be built except from real chain evidence
+    // (SPEC.md §6BB.6-§6BB.7) — private fields, pub(crate)-only constructors.
+    cases.compile_fail("tests/compile_fail/a_distributor_needs_chain_evidence.rs");
 }
 
 /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module stripped.
