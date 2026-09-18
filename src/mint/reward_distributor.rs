@@ -42,14 +42,19 @@ use chia_wallet_sdk::prelude::{Conditions, Memos};
 use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
 use chia_wallet_sdk::signer::RequiredSignature;
 use clvmr::{NodePtr, SExp};
+use dig_chainsource_interface::{ChainSource, CoinRecord};
 use dig_rewards_coin::{
-    dig_distributor_constants, launch_dig_distributor, launch_manager_singleton, LaunchComment,
-    ManagerInnerPuzzle, MANAGER_SINGLETON_AMOUNT_MOJOS,
+    dig_distributor_constants, discover_distributor, launch_dig_distributor,
+    launch_manager_singleton, LaunchComment, ManagerInnerPuzzle, MANAGER_SINGLETON_AMOUNT_MOJOS,
 };
 
 use crate::keys::wallet_key::WalletKey;
-use crate::mint::did::MintNetwork;
+use crate::mint::chain::SpendPublisher;
+use crate::mint::did::{self, MintNetwork};
 use crate::mint::error::{MintError, MintResult};
+use crate::mint::reward_distributor_evidence::{
+    ConfirmedRewardDistributor, PendingRewardDistributor, RewardDistributorStatus,
+};
 
 /// The XCH the launch offer carries to the settlement puzzle.
 ///
@@ -115,6 +120,15 @@ pub struct SignedRewardDistributorMint {
     bundle: SpendBundle,
     distributor_launcher_id: Bytes32,
     manager_launcher_id: Bytes32,
+    /// The XCH funding coin this mint spends — one of its two pre-existing inputs. Carried through
+    /// so [`submit`](Self::submit) can build the [`PendingRewardDistributor`](super::reward_distributor_evidence::PendingRewardDistributor)
+    /// evidence names without re-deriving it from the bundle.
+    funding_coin_id: Bytes32,
+    /// The $DIG CAT coin this mint spends — its other pre-existing input. Same role as
+    /// `funding_coin_id`.
+    reward_cat_coin_id: Bytes32,
+    /// The generation (`store_id:root`) this launch's comment advertises, echoed from the request.
+    generation: LaunchComment,
     /// The reward CAT coin's amount, echoed from the request. See the accessor for why the name
     /// carries `requested`.
     requested_reserve_base_units: u64,
@@ -140,6 +154,8 @@ impl SignedRewardDistributorMint {
     ///
     /// Derived from this bundle's own spends. No coin with this id exists until the bundle
     /// confirms; a bundle that is never submitted, or is rejected, leaves this id naming nothing.
+    /// `submit` carries this same id into the `PendingRewardDistributor` it returns, and only a
+    /// buried, discovered confirmation of it turns into `ConfirmedRewardDistributor::distributor_launcher_id()`.
     #[must_use]
     pub const fn predicted_distributor_launcher_id(&self) -> Bytes32 {
         self.distributor_launcher_id
@@ -149,6 +165,8 @@ impl SignedRewardDistributorMint {
     ///
     /// Derived from this bundle's own spends. No coin with this id exists until the bundle
     /// confirms; a bundle that is never submitted, or is rejected, leaves this id naming nothing.
+    /// `submit` carries this same id into the `PendingRewardDistributor` it returns, and only a
+    /// buried, discovered confirmation of it turns into `ConfirmedRewardDistributor::manager_launcher_id()`.
     #[must_use]
     pub const fn predicted_manager_launcher_id(&self) -> Bytes32 {
         self.manager_launcher_id
@@ -170,6 +188,205 @@ impl SignedRewardDistributorMint {
     #[cfg(test)]
     pub(super) const fn security_coin_secret_key(&self) -> &chia_bls::SecretKey {
         &self.security_coin_secret_key
+    }
+
+    /// Broadcast this bundle and name what to look for on chain (`SPEC.md` §6BB.6, §6BB.8).
+    ///
+    /// The peak is read BEFORE the push, deliberately: it is the pending's `pushed_at_height`, the
+    /// lower bound `status` uses to reject a confirmation the chain claims predates this broadcast
+    /// (rule (b)). Reading it after the push would let a race with block production move the peak
+    /// forward first, silently narrowing that bound.
+    ///
+    /// Takes `&self`, not `self`: after `Err(MintError::ChainUnreachable)` the outcome is UNKNOWN
+    /// and the caller MUST be able to push the identical bundle again (`SPEC.md` §6BB.6) — a mempool
+    /// is idempotent over the same bundle, and `AlreadyInMempool` is the same success.
+    ///
+    /// # Errors
+    ///
+    /// - [`MintError::ChainUnreachable`] if the peak cannot be read, or if the push's outcome is
+    ///   unknown. The bundle was NOT necessarily lost; push it again.
+    /// - [`MintError::Rejected`] if the mempool answered no. Funds did not move.
+    pub fn submit<C, P>(&self, chain: &C, publisher: &P) -> MintResult<PendingRewardDistributor>
+    where
+        C: ChainSource + ?Sized,
+        P: SpendPublisher + ?Sized,
+    {
+        let pushed_at_height = did::peak_height(chain)?;
+        did::push(publisher, &self.bundle)?;
+
+        Ok(PendingRewardDistributor::new(
+            self.distributor_launcher_id,
+            self.manager_launcher_id,
+            self.funding_coin_id,
+            self.reward_cat_coin_id,
+            self.requested_reserve_base_units,
+            self.generation,
+            pushed_at_height,
+        ))
+    }
+}
+
+/// Adapts a `&C` (`C: ChainSource + ?Sized`) into a `Sized` [`ChainSource`] impl.
+///
+/// `dig_rewards_coin::discover_distributor` takes `source: &impl ChainSource`, i.e. a generic,
+/// therefore `Sized`, parameter — while [`PendingRewardDistributor::status`] is generic over
+/// `C: ChainSource + ?Sized`, like every other confirmation read in this crate (`SPEC.md` §6BB.8).
+/// `ByRef` is a zero-cost forward of every method, not a narrowing of the public bound to fit a
+/// dependency's signature.
+struct ByRef<'a, C: ?Sized>(&'a C);
+
+impl<C: ChainSource + ?Sized> ChainSource for ByRef<'_, C> {
+    type Error = C::Error;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.0.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.0
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(
+        &self,
+        parent_coin_id: Bytes32,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.0.coin_records_by_parent(parent_coin_id)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.0.coin_spend(coin_id)
+    }
+
+    fn parent_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.0.parent_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+        self.0.resolve_singleton_lineage(launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.0.peak_height()
+    }
+
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        self.0.block_timestamp(height)
+    }
+}
+
+impl PendingRewardDistributor {
+    /// Ask the chain where this pushed reward-distributor mint stands (`SPEC.md` §6BB.8).
+    ///
+    /// Evaluated in a fixed, normative order — the launcher record before either input, and
+    /// discovery only against a CONFIRMED launcher — because reordering it misreports: an input
+    /// read before the launcher would call an already-included mint's own spend a "different
+    /// spend", and a discovery attempted against an unconfirmed coin would misread an unreadable
+    /// parent spend as a contradiction.
+    ///
+    /// # Errors
+    ///
+    /// [`MintError::ChainUnreachable`] whenever a chain read fails or cannot answer — including a
+    /// missing peak, a failed launcher/input read, or a `discover_distributor` error. The mint's
+    /// state is then UNKNOWN, never an absence: this method never turns a read failure into
+    /// `Awaiting` or `Failed`.
+    pub fn status<C>(&self, chain: &C) -> MintResult<RewardDistributorStatus>
+    where
+        C: ChainSource + ?Sized,
+    {
+        let peak = did::peak_height(chain)?;
+
+        let launcher_record = chain
+            .coin_record(self.distributor_launcher_id())
+            .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+
+        let Some(launcher_record) = launcher_record else {
+            // Step 3: the launcher does not exist (yet, or ever). Its own inputs are the only
+            // evidence left: if either was consumed by a spend other than this bundle's, this mint
+            // can never confirm.
+            let funding = chain
+                .coin_record(self.funding_coin_id())
+                .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+            let reward_cat = chain
+                .coin_record(self.reward_cat_coin_id())
+                .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+
+            if funding.as_ref().is_some_and(CoinRecord::is_spent) {
+                return Ok(RewardDistributorStatus::Failed {
+                    reason: "the funding coin was spent by a different spend; this mint can never \
+                             confirm"
+                        .into(),
+                });
+            }
+            if reward_cat.as_ref().is_some_and(CoinRecord::is_spent) {
+                return Ok(RewardDistributorStatus::Failed {
+                    reason: "the reward CAT coin was spent by a different spend; this mint can \
+                             never confirm"
+                        .into(),
+                });
+            }
+
+            return Ok(RewardDistributorStatus::Awaiting {
+                blocks_since_push: peak.saturating_sub(self.pushed_at_height()),
+            });
+        };
+
+        if launcher_record.confirmed_height.is_none() {
+            // Step 4: a mempool observation of the launcher is "not yet" — discovery is not
+            // attempted, since the parent spend of an unconfirmed coin need not be readable.
+            return Ok(RewardDistributorStatus::Awaiting {
+                blocks_since_push: peak.saturating_sub(self.pushed_at_height()),
+            });
+        }
+
+        // Step 5: the launcher is confirmed. Only now is discovery attempted.
+        let by_ref = ByRef(chain);
+        let discovered = discover_distributor(&by_ref, self.distributor_launcher_id())
+            .map_err(|e| MintError::ChainUnreachable(e.to_string()))?;
+
+        let Some(discovered) = discovered else {
+            return Ok(RewardDistributorStatus::Failed {
+                reason: "the launcher coin is confirmed, but the spend that created it advertises \
+                         no DIG rewards distributor for it"
+                    .into(),
+            });
+        };
+
+        match crate::mint::reward_distributor_evidence::check(
+            self,
+            &launcher_record,
+            &discovered,
+            peak,
+        ) {
+            Ok(()) => {
+                let evidence = ConfirmedRewardDistributor::from_confirmed(
+                    self,
+                    &launcher_record,
+                    &discovered,
+                    peak,
+                )
+                .expect("check() returned Ok, so from_confirmed cannot refuse the same inputs");
+                Ok(RewardDistributorStatus::Confirmed(evidence))
+            }
+            Err(crate::mint::reward_distributor_evidence::EvidenceDefect::Shallow) => {
+                Ok(RewardDistributorStatus::Awaiting {
+                    blocks_since_push: peak.saturating_sub(self.pushed_at_height()),
+                })
+            }
+            Err(defect) => Ok(RewardDistributorStatus::Failed {
+                reason: format!(
+                    "the confirmed launcher's evidence does not describe this pending mint \
+                     ({defect:?})"
+                ),
+            }),
+        }
     }
 }
 
@@ -425,6 +642,9 @@ fn build_and_sign_reward_distributor_launch(
         bundle: SpendBundle::new(coin_spends, signature),
         distributor_launcher_id: launched.distributor.info.constants.launcher_id,
         manager_launcher_id: manager.launcher_id(),
+        funding_coin_id,
+        reward_cat_coin_id,
+        generation: request.generation,
         requested_reserve_base_units: request.reward_cat.coin.amount,
         #[cfg(test)]
         security_coin_secret_key: launched.security_coin_secret_key,
@@ -820,6 +1040,248 @@ mod tests {
 
         verify_aggregate_discharges(&signature, &signed, security_sk.public_key())
             .expect("a correctly aggregated signature over the exact enumerated pairs verifies");
+    }
+}
+
+/// Unit tests for [`PendingRewardDistributor::status`]'s evaluation order (`SPEC.md` §6BB.8), over
+/// a hand-built [`ChainSource`] double rather than a simulator — the ORDER a real chain is consulted
+/// in is exactly what a simulator's real block production cannot pin down cheaply.
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::mint::MIN_CONFIRMATION_DEPTH;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    const PUSHED_AT: u32 = 4_200_000;
+
+    fn generation(seed: u8) -> LaunchComment {
+        LaunchComment::new(Bytes32::new([seed; 32]), Bytes32::new([seed ^ 0x11; 32]))
+    }
+
+    fn pending(launcher_id: Bytes32) -> PendingRewardDistributor {
+        PendingRewardDistributor::new(
+            launcher_id,
+            Bytes32::new([0x22; 32]),
+            Bytes32::new([0x33; 32]),
+            Bytes32::new([0x44; 32]),
+            1_000,
+            generation(1),
+            PUSHED_AT,
+        )
+    }
+
+    /// A [`ChainSource`] double whose `coin_spend` call is COUNTED, so a test can assert discovery
+    /// was (or was not) attempted without depending on what it would have returned.
+    #[derive(Default)]
+    struct StubChain {
+        peak: Option<u32>,
+        records: HashMap<Bytes32, CoinRecord>,
+        /// `coin_id -> the spend that consumed it`, keyed by the SPENT coin's id (so
+        /// `coin_spend(parent_id)` and the default `parent_spend` compose correctly).
+        spends: HashMap<Bytes32, CoinSpend>,
+        coin_spend_calls: Cell<u32>,
+        fail_coin_spend: bool,
+    }
+
+    impl ChainSource for StubChain {
+        type Error = String;
+
+        fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+            Ok(self.records.get(&coin_id).cloned())
+        }
+
+        fn coin_records_by_puzzle_hash(
+            &self,
+            _puzzle_hash: Bytes32,
+            _include_spent: bool,
+        ) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn coin_records_by_parent(&self, _parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+            self.coin_spend_calls.set(self.coin_spend_calls.get() + 1);
+            if self.fail_coin_spend {
+                return Err("the chain could not answer".to_string());
+            }
+            Ok(self.spends.get(&coin_id).cloned())
+        }
+
+        fn resolve_singleton_lineage(
+            &self,
+            _launcher_id: Bytes32,
+        ) -> Result<Option<dig_chainsource_interface::SingletonLineage>, Self::Error> {
+            Err("not supported by this test double".to_string())
+        }
+
+        fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+            Ok(self.peak)
+        }
+
+        fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+            Ok(None)
+        }
+    }
+
+    fn record(coin: Coin, confirmed_height: Option<u32>, spent_height: Option<u32>) -> CoinRecord {
+        CoinRecord {
+            coin,
+            confirmed_height,
+            spent_height,
+            timestamp: None,
+            coinbase: false,
+        }
+    }
+
+    /// An unconfirmed (mempool-only) launcher record is `Awaiting`, and discovery is never
+    /// attempted: `coin_spend` (which a real discovery walk would call) must not be reached.
+    #[test]
+    fn an_unconfirmed_launcher_is_awaiting_and_discovery_is_not_attempted() {
+        let parent = Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 1);
+        let (discovered, spend) =
+            crate::mint::fixtures::discovered_distributor(&parent, generation(1));
+        let launcher_id = discovered.launcher_id();
+        let launcher_coin = chia_wallet_sdk::driver::Launcher::new(parent.coin_id(), 1).coin();
+
+        let mut records = HashMap::new();
+        records.insert(launcher_id, record(launcher_coin, None, None));
+        let mut spends = HashMap::new();
+        spends.insert(parent.coin_id(), spend);
+
+        let chain = StubChain {
+            peak: Some(PUSHED_AT + 50),
+            records,
+            spends,
+            ..Default::default()
+        };
+
+        let status = pending(launcher_id)
+            .status(&chain)
+            .expect("a stub chain that answers every call never returns ChainUnreachable");
+
+        assert_eq!(
+            status,
+            RewardDistributorStatus::Awaiting {
+                blocks_since_push: 50
+            }
+        );
+        assert_eq!(
+            chain.coin_spend_calls.get(),
+            0,
+            "discovery must not be attempted against an unconfirmed launcher"
+        );
+    }
+
+    /// A CONFIRMED launcher whose parent spend advertises no distributor comment is `Failed`, not
+    /// `Awaiting`: the launcher exists, so nothing further will change this outcome.
+    #[test]
+    fn a_confirmed_launcher_with_no_distributor_comment_is_failed_not_awaiting() {
+        let launcher_coin = Coin::new(Bytes32::new([3; 32]), Bytes32::new([4; 32]), 1);
+        let mut records = HashMap::new();
+        records.insert(
+            launcher_coin.coin_id(),
+            record(launcher_coin, Some(PUSHED_AT), None),
+        );
+        // No `coin_spend` entry for the launcher's parent: `discover_distributor`'s `parent_spend`
+        // read comes back `Ok(None)`, exactly like a parent that created no distributor comment.
+
+        let chain = StubChain {
+            peak: Some(PUSHED_AT + 50),
+            records,
+            ..Default::default()
+        };
+
+        let status = pending(launcher_coin.coin_id())
+            .status(&chain)
+            .expect("a stub chain that answers every call never returns ChainUnreachable");
+
+        assert!(
+            matches!(status, RewardDistributorStatus::Failed { .. }),
+            "a confirmed launcher advertising no distributor is a contradiction, not a delay: got \
+             {status:?}"
+        );
+    }
+
+    /// A read failure DURING discovery (the parent-spend walk) is `Err`, never a status: an unknown
+    /// answer must not be reported as `Awaiting` or `Failed`.
+    #[test]
+    fn a_discovery_read_failure_is_an_error_not_a_status() {
+        let launcher_coin = Coin::new(Bytes32::new([5; 32]), Bytes32::new([6; 32]), 1);
+        let mut records = HashMap::new();
+        records.insert(
+            launcher_coin.coin_id(),
+            record(launcher_coin, Some(PUSHED_AT), None),
+        );
+
+        let chain = StubChain {
+            peak: Some(PUSHED_AT + 50),
+            records,
+            fail_coin_spend: true,
+            ..Default::default()
+        };
+
+        let result = pending(launcher_coin.coin_id()).status(&chain);
+        assert!(
+            matches!(result, Err(MintError::ChainUnreachable(_))),
+            "a chain read failure mid-discovery must surface as an error, not a status: got \
+             {result:?}"
+        );
+    }
+
+    /// The launcher is read BEFORE either input: an INCLUDED mint has spent its own inputs, and a
+    /// launcher record that satisfies every rule must win over an input read that would otherwise
+    /// misreport the mint's own spend as "a different spend".
+    #[test]
+    fn the_launcher_is_read_before_the_inputs() {
+        let parent = Coin::new(Bytes32::new([7; 32]), Bytes32::new([8; 32]), 1);
+        let (discovered, spend) =
+            crate::mint::fixtures::discovered_distributor(&parent, generation(1));
+        let launcher_id = discovered.launcher_id();
+        let launcher_coin = chia_wallet_sdk::driver::Launcher::new(parent.coin_id(), 1).coin();
+
+        let p = pending(launcher_id);
+        // `funding_coin_id`/`reward_cat_coin_id` are reported SPENT — if the launcher were not
+        // read first, this would misreport as proof-of-death `Failed`.
+        let mut records = HashMap::new();
+        records.insert(launcher_id, record(launcher_coin, Some(PUSHED_AT), None));
+        records.insert(
+            p.funding_coin_id(),
+            record(
+                Coin::new(p.funding_coin_id(), Bytes32::new([0xAA; 32]), 1),
+                Some(PUSHED_AT),
+                Some(PUSHED_AT + 1),
+            ),
+        );
+        records.insert(
+            p.reward_cat_coin_id(),
+            record(
+                Coin::new(p.reward_cat_coin_id(), Bytes32::new([0xBB; 32]), 1),
+                Some(PUSHED_AT),
+                Some(PUSHED_AT + 1),
+            ),
+        );
+        let mut spends = HashMap::new();
+        spends.insert(parent.coin_id(), spend);
+
+        let chain = StubChain {
+            peak: Some(PUSHED_AT + MIN_CONFIRMATION_DEPTH - 1),
+            records,
+            spends,
+            ..Default::default()
+        };
+
+        let status = p
+            .status(&chain)
+            .expect("a stub chain that answers every call never returns ChainUnreachable");
+
+        assert!(
+            matches!(status, RewardDistributorStatus::Confirmed(_)),
+            "the launcher's own confirmation must win over its now-spent inputs: got {status:?}"
+        );
     }
 }
 
