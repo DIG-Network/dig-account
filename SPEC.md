@@ -1998,11 +1998,15 @@ produces no key, no puzzle hash and no bundle through this facade, for the same 
 `ensure_live` runs ahead of derivation (§6B): the ceremony consults the chain between deriving a key and
 signing, and a lock during that window must stop the signature, not merely refuse to have started one.
 
-**No method returns a `WalletKey`, a `SecretKey` or the master seed.** The facade's only public surface is
-`public_key()`, `puzzle_hash()`, `begin(...)` and `dig_cat_coins(...)` — none of which can hand the caller
-anything that signs. This is a structural property, not a convention: `src/reward_distributor_mint.rs`
-contains no `pub fn` returning key material, and a compile-fail case (`tests/compile_fail/`) proves the
-struct cannot be constructed or its fields read from outside this crate.
+**No method returns a `WalletKey`, a `SecretKey`, the master seed, or its container.** The facade's only
+public surface is `public_key()`, `puzzle_hash()`, `begin(...)` and `dig_cat_coins(...)` — none of which
+can hand the caller anything that signs. This is a structural property, not a convention:
+`src/reward_distributor_mint.rs` contains no `pub fn` returning key material — a source-scan test checks
+every `pub fn`'s RETURN TYPE (not merely a `master_seed`/`WalletKey`/`SecretKey` name-match) against the
+seed's OWN container type (`UnlockedMasterSeed`) and against `Arc<...>` generally, because handing out that
+container leaks the seed exactly as directly as handing out the bytes (its own `master_seed()` accessor is
+public). A compile-fail case (`tests/compile_fail/`) separately proves the struct cannot be constructed or
+its fields read from outside this crate.
 
 **`begin` is a pure pass-through to §6BB.** `RewardDistributorMinter::begin` calls
 `begin_reward_distributor_mint(&key, request, network, consensus_constants)` and nothing else — it adds no
@@ -2019,10 +2023,31 @@ builder's private coin selection (§6): given a chain and a p2 puzzle hash, they
 of that asset at that address, each with a proven lineage.
 
 **Unspent only.** A coin record with a `spent_height` is never returned — a caller asking "what can this
-wallet spend" must not be handed a coin somebody, or the wallet itself, already spent.
+wallet spend" must not be handed a coin somebody, or the wallet itself, already spent. This is re-checked
+locally rather than trusted to the source's own `include_spent = false` handling: a source that ignores
+the flag must not be able to make a spent coin read as spendable.
 
-**Lineage is proven or the WHOLE call refuses.** Each candidate coin's parent spend is read and parsed as
-a CAT (reusing the CAT-transfer builder's `resolve_lineage`); a coin whose parent spend is missing, does
+**Attributed only to the coin actually at the queried puzzle hash.** Each candidate's own
+`record.coin.puzzle_hash` is re-checked against the puzzle hash just derived from `asset_id` and
+`p2_puzzle_hash`, mirroring the same re-check the private selector (§6) runs on its own candidates. A
+hint-indexing (or otherwise non-conforming or malicious) source can answer a puzzle-hash query with a
+real, genuinely spendable, lineage-provable coin that is not actually at that puzzle hash — its true owner
+is someone else, or nobody. Without this re-check, `resolve_lineage`'s coin-id-based matching would let
+such a coin resolve cleanly and be attributed to the caller's wallet. This is exclusion, never a refusal
+of the whole call: a stranger must not be able to make a wallet's own listing fail merely by hinting a
+coin at it.
+
+**Bounded, largest first.** After the unspent and puzzle-hash filters, candidates are sorted by amount
+(largest first, ties broken by coin id for a deterministic order), and lineage is resolved for at most the
+first `MAX_LISTED_CAT_COINS` (64) of them — this bounds the remote reads and CLVM parses `cat_coins`
+performs, not merely the length of the `Vec` it returns, because a dust attack against a public CAT
+address is as available as one against an XCH address and each candidate costs a real chain read. The
+result type, `CatCoinListing`, reports the shortfall as an explicit `omitted` count: never a silent
+truncation of the returned set, and never a whole-call refusal merely because more candidates existed
+than the bound allows.
+
+**Lineage is proven or the WHOLE call refuses.** Each resolved candidate's parent spend is read and parsed
+as a CAT (reusing the CAT-transfer builder's `resolve_lineage`); a coin whose parent spend is missing, does
 not parse as a CAT, or does not create that coin as a CAT child is `CatTransferError::LineageUnavailable`
 for the entire call — never a partial `Vec` with the unprovable coin silently dropped, and never a `Cat`
 carrying a fabricated or absent lineage proof. A source that cannot answer for one coin is not evidence
