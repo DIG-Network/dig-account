@@ -2,9 +2,9 @@
 
 use chia_protocol::{Bytes32, Coin, CoinSpend};
 use chia_wallet_sdk::clvm_traits::{clvm_quote, ToClvm};
+use chia_wallet_sdk::clvmr::NodePtr;
 use chia_wallet_sdk::driver::{Launcher, SpendContext};
 use chia_wallet_sdk::types::Conditions;
-use chia_wallet_sdk::clvmr::NodePtr;
 use dig_chainsource_interface::CoinRecord;
 use dig_rewards_coin::{discovered_distributors_in_spend, DiscoveredDistributor, LaunchComment};
 
