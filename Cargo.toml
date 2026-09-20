@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.28.0"
+version = "0.29.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -47,21 +47,20 @@ dig-session = "0.9"
 # no dig-identity type can meet a different one across a seam.
 dig-identity = "0.7.1"
 dig-keystore = "0.13"
-# The single dig-constants line: dig-session 0.9 and dig-wallet-backend 0.31 both require ^0.11, so
-# asking for it here upgrades that shared edge rather than resolving a second one beside it.
+# NO LONGER a single dig-constants line — that ship sailed underneath this comment.
 #
-# HELD at ^0.11 DELIBERATELY, against §2.4b's "bring dig-* to latest". 0.13.1 is published, and
-# measured from the index on 2026-09-04: dig-session 0.9.1 declares `dig-constants ^0.11.1` and
-# dig-wallet-backend 0.31.1 declares `^0.11`. Neither has adopted 0.13. So bumping the caret HERE
-# would not upgrade that shared edge — it would resolve a SECOND dig-constants line beside it, one
-# 0.13 for this crate and one 0.11 for the session and money seams it hands values to. That is the
-# exact duplication this comment's first sentence exists to prevent, and §2.4b names it outright:
-# do not bump a dep whose new version drags in an old line; verify from the resolved lock.
+# Re-measured 2026-09-17 (#59/#60, §2.4b): dig-rewards-coin ^0.6/^0.7 both declare
+# `dig-constants ^0.13.1`, so the moment dig-account took on dig-rewards-coin (#58) the lock ALREADY
+# resolved two dig-constants lines — 0.11.1 for dig-session/dig-wallet-backend (still `^0.11` as of
+# 0.9.1/0.31.1) and 0.13.1 for dig-rewards-coin. Holding this line at ^0.11, as the previous version
+# of this comment did, no longer avoids a second line; it just makes THIS crate's own direct usage
+# the odd one out, on 0.11.1 while its own dependency's is on 0.13.1. Moving here to ^0.13 joins the
+# line dig-rewards-coin already pulls in rather than opening a new one — verified via `cargo tree -d`
+# after the bump.
 #
-# The order is release-first (§4.1): dig-session and dig-wallet-backend adopt ^0.13, and only then
-# does this line move. Tracked as a named child rather than folded in here, because that cascade is
-# two other repos wide and would dwarf this crate's change.
-dig-constants = "0.11"
+# dig-session and dig-wallet-backend adopting ^0.13 is still the eventual fix for the OTHER half of
+# the split (tracked as a named child, release-first per §4.1); it just no longer gates this line.
+dig-constants = "0.13"
 # Floor at 0.3.1, which is the first release on chia-bls ^0.36.1. 0.3.0 required ^0.26 and was the
 # ONLY edge in this tree resolving a chia-bls line other than 0.36.1 through a first-party crate —
 # the remaining duplicates are internal to clvmr and chialisp and reach no public signature. The
@@ -121,7 +120,7 @@ dig-chainsource-interface = { version = "0.3.3", features = ["lineage-walk"] }
 # BOTH directly and through dig-social-profile -> dig-store, so bumping the caret here does not
 # upgrade those edges — it resolves a SECOND line beside them. The order is always dig-store first,
 # then dig-social-profile, then here. Re-check with `cargo tree -d` before moving this line.
-dig-merkle = "0.9"
+dig-merkle = "0.9.1"
 # The profile SMT **schema only** — `Profile::with_schema_v2`, `SlotId`, `Value`, `build_root`.
 #
 # 0.4 is the first release on the chia 0.36.1 / chia-wallet-sdk 0.34 family. Before it, this crate
@@ -179,7 +178,7 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # response MAPPING is deliberately independent of it, so the mempool-verdict logic is unit-tested
 # through the `PushTransport` seam with no client and no network at all.
 ureq = { version = "2", optional = true }
-dig-rewards-coin = "0.6"
+dig-rewards-coin = "0.7"
 
 [dev-dependencies]
 # Test-only: the INDEPENDENT BIP-39 expansion used as the reference for the account root, so a

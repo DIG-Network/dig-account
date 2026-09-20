@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.0] - 2026-09-17
+
+### Features
+- **account:** `reward_distributor_minter()` facade over the reward-distributor mint seam (#60)
+- **cat_transfer:** Public `cat_coins` / `dig_cat_coins` unspent, lineage-proven CAT selection (#59)
+
+### Bug Fixes
+- **cat_transfer:** `cat_coins` / `dig_cat_coins` now re-check each candidate's puzzle hash (never
+  attributing a stranger's coin hinted at the queried address), bound the coins whose lineage they
+  resolve to `MAX_LISTED_CAT_COINS` with the shortfall reported as `CatCoinListing::omitted`, and
+  return `CatCoinListing` in place of a bare `Vec<Cat>` (#59, #60 gate round)
+- **reward_distributor_mint:** the key-egress source scan now also flags a public method whose return
+  type is the seed's own container (`UnlockedMasterSeed`) or any `Arc<...>`, not only `WalletKey`/
+  `SecretKey`/`master_seed` by name (#59, #60 gate round)
+
 ## [0.28.0] - 2026-09-17
 
 ### Features
