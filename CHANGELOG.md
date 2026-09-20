@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.30.0] - 2026-09-20
 
 ### Features
-- **mint:** Publish + confirm half of a reward-distributor mint (#3341) — `SignedRewardDistributorMint::submit`, `PendingRewardDistributor`, `ConfirmedRewardDistributor`, `RewardDistributorStatus`
+- **mint:** Publish + confirm half of the reward-distributor mint (#3341)
 
 ## [0.29.0] - 2026-09-20
 
