@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.30.1] - 2026-09-20
+
+### Fixes
+- Re-stamp Cargo.lock to the crate's own version so 'cargo package --locked' passes; 0.30.0 was tagged but never published (publish run 35516991530).
+
 ## [0.30.0] - 2026-09-20
 
 ### Features
