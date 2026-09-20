@@ -6,8 +6,8 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.30.1] - 2026-09-20
 
-### Fixes
-- Re-stamp Cargo.lock to the crate's own version so 'cargo package --locked' passes; 0.30.0 was tagged but never published (publish run 35516991530).
+### Bug Fixes
+- **release:** Re-stamp Cargo.lock and bump to 0.30.1 -- 0.30.0 publish failed under --locked
 
 ## [0.30.0] - 2026-09-20
 
