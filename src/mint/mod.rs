@@ -24,6 +24,7 @@ pub mod error;
 pub mod evidence;
 pub mod profile;
 pub mod reward_distributor;
+pub mod reward_distributor_evidence;
 pub mod seed;
 pub mod status;
 pub mod store_evidence;
@@ -51,6 +52,9 @@ pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use profile::ProfileMintStatus;
+pub use reward_distributor_evidence::{
+    ConfirmedRewardDistributor, PendingRewardDistributor, RewardDistributorStatus,
+};
 pub use seed::ProfileSeed;
 pub use status::MintStatus;
 pub use store_evidence::{ConfirmedStore, PendingStoreLaunch};

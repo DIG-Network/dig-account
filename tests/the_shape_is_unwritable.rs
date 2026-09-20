@@ -55,6 +55,9 @@ fn the_unauthorized_call_shapes_do_not_compile() {
     cases.compile_fail("tests/compile_fail/a_stale_active_handle.rs");
     // #60: a `RewardDistributorMinter` can only ever come from an unlocked account.
     cases.compile_fail("tests/compile_fail/construct_a_minter_outside_the_unlock.rs");
+    // The reward-distributor evidence types: neither can be built except from real chain evidence
+    // (SPEC.md §6BB.6-§6BB.7) — private fields, pub(crate)-only constructors.
+    cases.compile_fail("tests/compile_fail/a_distributor_needs_chain_evidence.rs");
 }
 
 /// Every `.rs` file under `src/`, with its `#[cfg(test)]` module stripped.
