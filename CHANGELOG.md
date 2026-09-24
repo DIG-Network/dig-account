@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.0] - 2026-09-24
+
+### Features
+- **account:** Egress allowlist scan, CatCoinListing order, rustdoc + lockfile gates (#63) (#65)
+
 ## [0.30.1] - 2026-09-20
 
 ### Bug Fixes
