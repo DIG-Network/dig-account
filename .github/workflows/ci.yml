@@ -53,6 +53,8 @@ jobs:
         run: cargo test --doc --all-features
 
       - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --all-features
 
   coverage:

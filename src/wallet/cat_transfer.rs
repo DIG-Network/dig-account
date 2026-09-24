@@ -24,7 +24,7 @@
 //! The CAT puzzle demands a lineage proof — proof that this coin descends from a genuine coin of
 //! the same asset. That proof is only obtainable by reading the coin's PARENT SPEND and parsing it.
 //! Every selected input therefore costs a second chain read
-//! ([`ChainSource::parent_spend`](dig_chainsource_interface::ChainSource::parent_spend)), and an
+//! ([`ChainSource::parent_spend`]), and an
 //! input whose lineage cannot be established is not "skipped" — it is
 //! [`CatTransferError::LineageUnavailable`], because a coin we cannot prove is a coin we must not
 //! spend.
@@ -40,7 +40,7 @@
 //! # Every input is confirmed by name first
 //!
 //! Both the CAT inputs and the XCH fee coin go through
-//! [`confirm_all_spendable_by_name`](crate::chain_confirm::confirm_all_spendable_by_name), all-or-
+//! [`confirm_all_spendable_by_name`], all-or-
 //! nothing, for the reasons in [`crate::chain_confirm`].
 
 use std::collections::HashSet;
@@ -88,7 +88,7 @@ pub const MAX_CAT_TRANSFER_INPUT_COINS: usize = MAX_TRANSFER_INPUT_COINS;
 /// The most CAT coins [`cat_coins`] will resolve lineage for and return in one call.
 ///
 /// [`cat_coins`] is reachable with no amount to select toward — a caller only needs to know a
-/// puzzle hash, which anyone can compute — so unlike [`select_cat_coins`], its candidate count is
+/// puzzle hash, which anyone can compute — so unlike `select_cat_coins`, its candidate count is
 /// not bounded by what the caller needs. Each candidate costs a real chain read
 /// ([`ChainSource::parent_spend`]) plus a CLVM parse, so an unbounded listing lets dust sent to a
 /// public address turn one call into an arbitrarily large number of reads: a cost-asymmetry denial
@@ -417,7 +417,7 @@ impl CatCoinListing {
 /// # Attributed only to the coin actually at the puzzle hash
 ///
 /// Each candidate's own `record.coin.puzzle_hash` is re-checked against the puzzle hash just
-/// queried — the same re-check [`select_cat_coins`] runs locally, and for the same reason: a
+/// queried — the same re-check `select_cat_coins` runs locally, and for the same reason: a
 /// hint-indexing (or otherwise malicious) source can answer with a coin at a DIFFERENT puzzle hash
 /// that merely hints at this one, and a caller that trusted the index would attribute a stranger's
 /// CAT coin to this wallet's address. A stranger must not be able to make that happen by hinting

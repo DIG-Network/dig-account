@@ -22,7 +22,7 @@
 //!   `chia-wallet-sdk` drivers) and every signature message comes from
 //!   [`dig_did::required_signatures`], the SDK's key-free extractor. This module adds coin selection,
 //!   a gate, and a broadcast — no puzzle, no condition encoding, no message construction of its own.
-//! - **The signing gate.** The account key is never used as an oracle: [`gate`] refuses to sign
+//! - **The signing gate.** The account key is never used as an oracle: `gate` refuses to sign
 //!   anything but `AGG_SIG_ME` under this wallet's own key, over a bundle that spends exactly one
 //!   pre-existing coin, which must pay this wallet's own puzzle hash, and otherwise only coins the
 //!   bundle itself creates. (The general money path's `LocalMoneySigner` cannot serve here: its verifier decodes
@@ -144,7 +144,7 @@ impl ProfileMinter {
     ///
     /// Returns a [`PendingMint`] — the bundle reached the mempool, which is NOT yet a DID. Poll
     /// [`mint_status`](Self::mint_status) until it reports
-    /// [`MintStatus::Confirmed`](crate::mint::MintStatus::Confirmed); only that evidence may be
+    /// [`MintStatus::Confirmed`]; only that evidence may be
     /// recorded.
     ///
     /// # Errors

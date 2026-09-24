@@ -144,7 +144,7 @@ pub struct SignedRewardDistributorMint {
 }
 
 impl SignedRewardDistributorMint {
-    /// The signed bundle, ready for the [`SpendPublisher`](super::chain::SpendPublisher) seam.
+    /// The signed bundle, ready for the [`SpendPublisher`] seam.
     #[must_use]
     pub const fn bundle(&self) -> &SpendBundle {
         &self.bundle
@@ -395,7 +395,7 @@ impl PendingRewardDistributor {
 ///
 /// The returned bundle is complete or there is no bundle. It is NOT pushed — a bundle that reached
 /// a mempool is not a confirmed distributor, and this crate never conflates the two; the caller
-/// broadcasts it through [`SpendPublisher`](super::chain::SpendPublisher) and confirms it by
+/// broadcasts it through [`SpendPublisher`] and confirms it by
 /// reading the chain.
 ///
 /// # Errors

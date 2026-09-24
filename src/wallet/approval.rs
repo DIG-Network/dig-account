@@ -57,7 +57,7 @@ struct AuthorizedSpend {
 /// A spend the custody gate has PERMITTED, carrying the exact coin spends it permitted.
 ///
 /// Minted only by [`PolicyAuthorizer::authorize_op`](crate::wallet::enforcer::PolicyAuthorizer::authorize_op)
-/// (auto-approved) or by [`PendingApproval::confirmed`] (the human approved), and accepted only by
+/// (auto-approved) or by [`PendingApproval::confirm_with`] (the human approved), and accepted only by
 /// [`MoneySigner::sign_approved`](crate::wallet::money_signer::MoneySigner::sign_approved) — which is
 /// the only signing entry point in the crate. See the module docs for why it owns the spends rather
 /// than describing them.
@@ -101,7 +101,7 @@ impl SpendApproval {
 /// A spend the custody gate would permit only with a human's agreement — the escalatable outcome.
 ///
 /// Holds the same spends and the same summary as the approval it may become, so the user confirms the
-/// spend that will actually be signed. [`confirmed`](Self::confirmed) is the ONLY route from here to a
+/// spend that will actually be signed. [`confirm_with`](Self::confirm_with) is the ONLY route from here to a
 /// signable [`SpendApproval`].
 pub struct PendingApproval {
     inner: AuthorizedSpend,
@@ -124,7 +124,7 @@ impl PendingApproval {
     }
 
     /// The summary the confirm ceremony MUST render — the effect of the very spends
-    /// [`confirmed`](Self::confirmed) will make signable.
+    /// [`confirm_with`](Self::confirm_with) will make signable.
     pub fn summary(&self) -> &SpendSummary {
         &self.inner.summary
     }
@@ -204,7 +204,7 @@ pub enum SpendRuling {
     /// value. Sign it.
     Approved(SpendApproval),
     /// Policy will permit the spend only with the user's explicit agreement. Render
-    /// [`PendingApproval::summary`], then [`PendingApproval::confirmed`]. Nothing has been charged.
+    /// [`PendingApproval::summary`], then [`PendingApproval::confirm_with`]. Nothing has been charged.
     RequiresConfirmation(PendingApproval),
 }
 

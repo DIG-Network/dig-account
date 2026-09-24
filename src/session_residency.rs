@@ -9,7 +9,7 @@
 //! keeps working. `lock()` looked like a revocation and was really a hint.
 //!
 //! A `Residency` closes that. Every capability derived from one unlock shares the same token, and
-//! [`revoke`](Residency::revoke) flips it once for all of them. A signer therefore OBSERVES the session
+//! `revoke` flips it once for all of them. A signer therefore OBSERVES the session
 //! rather than owning a snapshot of it: after `lock()`, after a password change, after a profile switch,
 //! signing fails with [`Locked`](crate::error::AccountError::Locked) — even though the seed bytes may
 //! still be resident because some other handle is alive.
@@ -48,7 +48,7 @@ struct IdleWindow {
 
 /// The liveness of ONE unlock, shared by every capability derived from it.
 ///
-/// Live until EITHER an explicit [`revoke`](Self::revoke) or — when the unlock carries an idle window
+/// Live until EITHER an explicit `revoke` or — when the unlock carries an idle window
 /// — the deadline passes. There is deliberately no way back from either: a relock is a new unlock,
 /// which mints a new token, so a revoked `Residency` can never be resurrected by holding a reference
 /// to it.
@@ -96,7 +96,7 @@ impl Residency {
 
     /// Whether the unlock this token belongs to is still live.
     ///
-    /// `Acquire`/`Release` ordering pairs with [`revoke`](Self::revoke): a thread that observes the
+    /// `Acquire`/`Release` ordering pairs with `revoke`: a thread that observes the
     /// revocation also observes everything the revoking thread did before it, so a relock cannot be
     /// seen half-applied.
     pub fn is_live(&self) -> bool {

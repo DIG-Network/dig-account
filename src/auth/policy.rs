@@ -139,7 +139,7 @@ impl Clock for SystemClock {
 /// # Relocking is a REVOCATION
 ///
 /// Every handle the gate hands out from one unlock shares that unlock's
-/// [`Residency`](crate::session_residency::Residency), and every relock path — [`lock`](Self::lock),
+/// [`Residency`], and every relock path — [`lock`](Self::lock),
 /// idle expiry, a superseding [`unlock`](Self::unlock), `Drop` — revokes it. Idle expiry does so
 /// without any call at all: the token holds the deadline and observes the clock itself. So a capability retained
 /// across a relock (a money signer above all) refuses with

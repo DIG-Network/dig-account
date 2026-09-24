@@ -17,9 +17,9 @@
 //!
 //! 1. **Acquisition is atomic, not check-then-act.** Reading the held set, selecting, and then
 //!    reserving is a time-of-check/time-of-use race: two threads both read an empty set and both
-//!    reserve the same coin. So [`CoinReservationStore::reserve_all`] is compare-and-set — it takes
+//!    reserve the same coin. So [`CoinReservationStore::reserve_all`](crate::wallet::reservation::CoinReservationStore::reserve_all) is compare-and-set — it takes
 //!    every coin or none — and a caller that loses re-selects from the coins that remain
-//!    ([`select_and_reserve`]). Filtering by the held set is an optimisation that keeps the common
+//!    (`select_and_reserve`). Filtering by the held set is an optimisation that keeps the common
 //!    case one attempt; the conflict result is what makes it correct.
 //! 2. **Expiry must not resurrect a spent coin.** A reservation ALWAYS expires, so a crashed or
 //!    abandoned build cannot strand funds. That is only safe because the reservation is a filter
@@ -31,14 +31,14 @@
 //!    everywhere else. So a build blocked by reservations reports that, in those words, and never
 //!    as insufficient funds.
 //! 4. **Fail toward over-reserving.** An unreadable store REFUSES the build
-//!    ([`ReservationError::Unavailable`]). An over-reserved coin costs a delayed spend; an
+//!    ([`ReservationError::Unavailable`](crate::wallet::reservation::ReservationError::Unavailable)). An over-reserved coin costs a delayed spend; an
 //!    under-reserved one costs an invalid bundle after the money moved. A guard that fails open is
 //!    not a guard.
 //!
 //! # Scope — one process, unless the store says otherwise
 //!
-//! [`LocalReservations`] covers callers **inside one process**. Two processes sharing one wallet —
-//! dig-app and a dig-node serving the same keys — each holding their own [`LocalReservations`] would
+//! [`LocalReservations`](crate::wallet::reservation::LocalReservations) covers callers **inside one process**. Two processes sharing one wallet —
+//! dig-app and a dig-node serving the same keys — each holding their own [`LocalReservations`](crate::wallet::reservation::LocalReservations) would
 //! re-create exactly the double-select each of them fixes locally.
 //!
 //! That is why the store is a SEAM rather than a fixed table. dig-account is the key-holding custody
@@ -340,7 +340,7 @@ impl<'a> CoinReservations<'a> {
 /// with nothing released, so the coins stay held for the full TTL over a spend that was never built.
 ///
 /// That is not a leak, it is a DENIAL PRIMITIVE, and a renewable one. Because
-/// [`select_and_reserve`] correctly excludes what is already held, each retry orphans a DIFFERENT
+/// `select_and_reserve` correctly excludes what is already held, each retry orphans a DIFFERENT
 /// coin, so a caller retrying against a source that fails after the listing walks the whole wallet
 /// shut — and can do it again the moment the TTL lapses. The TTL bounds one round; it does not bound
 /// a caller who keeps trying.

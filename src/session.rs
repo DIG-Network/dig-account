@@ -45,7 +45,7 @@ impl AccountSession {
     /// Seals `entropy` — 32 bytes of BIP-39 entropy, the account root — under `password` via `store` (fail-closed if the account already exists — never
     /// clobbers an existing custody root) and returns a live [`UnlockedAccount`]. The raw master seed
     /// is never returned: it lives `pub(crate)` inside the handle. This is the public counterpart to
-    /// [`AccountStore::enroll`](crate::store::AccountStore::enroll), which is `pub(crate)` precisely so
+    /// `AccountStore::enroll`, which is `pub(crate)` precisely so
     /// no raw seed crosses the public API.
     pub fn enroll(
         store: Arc<AccountStore>,

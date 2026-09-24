@@ -334,7 +334,7 @@ impl ProfileRegistry {
     ///
     /// [`AccountError::MintFeeAboveCeiling`] if `store_fee` exceeds [`MAX_MINT_FEE_MOJOS`]. The
     /// journalled fee is what a resumed phase B may spend, so it is bounded by the same ceiling the
-    /// DID half already enforces; [`check`](Self::check) applies it again on load, so the bound
+    /// DID half already enforces; `check` applies it again on load, so the bound
     /// cannot be side-stepped by editing the file.
     pub fn begin_mint(&mut self, ix: ProfileIx, stage: MintStage, store_fee: u64) -> Result<()> {
         self.reserve(ProfileMintInProgress::new(ix, stage, store_fee))

@@ -19,7 +19,7 @@ use crate::id::ProfileIx;
 /// `puzzle_hash()` / `address()` are all the SYNTHETIC key's), so keys line up with every other Chia
 /// wallet — and with any spend the money-signer produces — reading the same seed.
 ///
-/// The secret key is held in-crate only: [`secret_key`](Self::secret_key) is `pub(crate)`, and the
+/// The secret key is held in-crate only: `secret_key` is `pub(crate)`, and the
 /// public surface exposes exclusively the public identifiers ([`public_key`](Self::public_key),
 /// [`puzzle_hash`](Self::puzzle_hash), [`address`](Self::address)). The raw money key is therefore
 /// never extractable through the public API; signing flows only through the in-crate
