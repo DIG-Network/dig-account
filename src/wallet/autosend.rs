@@ -117,7 +117,7 @@ pub struct AutoSendPolicy {
     /// MUST be non-zero. A zero-length window contains no spend, so the cap would silently degrade
     /// into a second per-transaction limit with no bound on how many times it applies — while the
     /// user believes a daily cap is set. The gate treats zero as
-    /// [`PolicyIndeterminate`](AccountError::PolicyIndeterminate) rather than obeying it.
+    /// [`PolicyIndeterminate`](crate::error::AccountError::PolicyIndeterminate) rather than obeying it.
     pub period_seconds: u64,
     /// The total native mojos (amounts plus fees) that may auto-send within any
     /// `period_seconds`-long window, summed across ALL op classes. Default `0`.

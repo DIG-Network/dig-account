@@ -4,7 +4,7 @@
 //!
 //! A money signer turns a set of verified coin spends into the aggregate BLS signature that
 //! authorizes them. The ONLY concrete implementation, [`LocalMoneySigner`], routes through
-//! `dig-wallet-backend`'s [`LocalSigner`](dig_wallet_backend::client::LocalSigner) over the
+//! `dig-wallet-backend`'s [`LocalSigner`] over the
 //! **canonical** Chia wallet money keys, which:
 //!
 //! 1. **Re-derives every required signature from the VERIFIED `coin_spends`** — the engine-supplied
@@ -18,7 +18,7 @@
 //! There is deliberately NO bespoke signer path: a hand-rolled spend signer is how custody bugs ship.
 //! All of the above is enforced inside `dig-wallet-backend`'s vetted verify + sign core; this crate
 //! wires it to the account's **canonical** money key (the derivation funds actually live at — see
-//! [`WalletKey`](crate::keys::wallet_key::WalletKey)) and never re-implements the crypto.
+//! [`WalletKey`]) and never re-implements the crypto.
 //!
 //! # Key isolation
 //!

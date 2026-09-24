@@ -5,7 +5,7 @@
 //!
 //! **A DID is recorded only from evidence of an actual on-chain mint.** A `MintedDid` carries a
 //! `confirmed_height: u32` — not an `Option` — and has exactly ONE constructor,
-//! [`MintedDid::from_confirmed`], which is private to the mint module. No caller can assemble one
+//! `MintedDid::from_confirmed`, which is private to the mint module. No caller can assemble one
 //! from a key, an address, a push receipt, or an optimistic guess: the fields are private, and there
 //! is no `Default`, no `Deserialize`, and no other constructor.
 //!
@@ -17,7 +17,7 @@
 //! was told exactly what to fabricate. The `did_coin_id` is not a secret either: it is fully
 //! determined by the bundle that node received.
 //!
-//! [`from_confirmed`](MintedDid::from_confirmed) therefore checks a claimed height against the
+//! `from_confirmed` therefore checks a claimed height against the
 //! genesis floor, the peak observed before the push, and a [`MIN_CONFIRMATION_DEPTH`]-block burial.
 //!
 //! **Be precise about what that costs an attacker: nothing.** `pushed_at_height`, `peak` and
@@ -160,7 +160,7 @@ impl PendingMint {
 
 /// A DID that EXISTS on chain, and the evidence that it does.
 ///
-/// Constructible only by [`from_confirmed`](Self::from_confirmed) from a confirmed
+/// Constructible only by `from_confirmed` from a confirmed
 /// [`CoinRecord`] of the exact coin the mint's bundle created. See the module docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MintedDid {

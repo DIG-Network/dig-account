@@ -38,22 +38,24 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       # nextest runs each test as its own process and natively detects+reports
       # flaky tests (failed-then-passed-on-retry) instead of silently hiding
       # them. `--test-threads=1` mirrors the prior serial run (some integration
       # tests assume serial execution).
       - name: Run tests (nextest, flaky-aware)
-        run: cargo nextest run --all-features --retries 2 --test-threads=1
+        run: cargo nextest run --all-features --locked --retries 2 --test-threads=1
 
       # nextest does NOT run doctests, so the headline `lib.rs` example is ungated
       # by the step above. Run it explicitly so a doc example can never rot.
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test --doc --all-features --locked
 
       - name: Check documentation
-        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked
 
   coverage:
     name: Coverage (>=80% lines, gated)
@@ -88,4 +90,4 @@ jobs:
       # summary report is printed; the gate is enforced by
       # `--fail-under-lines 80`.
       - name: Run coverage with 80% line gate
-        run: cargo llvm-cov nextest --all-features --workspace --fail-under-lines 80 --retries 2 --test-threads 1
+        run: cargo llvm-cov nextest --all-features --workspace --locked --fail-under-lines 80 --retries 2 --test-threads 1

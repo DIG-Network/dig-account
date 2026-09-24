@@ -2,10 +2,10 @@
 //! re-derived effect of a spend, never an engine-supplied claim.
 //!
 //! A [`SpendSummary`] is built from the coin spends alone via
-//! [`analyze`](dig_wallet_backend::client::analyze) (which re-parses them through the chia-wallet-sdk
+//! [`analyze`] (which re-parses them through the chia-wallet-sdk
 //! drivers and reconstructs every created coin plus the fee, SPEC §4/#1058) plus a [`SpendTier`]
 //! classifying how the spend must be handled under the profile's
-//! [`CustodyPolicy`](crate::wallet::policy::CustodyPolicy). The harness renders this structure so the
+//! [`CustodyPolicy`]. The harness renders this structure so the
 //! user confirms the EXACT destinations + amounts the signature will authorize.
 //!
 //! # Why every output counts, hinted or not
@@ -214,7 +214,7 @@ pub struct SpendSummary {
     /// render the same sentence (NC-14, dig_ecosystem#3079).
     ///
     /// The strings are produced by
-    /// [`NftOperation::describe`](dig_wallet_backend::client::NftOperation::describe) — the SAME
+    /// [`NftOperation::describe`](dig_wallet_backend::client::verify::NftOperation::describe) — the SAME
     /// function `dig-wallet-backend`'s signing gate compares its own derivation against. Rendering
     /// and comparison share one function on purpose: derived separately they could drift, and a
     /// person would then approve a sentence the gate never checked.
@@ -304,7 +304,7 @@ impl SpendSummary {
     /// Re-derive a summary from `coin_spends` and classify its [`SpendTier`] under `policy`.
     ///
     /// A display-side convenience (`WalletOps::summarize`). A custody decision goes through
-    /// [`DerivedSpend::derive`], which produces this same summary ALONGSIDE the checked total and the
+    /// `DerivedSpend::derive`, which produces this same summary ALONGSIDE the checked total and the
     /// dependency-facing derivation the signer needs, so the gate parses the spend exactly once.
     pub fn classified(coin_spends: &[CoinSpend], policy: &CustodyPolicy) -> Result<Self> {
         Ok(DerivedSpend::derive(coin_spends, policy)?.summary)

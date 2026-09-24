@@ -17,7 +17,7 @@
 //!
 //! dig-account is headless: it owns the account STATE machine + the crypto, but it never collects a
 //! password, renders a spend prompt, or drives an OS auth ceremony. The host harness (dig-app)
-//! implements [`AuthProvider`](auth::provider::AuthProvider) and injects it; dig-account calls back
+//! implements [`AuthProvider`] and injects it; dig-account calls back
 //! through that seam for every unlock and every spend confirmation. The private key never leaves the
 //! crate; the UI never sees a seed.
 //!
@@ -31,7 +31,7 @@
 //! unlock policy (`auth::policy`), per-profile key/DEK derivation, and the money path (`wallet` —
 //! the canonical `WalletKey` + the concrete [`MoneySigner`](wallet::money_signer::LocalMoneySigner)
 //! over `dig-wallet-backend`'s `LocalSigner`, with the structured
-//! [`SpendSummary`](wallet::summary::SpendSummary)) carry real, tested implementations, as does the
+//! [`SpendSummary`]) carry real, tested implementations, as does the
 //! **on-chain DID mint** ([`mint`] — build, sign, push, and prove a `did:chia:` against real chain
 //! evidence) and the **full profile mint** ([`mint::profile`] — the two-bundle ceremony that binds a
 //! DID to a dig-store launched from its coin, resumable across a restart).

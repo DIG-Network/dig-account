@@ -737,7 +737,7 @@ impl PendingTransfer {
 
 /// A payment that EXISTS on chain, and the evidence that it does.
 ///
-/// Constructible only by [`from_confirmed`](Self::from_confirmed), which is private to this module,
+/// Constructible only by `from_confirmed`, which is private to this module,
 /// from a sufficiently-buried record of the exact coin the pushed bundle creates. There is no
 /// `Default`, no `Deserialize` and no other constructor, so nothing can assemble one from a push
 /// receipt or an optimistic guess.

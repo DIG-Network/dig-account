@@ -10,14 +10,14 @@
 //!
 //! **A store is recorded only from evidence of an actual on-chain launch.** [`ConfirmedStore`]
 //! carries a `confirmed_height: u32` — not an `Option` — has private fields, exactly one
-//! crate-private constructor ([`ConfirmedStore::from_confirmed`]), no `Default` and no
+//! crate-private constructor (`ConfirmedStore::from_confirmed`), no `Default` and no
 //! `Deserialize`. There is no way to assemble one from a key, from a push receipt, or from optimism.
 //!
 //! # What this does NOT prove
 //!
 //! Exactly what [`evidence`](super::evidence) does not prove, for the same reason: every field is
 //! the chain source's testimony, and in a typical deployment that source is the same node the bundle
-//! was pushed to. The five rules in [`ConfirmedStore::from_confirmed`] close the DEGENERATE
+//! was pushed to. The five rules in `ConfirmedStore::from_confirmed` close the DEGENERATE
 //! fabrications (genesis, the future, a height predating the push, an unrelated coin) and buy real
 //! reorg safety against an HONEST source. They cost a dishonest one nothing. The mitigation is the
 //! caller's: pass a trusted or aggregating `ChainSource`.
@@ -102,7 +102,7 @@ impl PendingStoreLaunch {
 
 /// A dig-store that EXISTS on chain, and the evidence that it does.
 ///
-/// Constructible only by [`from_confirmed`](Self::from_confirmed) from a confirmed [`CoinRecord`] of
+/// Constructible only by `from_confirmed` from a confirmed [`CoinRecord`] of
 /// the exact coin the launch bundle created. See the module docs for what that can and cannot prove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedStore {

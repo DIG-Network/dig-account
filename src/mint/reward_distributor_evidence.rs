@@ -10,7 +10,7 @@
 //!
 //! **A distributor is reported only from evidence of an actual on-chain launch.**
 //! [`ConfirmedRewardDistributor`] carries a `confirmed_height: u32` — not an `Option` — has private
-//! fields, exactly one crate-private constructor ([`ConfirmedRewardDistributor::from_confirmed`]),
+//! fields, exactly one crate-private constructor (`ConfirmedRewardDistributor::from_confirmed`),
 //! no `Default` and no `Deserialize`. There is no way to assemble one from a key, a push receipt, a
 //! request or optimism.
 //!
@@ -19,14 +19,14 @@
 //! Exactly what [`store_evidence`](super::store_evidence) does not prove, for the same reason:
 //! every field is the chain source's testimony, and in a typical deployment that source is the same
 //! node the bundle was pushed to. The five rules in
-//! [`ConfirmedRewardDistributor::from_confirmed`] close the DEGENERATE fabrications (genesis, the
+//! `ConfirmedRewardDistributor::from_confirmed` close the DEGENERATE fabrications (genesis, the
 //! future, a height predating the push, an unrelated coin, a different launcher, a different
 //! generation) and buy real reorg safety against an HONEST source. They cost a dishonest one
 //! nothing. The mitigation is the caller's: pass a trusted or aggregating `ChainSource`. See
 //! `SPEC.md` §6BB.9 for the full list of what a reader may not conclude from a [`Confirmed`]
 //! value.
 //!
-//! [`Confirmed`]: super::reward_distributor::RewardDistributorStatus::Confirmed
+//! [`Confirmed`]: RewardDistributorStatus::Confirmed
 
 use chia_protocol::Bytes32;
 use dig_chainsource_interface::CoinRecord;
@@ -137,7 +137,7 @@ impl PendingRewardDistributor {
 
 /// A reward distributor that EXISTS on chain, and the evidence that it does.
 ///
-/// Constructible only by [`from_confirmed`](Self::from_confirmed) from a confirmed [`CoinRecord`]
+/// Constructible only by `from_confirmed` from a confirmed [`CoinRecord`]
 /// of the exact coin the launch bundle created, plus the [`DiscoveredDistributor`] that decoded its
 /// parent spend. See the module docs for what that can and cannot prove.
 #[derive(Debug, Clone, PartialEq, Eq)]

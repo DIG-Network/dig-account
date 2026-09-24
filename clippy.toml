@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "chia_wallet_sdk::driver::RewardDistributor::created_slot_value_to_slot", reason = "on a chain-rebuilt distributor this derives a phantom slot from the tip; use dig_rewards_coin::DistributorSnapshot::entry_slot / commitment_slots / reward_slots (dig_ecosystem#3357)" },
+]

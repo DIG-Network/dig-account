@@ -2250,13 +2250,32 @@ signing, and a lock during that window must stop the signature, not merely refus
 
 **No method returns a `WalletKey`, a `SecretKey`, the master seed, or its container.** The facade's only
 public surface is `public_key()`, `puzzle_hash()`, `begin(...)` and `dig_cat_coins(...)` — none of which
-can hand the caller anything that signs. This is a structural property, not a convention:
-`src/reward_distributor_mint.rs` contains no `pub fn` returning key material — a source-scan test checks
-every `pub fn`'s RETURN TYPE (not merely a `master_seed`/`WalletKey`/`SecretKey` name-match) against the
-seed's OWN container type (`UnlockedMasterSeed`) and against `Arc<...>` generally, because handing out that
-container leaks the seed exactly as directly as handing out the bytes (its own `master_seed()` accessor is
-public). A compile-fail case (`tests/compile_fail/`) separately proves the struct cannot be constructed or
-its fields read from outside this crate.
+can hand the caller anything that signs. This is a structural property, not a convention, and it is proved
+by an ITEM ALLOWLIST rather than a needle scan: `src/reward_distributor_mint.rs`'s
+`no_method_hands_out_the_key` test walks the module's production half (everything above `#[cfg(test)]`)
+and requires every COLUMN-0 item there — everything that is not a doc/line comment, an attribute, a
+closing brace, or indented continuation — to be one of: a `use`, the exact `pub struct
+RewardDistributorMinter` (whose body may carry no `pub` field), the exact inherent `impl
+RewardDistributorMinter {`, or an `impl … for …` whose TRAIT NAME (never its target) is on a pinned
+(today empty) trait allowlist. `pub use`, `pub mod`, `pub type`, a bare `type` alias, `pub const`, `pub
+static`, a free `pub fn`, `pub enum`, `pub trait`, `macro_rules!`, a bare `mod`, and a generic `impl<T>
+…` all fail, naming the offending line — nothing on that list is checked by name; anything not on the
+allowlist above fails by construction. The trait-impl check runs by TRAIT NAME ALONE, regardless of
+target: `impl Trait for &RewardDistributorMinter` and `impl Trait for Arc<RewardDistributorMinter>` fail
+exactly as `impl Trait for RewardDistributorMinter` would, because a trait impl on a reference or wrapper
+type is exactly as reachable as one on the bare type and its methods carry no `pub` keyword for a
+visibility check to catch. Every `fn` inside the inherent impl that carries ANY `pub` qualifier — `pub`,
+`pub(crate)`, `pub(super)`, `pub(in …)`, combined in any order with `const`/`async`/`unsafe`/`extern` —
+and every `fn` inside an allowlisted trait impl regardless of visibility keyword, must return a type from
+a pinned allowlist (`Self`, `MintResult<PublicKey>`, `MintResult<Bytes32>`,
+`MintResult<SignedRewardDistributorMint>`, `CatTransferResult<CatCoinListing>`); a private inherent method
+(`live_wallet_key`) is exempt. The count of methods actually checked is pinned to exactly 5 (`new`,
+`public_key`, `puzzle_hash`, `begin`, `dig_cat_coins`) so a method silently leaving the scan's view is
+itself a failure. This is a TEXTUAL scan over one file, not a type-system proof: it refuses any `mod` or
+`macro_rules!` item outright rather than trying to see inside one, and it does NOT see through a re-export
+living in another file, a blanket impl elsewhere in the crate, or a proc-macro attribute that expands into
+a new method at compile time — those remain out of scope. A compile-fail case (`tests/compile_fail/`)
+separately proves the struct cannot be constructed or its fields read from outside this crate.
 
 **`begin` is a pure pass-through to §6BB.** `RewardDistributorMinter::begin` calls
 `begin_reward_distributor_mint(&key, request, network, consensus_constants)` and nothing else — it adds no
