@@ -165,19 +165,33 @@ mod tests {
         assert!(matches!(minter.live_wallet_key(), Err(MintError::Locked)));
     }
 
-    /// A source-scan proof, not a convention — and a CLOSED ALLOWLIST rather than a needle scan:
-    /// every `pub`/`pub(crate) fn` in this module's PRODUCTION half must return a type on
-    /// [`ALLOWED_RETURN_TYPES`] below, every trait this type implements must be on
-    /// `ALLOWED_TRAIT_IMPLS`, no `type` alias may appear (one could smuggle a key type past the
-    /// return-type check), and no field inside a `pub struct` here may itself be `pub`. A needle
-    /// scan only catches names it was told to watch for (`Arc<`, `WalletKey`, …); an allowlist
-    /// catches everything NOT explicitly permitted — `-> S`, `-> &dyn Any`, `-> impl Trait`, a new
-    /// `Arc<...>` wrapper, all fail without being named individually.
+    /// A source-scan proof, not a convention — an ITEM ALLOWLIST over the production half, closed
+    /// and fail-closed: every column-0 item must be one of `use `, the exact `pub struct
+    /// RewardDistributorMinter`, the exact inherent `impl RewardDistributorMinter {`, or an `impl
+    /// … for …` whose trait is on [`ALLOWED_TRAIT_IMPLS`] below — REGARDLESS of the target
+    /// (`&RewardDistributorMinter`, `Arc<RewardDistributorMinter>`, anything), because a trait impl
+    /// on a reference or wrapper type is exactly as reachable as one on the bare type, and its
+    /// methods carry no `pub` keyword to catch by visibility. Anything else at column 0 — `pub
+    /// use`, `pub mod`, `pub type`, `type`, `pub const`, `pub static`, a free `pub fn`, `pub enum`,
+    /// `pub trait`, `macro_rules!`, `mod`, a generic `impl<T>` — fails, naming the line.
     ///
-    /// This is a TEXTUAL scan over one file, not a type-system proof: it does not see through a
-    /// re-export, a blanket trait impl elsewhere in the crate, or a macro that expands into new
-    /// items. It closes the gap a needle scan left (an unnamed leak shape passing silently) but is
-    /// not a substitute for `readable-code` review on every diff to this module.
+    /// Every `fn` inside the inherent impl or an allowlisted trait impl is then checked: a private
+    /// inherent method is exempt (`live_wallet_key` legitimately returns `MintResult<WalletKey>`),
+    /// but ANY `pub`-qualified one — `pub`, `pub(crate)`, `pub(super)`, `pub(in …)`, in any order
+    /// with `const`/`async`/`unsafe`/`extern` — and every trait-impl method regardless of
+    /// visibility keyword, must return a type on [`ALLOWED_RETURN_TYPES`]. A needle scan only
+    /// catches names it was told to watch for; this allowlist catches everything NOT explicitly
+    /// permitted — `-> &dyn Any`, `-> impl Trait`, a new `Arc<...>` wrapper, a `const`/`async`/
+    /// `unsafe` qualifier that used to slip past a literal `"pub fn "` split — without any of them
+    /// being named individually.
+    ///
+    /// This is a TEXTUAL scan over one file, not a type-system proof: it refuses any `mod` or
+    /// `macro_rules!` item outright rather than trying to see inside one, but it does not see
+    /// through a re-export living in ANOTHER file, a blanket impl elsewhere in the crate, or a
+    /// proc-macro attribute that expands into a new method at compile time. It closes the gap a
+    /// target-anchored needle scan left (a trait impl on `&Self` evading a scan for
+    /// `RewardDistributorMinter`-prefixed targets) but is not a substitute for `readable-code`
+    /// review on every diff to this module.
     ///
     /// Mirrors `tests/the_shape_is_unwritable.rs::production_half`'s split so an in-crate test
     /// helper (which legitimately reaches into internals) is never mistaken for a public leak.
@@ -196,6 +210,7 @@ mod tests {
         // trait. Add an entry here — deliberately, in the same diff that adds the impl — the day
         // one is needed; an empty allowlist is vacuously enforced, not vacuously skipped.
         const ALLOWED_TRAIT_IMPLS: &[&str] = &[];
+        const TARGET: &str = "RewardDistributorMinter";
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -210,6 +225,34 @@ mod tests {
             "RewardDistributorMinter gained a #[derive]; add its traits to ALLOWED_TRAIT_IMPLS \
              deliberately and re-run this scan rather than widening it blindly"
         );
+
+        // Column-0 item allowlist: a line whose first char is not whitespace, `#`, `/` (a doc or
+        // line comment) or `}` begins a new item. Everything not explicitly permitted here fails —
+        // this is what catches `pub use`, `pub type`, `pub const`, `pub(super) fn` as a FREE item,
+        // a bare `mod`, `macro_rules!`, and a generic `impl<T> …` that never reaches the trait- or
+        // method-level checks below because it never gets past this gate.
+        for line in production.lines() {
+            let Some(first) = line.chars().next() else {
+                continue;
+            };
+            if first.is_whitespace() || first == '#' || first == '/' || first == '}' {
+                continue;
+            }
+            let is_inherent_impl = line.starts_with(&format!("impl {TARGET} {{"));
+            let is_trait_impl = line.starts_with("impl ") && line.contains(" for ");
+            let allowed = line.starts_with("use ")
+                || line.starts_with(&format!("pub struct {TARGET}"))
+                || is_inherent_impl
+                || is_trait_impl
+                || line.starts_with("const ")
+                || line.starts_with("static ");
+            assert!(
+                allowed,
+                "disallowed top-level item in the production half — not on the item allowlist \
+                 (use / pub struct {TARGET} / impl {TARGET} / an allowlisted trait impl / private \
+                 const or static): {line}"
+            );
+        }
 
         assert!(
             !production.contains("\ntype "),
@@ -229,47 +272,80 @@ mod tests {
             }
         }
 
+        // Trait-impl allowlist, checked by TRAIT NAME alone — never by target. `impl Trait for
+        // &RewardDistributorMinter` and `impl Trait for Arc<RewardDistributorMinter>` are exactly
+        // as reachable as `impl Trait for RewardDistributorMinter`, and trait methods carry no
+        // `pub` keyword for a visibility check to catch, so the target is never consulted here.
         for block in production.split("impl ").skip(1) {
             let header = block.split('{').next().unwrap_or_default();
-            if let Some((trait_name, target)) = header.split_once(" for ") {
-                if target.trim().starts_with("RewardDistributorMinter") {
-                    let trait_name = trait_name.trim();
-                    assert!(
-                        ALLOWED_TRAIT_IMPLS.contains(&trait_name),
-                        "RewardDistributorMinter implements {trait_name}, which is not on the \
-                         closed trait allowlist — a trait method can hand out key material \
-                         without matching any return-type needle"
-                    );
-                }
+            if let Some((trait_name, _target)) = header.split_once(" for ") {
+                let trait_name = trait_name.trim();
+                assert!(
+                    ALLOWED_TRAIT_IMPLS.contains(&trait_name),
+                    "RewardDistributorMinter (or a reference/wrapper around it) implements \
+                     {trait_name}, which is not on the closed trait allowlist — a trait method \
+                     can hand out key material without matching any return-type needle, and \
+                     without carrying a `pub` keyword at all: {header}"
+                );
             }
         }
 
+        // Method scan: every `fn` inside the inherent impl (pub-qualified, in ANY order/form) or
+        // inside an allowlisted trait impl (every fn, since trait methods carry no visibility
+        // keyword) must return an allowlisted type.
         let mut checked = 0;
-        for chunk in production
-            .split("pub fn ")
-            .skip(1)
-            .chain(production.split("pub(crate) fn ").skip(1))
-        {
-            let signature = chunk.split('{').next().unwrap_or_default();
-            let return_type = signature
-                .split("->")
-                .nth(1)
-                .unwrap_or("()")
-                .split("where")
-                .next()
-                .unwrap_or_default()
-                .trim();
-            checked += 1;
-            assert!(
-                ALLOWED_RETURN_TYPES.contains(&return_type),
-                "pub/pub(crate) fn returns a type outside the closed allowlist — this is either \
-                 a new key-egress shape or ALLOWED_RETURN_TYPES needs deliberately extending: \
-                 {signature} -> {return_type}"
-            );
+        for block in production.split("impl ").skip(1) {
+            let header_end = block.find('{').unwrap_or(0);
+            let header = &block[..header_end];
+            let body = &block[header_end..];
+            let is_trait_impl = header.contains(" for ");
+            let is_target_impl = if is_trait_impl {
+                let trait_name = header.split(" for ").next().unwrap_or_default().trim();
+                ALLOWED_TRAIT_IMPLS.contains(&trait_name)
+            } else {
+                header.trim() == TARGET
+            };
+            if !is_target_impl {
+                // Not our inherent impl, and any non-allowlisted trait impl already panicked above.
+                continue;
+            }
+
+            for (idx, _) in body.match_indices("fn ") {
+                let line_start = body[..idx].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                let qualifier = &body[line_start..idx];
+                let is_pub_qualified = qualifier.contains("pub");
+                if !is_pub_qualified && !is_trait_impl {
+                    continue; // a private inherent method — exempt, e.g. `live_wallet_key`.
+                }
+                let after_fn = &body[idx + "fn ".len()..];
+                let signature_end = after_fn.find('{').unwrap_or(after_fn.len());
+                let signature = &after_fn[..signature_end];
+                let return_type = signature
+                    .split("->")
+                    .nth(1)
+                    .unwrap_or("()")
+                    .split("where")
+                    .next()
+                    .unwrap_or_default()
+                    .trim();
+                checked += 1;
+                assert!(
+                    ALLOWED_RETURN_TYPES.contains(&return_type),
+                    "a pub-qualified (or trait-impl) fn returns a type outside the closed \
+                     allowlist — this is either a new key-egress shape or ALLOWED_RETURN_TYPES \
+                     needs deliberately extending: {qualifier}fn {signature} -> {return_type}"
+                );
+            }
         }
-        assert!(
-            checked >= 4,
-            "the scan found no public methods to check at all"
+        // Pinned, not a floor: `new` (pub(crate)), `public_key`, `puzzle_hash`, `begin` and
+        // `dig_cat_coins` are the 5 pub-qualified methods on the inherent impl today —
+        // `live_wallet_key` is private and exempt. A count drift in either direction means a
+        // method was added, removed, or the scan stopped seeing one that exists.
+        assert_eq!(
+            checked, 5,
+            "expected exactly 5 pub-qualified methods (new, public_key, puzzle_hash, begin, \
+             dig_cat_coins) to be checked — the scan saw a different number, which means either a \
+             method was added/removed or the scan itself stopped seeing one"
         );
     }
 }
