@@ -727,10 +727,11 @@ fn a_dust_flood_is_bounded_and_the_omission_is_counted() {
     let mut expected: Vec<u64> = amounts;
     expected.sort_unstable_by(|a, b| b.cmp(a));
     expected.truncate(MAX_LISTED_CAT_COINS);
-    let mut returned: Vec<u64> = result.cats().iter().map(|c| c.coin.amount).collect();
-    returned.sort_unstable_by(|a, b| b.cmp(a));
+    let returned: Vec<u64> = result.cats().iter().map(|c| c.coin.amount).collect();
     assert_eq!(
         returned, expected,
-        "the omitted candidates must be the SMALLEST, never an arbitrary subset"
+        "the omitted candidates must be the SMALLEST, never an arbitrary subset, AND the kept \
+         ones must come back in descending-amount ORDER -- cat_coins' own doc promises \"largest \
+         amount first\""
     );
 }
