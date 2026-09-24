@@ -165,20 +165,38 @@ mod tests {
         assert!(matches!(minter.live_wallet_key(), Err(MintError::Locked)));
     }
 
-    /// A source-scan proof, not a convention: no `pub fn` in this module's PRODUCTION half may
-    /// return `WalletKey`, `SecretKey`, the master seed, or its container
-    /// [`UnlockedMasterSeed`](dig_session::UnlockedMasterSeed) (whose own `master_seed()` is
-    /// public, so handing out the container leaks the seed just as directly as handing out the
-    /// bytes). Mirrors `tests/the_shape_is_unwritable.rs::production_half`'s split so an in-crate
-    /// test helper (which legitimately reaches into internals) is never mistaken for a public leak.
+    /// A source-scan proof, not a convention — and a CLOSED ALLOWLIST rather than a needle scan:
+    /// every `pub`/`pub(crate) fn` in this module's PRODUCTION half must return a type on
+    /// [`ALLOWED_RETURN_TYPES`] below, every trait this type implements must be on
+    /// `ALLOWED_TRAIT_IMPLS`, no `type` alias may appear (one could smuggle a key type past the
+    /// return-type check), and no field inside a `pub struct` here may itself be `pub`. A needle
+    /// scan only catches names it was told to watch for (`Arc<`, `WalletKey`, …); an allowlist
+    /// catches everything NOT explicitly permitted — `-> S`, `-> &dyn Any`, `-> impl Trait`, a new
+    /// `Arc<...>` wrapper, all fail without being named individually.
     ///
-    /// The container/`Arc<` needles are checked against the RETURN TYPE only, not the whole
-    /// signature: the struct's own `seed: Arc<UnlockedMasterSeed>` field legitimately names both,
-    /// and a whole-signature scan would have nothing left to distinguish a leaking accessor from
-    /// the field it wraps.
+    /// This is a TEXTUAL scan over one file, not a type-system proof: it does not see through a
+    /// re-export, a blanket trait impl elsewhere in the crate, or a macro that expands into new
+    /// items. It closes the gap a needle scan left (an unnamed leak shape passing silently) but is
+    /// not a substitute for `readable-code` review on every diff to this module.
+    ///
+    /// Mirrors `tests/the_shape_is_unwritable.rs::production_half`'s split so an in-crate test
+    /// helper (which legitimately reaches into internals) is never mistaken for a public leak.
     #[test]
     fn no_method_hands_out_the_key() {
         const TEST_MODULE: &str = "#[cfg(test)]\nmod tests {";
+        const ALLOWED_RETURN_TYPES: &[&str] = &[
+            "()",
+            "Self",
+            "MintResult<PublicKey>",
+            "MintResult<Bytes32>",
+            "MintResult<SignedRewardDistributorMint>",
+            "CatTransferResult<CatCoinListing>",
+        ];
+        // Empty today: `RewardDistributorMinter` carries no `#[derive(...)]` and implements no
+        // trait. Add an entry here — deliberately, in the same diff that adds the impl — the day
+        // one is needed; an empty allowlist is vacuously enforced, not vacuously skipped.
+        const ALLOWED_TRAIT_IMPLS: &[&str] = &[];
+
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/src/reward_distributor_mint.rs"
@@ -187,18 +205,66 @@ mod tests {
         let production = text.replace('\r', "");
         let production = production.split(TEST_MODULE).next().unwrap_or_default();
 
+        assert!(
+            !production.contains("#[derive"),
+            "RewardDistributorMinter gained a #[derive]; add its traits to ALLOWED_TRAIT_IMPLS \
+             deliberately and re-run this scan rather than widening it blindly"
+        );
+
+        assert!(
+            !production.contains("\ntype "),
+            "a type alias appeared in the production half of this module — it can smuggle a key \
+             type past the return-type allowlist below"
+        );
+
+        for struct_block in production.split("pub struct ").skip(1) {
+            let body = struct_block.split('}').next().unwrap_or_default();
+            for line in body.lines() {
+                let line = line.trim();
+                assert!(
+                    !line.starts_with("pub "),
+                    "a public struct field lets a caller reach past every method-level check \
+                     below: {line}"
+                );
+            }
+        }
+
+        for block in production.split("impl ").skip(1) {
+            let header = block.split('{').next().unwrap_or_default();
+            if let Some((trait_name, target)) = header.split_once(" for ") {
+                if target.trim().starts_with("RewardDistributorMinter") {
+                    let trait_name = trait_name.trim();
+                    assert!(
+                        ALLOWED_TRAIT_IMPLS.contains(&trait_name),
+                        "RewardDistributorMinter implements {trait_name}, which is not on the \
+                         closed trait allowlist — a trait method can hand out key material \
+                         without matching any return-type needle"
+                    );
+                }
+            }
+        }
+
         let mut checked = 0;
-        for chunk in production.split("pub fn ").skip(1) {
+        for chunk in production
+            .split("pub fn ")
+            .skip(1)
+            .chain(production.split("pub(crate) fn ").skip(1))
+        {
             let signature = chunk.split('{').next().unwrap_or_default();
-            let return_type = signature.split("->").nth(1).unwrap_or_default();
+            let return_type = signature
+                .split("->")
+                .nth(1)
+                .unwrap_or("()")
+                .split("where")
+                .next()
+                .unwrap_or_default()
+                .trim();
             checked += 1;
             assert!(
-                !signature.contains("WalletKey")
-                    && !signature.contains("SecretKey")
-                    && !signature.contains("master_seed")
-                    && !return_type.contains("UnlockedMasterSeed")
-                    && !return_type.contains("Arc<"),
-                "a public method hands out key material: pub fn {signature}"
+                ALLOWED_RETURN_TYPES.contains(&return_type),
+                "pub/pub(crate) fn returns a type outside the closed allowlist — this is either \
+                 a new key-egress shape or ALLOWED_RETURN_TYPES needs deliberately extending: \
+                 {signature} -> {return_type}"
             );
         }
         assert!(

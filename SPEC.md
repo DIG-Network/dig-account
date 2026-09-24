@@ -2250,13 +2250,19 @@ signing, and a lock during that window must stop the signature, not merely refus
 
 **No method returns a `WalletKey`, a `SecretKey`, the master seed, or its container.** The facade's only
 public surface is `public_key()`, `puzzle_hash()`, `begin(...)` and `dig_cat_coins(...)` — none of which
-can hand the caller anything that signs. This is a structural property, not a convention:
-`src/reward_distributor_mint.rs` contains no `pub fn` returning key material — a source-scan test checks
-every `pub fn`'s RETURN TYPE (not merely a `master_seed`/`WalletKey`/`SecretKey` name-match) against the
-seed's OWN container type (`UnlockedMasterSeed`) and against `Arc<...>` generally, because handing out that
-container leaks the seed exactly as directly as handing out the bytes (its own `master_seed()` accessor is
-public). A compile-fail case (`tests/compile_fail/`) separately proves the struct cannot be constructed or
-its fields read from outside this crate.
+can hand the caller anything that signs. This is a structural property, not a convention, and it is proved
+by a CLOSED ALLOWLIST rather than a needle scan: `src/reward_distributor_mint.rs`'s
+`no_method_hands_out_the_key` test requires every `pub`/`pub(crate) fn` in the module's production half to
+return a type from a pinned allowlist (`Self`, `MintResult<PublicKey>`, `MintResult<Bytes32>`,
+`MintResult<SignedRewardDistributorMint>`, `CatTransferResult<CatCoinListing>`), every trait the type
+implements to be on a pinned (today empty) trait allowlist, no `type` alias to appear in the production
+half, and no field inside a `pub struct` there to itself be `pub`. Anything not explicitly permitted fails
+— a new `Arc<...>` wrapper, `-> &dyn Any`, `-> impl Trait`, a smuggling type alias, or a new trait impl all
+fail without the scan having been told their name in advance, which a needle scan over specific type names
+cannot do. This is a TEXTUAL scan over one file, not a type-system proof: it does not see through a
+re-export, a blanket impl elsewhere in the crate, or macro-generated items. A compile-fail case
+(`tests/compile_fail/`) separately proves the struct cannot be constructed or its fields read from outside
+this crate.
 
 **`begin` is a pure pass-through to §6BB.** `RewardDistributorMinter::begin` calls
 `begin_reward_distributor_mint(&key, request, network, consensus_constants)` and nothing else — it adds no
