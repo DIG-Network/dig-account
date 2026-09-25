@@ -205,6 +205,66 @@ fn a_submitted_mint_is_awaiting_then_confirmed_after_burial() {
     }
 }
 
+/// **The launch creates a ZERO reserve, read back off the chain (#68).**
+///
+/// This is the executable half of the finding that withdrew `reserve_base_units`. The source read
+/// says `chia-sdk-driver` 0.36.0 `launch_drivers.rs:660-667` creates the reserve coin with the
+/// literal amount `0` and refunds the whole `total_cat_amount` to `fee_payout_puzzle_hash`; a
+/// source read is a hypothesis. This asserts it against a real consensus validator: after a real
+/// launch of a real $DIG CAT, `read_distributor` reports a reserve of ZERO.
+///
+/// That is why no amount belongs on a mint request: the distributor is byte-identical whatever the
+/// caller offers. Funding it is a later `commit_incentives_for_distributor_epoch` act.
+#[test]
+fn a_launched_distributor_reports_a_zero_reserve_and_refunds_the_whole_cat() {
+    let f = fixture(FUNDING_MOJOS);
+    let offered = f.reward_cat.coin.amount;
+    assert_ne!(
+        offered, 0,
+        "the fixture must actually offer CAT, or a zero reserve proves nothing"
+    );
+
+    let minted =
+        begin_reward_distributor_mint(&f.wallet, &request(&f), &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    let pending = minted
+        .submit(&f.chain, &f.chain)
+        .expect("the seam's own bundle is accepted by a real consensus validator");
+    f.chain.farm().expect("the launch confirms and is buried");
+
+    let snapshot = dig_rewards_coin::read_distributor(
+        &Timestamped { inner: &f.chain },
+        pending.distributor_launcher_id(),
+    )
+    .expect("a reachable chain answers")
+    .expect("the launched distributor is readable at its launcher id");
+
+    assert_eq!(
+        snapshot.distributor().reserve.coin.amount,
+        0,
+        "the launch creates the reserve coin EMPTY; any non-zero reading here means the driver          changed and the `reserve_base_units` withdrawal (#68) has to be revisited"
+    );
+
+    // The other half of the same claim: the offered CAT came back whole, to this wallet, findable.
+    let refunded: u64 = f
+        .chain
+        .coin_records_by_puzzle_hash(
+            Bytes32::from(CatArgs::curry_tree_hash(
+                dig_reserve_asset_id(),
+                f.wallet.puzzle_hash().into(),
+            )),
+            false,
+        )
+        .expect("a reachable chain answers")
+        .iter()
+        .map(|record| record.coin.amount)
+        .sum();
+    assert_eq!(
+        refunded, offered,
+        "every base unit offered must come back to this wallet's own $DIG puzzle hash; the launch          refunds total_cat_amount to constants.fee_payout_puzzle_hash, which this seam sets to          this wallet (SPEC 6BB.3a clause 1)"
+    );
+}
+
 /// The peak is read, and refused on, BEFORE any broadcast: an offline chain never sees a push.
 #[test]
 fn an_offline_chain_refuses_before_any_broadcast() {
@@ -410,6 +470,60 @@ fn an_eviction_stays_awaiting_with_a_growing_count() {
         second > first,
         "the count must keep growing so a caller's deadline eventually fires: {first} then {second}"
     );
+}
+
+/// A [`ChainSource`] that forwards every read to `inner` and supplies the one thing the shared
+/// double does not: a block timestamp.
+///
+/// `dig_rewards_coin::read_distributor` needs a timestamp for the peak to decide whether the entry
+/// set it decoded is stale, and `SimulatorChain` answers `None` because no test before this one
+/// needed one. The value is derived from the height rather than read, because nothing here depends
+/// on WHICH second it is — only that a real node has one. Everything else is delegated, so the
+/// reserve reading under test is the simulator's own.
+struct Timestamped<'a> {
+    inner: &'a SimulatorChain,
+}
+
+impl ChainSource for Timestamped<'_> {
+    type Error = String;
+
+    fn coin_record(&self, coin_id: Bytes32) -> Result<Option<CoinRecord>, Self::Error> {
+        self.inner.coin_record(coin_id)
+    }
+
+    fn coin_records_by_puzzle_hash(
+        &self,
+        puzzle_hash: Bytes32,
+        include_spent: bool,
+    ) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner
+            .coin_records_by_puzzle_hash(puzzle_hash, include_spent)
+    }
+
+    fn coin_records_by_parent(&self, parent: Bytes32) -> Result<Vec<CoinRecord>, Self::Error> {
+        self.inner.coin_records_by_parent(parent)
+    }
+
+    fn coin_spend(&self, coin_id: Bytes32) -> Result<Option<CoinSpend>, Self::Error> {
+        self.inner.coin_spend(coin_id)
+    }
+
+    fn resolve_singleton_lineage(
+        &self,
+        launcher_id: Bytes32,
+    ) -> Result<Option<SingletonLineage>, Self::Error> {
+        self.inner.resolve_singleton_lineage(launcher_id)
+    }
+
+    fn peak_height(&self) -> Result<Option<u32>, Self::Error> {
+        self.inner.peak_height()
+    }
+
+    /// One block every 52 seconds from a fixed epoch — Chia's own average block time, so a staleness
+    /// window measured in seconds means the same thing here as on mainnet.
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        Ok(Some(1_700_000_000 + u64::from(height) * 52))
+    }
 }
 
 /// A [`ChainSource`] that forwards every read to `inner` except `coin_spend` for one target coin

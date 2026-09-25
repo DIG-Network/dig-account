@@ -1663,11 +1663,26 @@ ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never
 ## 6BB. The reward-distributor mint (`begin_reward_distributor_mint`)
 
 `begin_reward_distributor_mint` is the ONLY path by which this crate signs a DIG reward-distributor
-launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH
-funding coin and the requested part of the $DIG reward CAT, both locked to the settlement puzzle,
-with each leg's remainder returned to the wallet as change), the distributor
-launcher, the eve singleton, the reserve CAT and the launch's ephemeral security coin — into ONE
-`SpendContext`, and returns a `SignedRewardDistributorMint` or an error.
+launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH funding
+coin, with its change returned to the wallet, and the $DIG reward CAT WHOLE, both locked to the
+settlement puzzle), the distributor launcher, the eve singleton, the reserve CAT and the launch's
+ephemeral security coin — into ONE `SpendContext`, and returns a `SignedRewardDistributorMint` or an
+error.
+
+**The launch creates an EMPTY reserve and refunds the offered CAT whole.** This is a property of
+the launch driver, not a choice this seam makes: `chia-sdk-driver` 0.36.0's
+`launch_reward_distributor` (`src/primitives/action_layer/launch_drivers.rs:660-667`) spends the
+offered CAT into an interim coin whose quoted puzzle makes exactly two creations — the reserve coin
+at the distributor's `P2DelegatedBySingletonLayer` hash with the **literal amount `0`**, and a
+refund of the WHOLE `total_cat_amount` to `constants.fee_payout_puzzle_hash`, which §6BB.3a clause 1
+fixes to this wallet's own puzzle hash. A distributor is therefore FUNDED after launch, never at
+it: the funding act is `commit_incentives_for_distributor_epoch`, a separate spend this seam does
+not make.
+
+Consequently `RewardDistributorMintRequest` carries NO field naming a reserve amount, and MUST NOT
+gain one. No amount a caller could name would change a byte of the distributor that results; a
+field that appeared to size the reserve and did not would be a false statement about money in the
+type system, and a doc apologising for it would be the tell that the type is wrong.
 
 ### 6BB.1 The bundle is complete or there is no bundle
 
@@ -1723,15 +1738,9 @@ and the seam MUST state that refusal ITSELF. Today a wrong-asset CAT also fails 
 `chia-sdk-driver`'s offer lookup, so no bundle is built — but that is a transitive crate's internal
 behaviour at a caret range, and it names the driver's problem rather than the caller's.
 
-`RewardDistributorMintRequest::reserve_base_units` names how much of the reward CAT becomes the
-reserve. It MUST be non-zero and MUST NOT exceed the reward CAT coin's own amount, and the seam
-MUST state BOTH refusals ITSELF, in the same pre-build block as the two ownership refusals — before
-a single spend is staged and therefore before any signature exists. Since building and signing are
-one function (§6BB.4), a refusal reached after the signing loop would be refusing a bundle this
-account had already authorized with its own key.
-
-Both bounds MUST be computed from the OBSERVED amount of the coin being spent. Neither the reserve
-nor the remainder may be derived from a denomination table or any compiled-in constant (CLAUDE.md
+The reward CAT is offered WHOLE. There is no reserve-amount refusal because there is no reserve
+amount: see the §6BB intro. The amount written into the settlement creation MUST be read off the
+coin actually being spent, never from a denomination table or any compiled-in constant (CLAUDE.md
 §2.6 clause 2).
 
 The request's `distributor_epoch_seconds` MUST be non-zero, and the seam MUST state that
@@ -1756,23 +1765,24 @@ understood by any host building a flow on this seam.
    and can never be rotated. There is deliberately no default: if the key behind that inner puzzle
    is lost, the distributor's entry set freezes forever.
 
-### 6BB.3b The remainder comes home, and it MUST be findable
+### 6BB.3b The offered CAT comes home WHOLE, and it MUST be findable
 
-The reward CAT's spend makes TWO creations: `reserve_base_units` to the settlement puzzle, and the
-remainder — the coin's own amount minus the reserve — back to this wallet. This mirrors the XCH
-funding leg, which already returns its own change.
+The reward CAT's spend makes exactly ONE creation: the whole coin to the settlement puzzle. The
+money comes back one step later, from the launch itself.
 
-1. The remainder coin MUST be created at this wallet's p2 puzzle hash, inside the same CAT, and MUST
-   carry a `hint` of that puzzle hash. A CAT change coin without the hint is still the wallet's money
-   and no wallet in the ecosystem will show it again, which is indistinguishable from losing it. The
-   production read that finds it is `wallet::cat_transfer::dig_cat_coins` (§6G), and an acceptance
-   test MUST discover it through that read rather than by finding a coin of the right amount in the
-   bundle.
-2. When the reserve equals the whole coin the spend MUST create NO change coin. A zero-value
-   `CREATE_COIN` is a coin that exists, is the wallet's, and can never be spent for anything.
+1. This seam MUST NOT split a CAT change coin off here. The launch refunds `total_cat_amount` to
+   `constants.fee_payout_puzzle_hash` — this wallet — and a change coin created here would only
+   divide the caller's own money into two of the caller's own coins while leaving the distributor
+   byte-identical.
+2. The refund MUST be findable at this wallet's $DIG puzzle hash. The launch driver hints it
+   (`launch_drivers.rs:660-667`), and the production read that finds it is
+   `wallet::cat_transfer::dig_cat_coins` (§6G). An acceptance test MUST discover the refunded
+   amount through a chain read at that puzzle hash rather than by finding a coin of the right
+   amount inside the bundle, and MUST separately assert that `read_distributor` reports a reserve
+   of **zero** immediately post-launch — a source read of the driver is a hypothesis, and only the
+   chain read is evidence.
 
-`begin_reward_distributor_mint`'s signature is unchanged by this: the amount is a field on the
-request, not a new argument.
+`begin_reward_distributor_mint`'s signature is unchanged by this.
 
 ### 6BB.4 Building and signing are one function
 
@@ -1819,7 +1829,6 @@ built from, and one peak read — never from a chain answer, so a chain source c
 | `manager_launcher_id` | `Bytes32` | the bundle's own spends (= `predicted_manager_launcher_id()`) |
 | `funding_coin_id` | `Bytes32` | `RewardDistributorMintRequest::funding.coin_id()` |
 | `reward_cat_coin_id` | `Bytes32` | `RewardDistributorMintRequest::reward_cat.coin.coin_id()` |
-| `requested_reserve_base_units` | `u64` | `RewardDistributorMintRequest::reserve_base_units`, in $DIG base units (1 $DIG = 1,000 base units); a REQUEST, not a reserve |
 | `generation` | `LaunchComment` | `RewardDistributorMintRequest::generation` — the `store_id:root` the launch comment advertises |
 | `pushed_at_height` | `u32` | the chain's peak, read immediately BEFORE the push |
 
@@ -1867,7 +1876,7 @@ measured against. Proving a record exists is not proving it is yours.
 type — if the account has relocked. Otherwise it refuses with `MintError::Refused`, naming which
 check fired, unless ALL of the following hold:
 
-**Internal consistency.**
+**Internal consistency.** Nothing is read from the chain for any of these.
 
 1. None of `distributor_launcher_id`, `manager_launcher_id`, `funding_coin_id`,
    `reward_cat_coin_id` is all-zero.
@@ -1875,23 +1884,89 @@ check fired, unless ALL of the following hold:
    (§6BB.3 rule 2).
 3. `distributor_launcher_id != manager_launcher_id` — a launch creates two DISTINCT singletons
    (§6BB.3a).
-4. `requested_reserve_base_units != 0`.
-5. `pushed_at_height != 0` — no bundle is pushed at genesis.
-6. `generation` parses as a `LaunchComment`.
+4. `pushed_at_height != 0` — no bundle is pushed at genesis.
+5. `generation` parses as a `LaunchComment`.
 
-**Ownership.** This is the clause the rest exists to reach; 1-6 alone prove nothing.
+**The coins are this account's.**
 
-7. `chain.coin_record(funding_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals this
+6. `chain.coin_record(funding_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals this
    profile's wallet puzzle hash.
-8. `chain.coin_record(reward_cat_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals
+7. `chain.coin_record(reward_cat_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals
    the $DIG CAT-CURRIED hash for this profile's wallet puzzle hash
    (`CatArgs::curry_tree_hash(DIG_ASSET_ID, p2)`, §6G) — never the raw p2 hash, which is not where
    a CAT lives.
 
-Rules 7 and 8 are the SAME predicate `begin_reward_distributor_mint` applies to the request it
-builds from (§6BB.3), so `resume` accepts exactly the coin set `begin` could have spent: no wider,
-no narrower. An absent coin record is a REFUSAL, not a pass — fail closed: a coin the chain has
-never heard of is not this account's.
+**The coins are the coins that produced THIS launch.** Rules 6 and 7 alone do NOT establish
+ownership of the distributor, and a version of this clause that stopped there was exploitable.
+
+Rules 6 and 7 are the same predicate `begin_reward_distributor_mint` applies to the request it
+builds from (§6BB.3) — but matching that predicate does not reproduce what `begin` has.
+`begin` DERIVES both launcher ids from the bundle it builds, so its coins are bound to the object
+by construction; a record carries the launcher ids as data and binds them to nothing. Both launcher
+ids and the generation are chain-readable by anyone, so an attacker pairs a victim's launcher ids
+and generation with two coins of her OWN, passes rules 1-7, and `status` hands her a
+`ConfirmedRewardDistributor` for a distributor she never funded. **Ownership MUST therefore mean
+both: these coins are mine, AND they are the coins that produced this launcher.**
+
+The binding is re-established by walking the launch's own ancestry back to `funding_coin_id`, in
+the shape §6BB's build produces it:
+
+8. `manager_launcher_id` MUST equal `Coin::new(funding_coin_id, SINGLETON_LAUNCHER_HASH,
+   MANAGER_SINGLETON_AMOUNT_MOJOS).coin_id()`. `launch_manager_singleton` passes the funding coin
+   id straight to `Launcher::new`, so this is a pure derivation and MUST cost **no chain read**.
+9. `distributor_launcher_id`'s launcher coin MUST trace back to `funding_coin_id`: its
+   `parent_coin_info` is the launch's ephemeral security coin, whose own `parent_coin_info` MUST
+   equal `Coin::new(funding_coin_id, SETTLEMENT_PAYMENT_HASH, OFFER_XCH_AMOUNT).coin_id()`. This
+   costs exactly **two** `coin_record` reads — the launcher coin and the security coin — because
+   the security coin's identity depends on a random key the mint discarded. The settlement coin at
+   the end MUST be DERIVED, not read: every input to its identity is fixed by §6BB's build, and
+   re-deriving it is stronger than trusting a third chain answer.
+
+Every `coin_record` answer used above MUST be checked to have the coin id that was ASKED for. A
+source that answers a different question cannot prove anything here.
+
+**Reserve.** There is no `requested_reserve_base_units` rule, because there is no such field: see
+the §6BB intro.
+
+**An absent coin record is fail-closed, with one typed exception.** For rules 6, 7 and the security
+coin of rule 9, absence is a REJECTION: a coin the chain has never heard of is not this account's.
+For the LAUNCHER coin of rule 9 it is neither a rejection nor a pass — see the rejection taxonomy
+below.
+
+#### The rejection is TYPED, because a host routes on it
+
+`resume` MUST NOT report these outcomes as one stringly-typed refusal. A host (dig-app) keeps
+rejected records in a different place from live ones and shows a user different things, and a host
+that had to match a substring of a message would break on the next copy-edit. `resume` therefore
+returns `MintError::RecordRejected(RecordRejection)` with these variants, and every routing
+decision a host needs MUST be expressible by MATCHING alone:
+
+| variant | carries | means | rules |
+|---|---|---|---|
+| `RecordRejection::Malformed` | `RecordField` | a typo or a corrupted store; nothing was read from the chain | 1-5 |
+| `RecordRejection::NotYours` | `OwnershipProof` | the record describes somebody else's mint | 6-9 |
+| `RecordRejection::Unproven` | — | the launcher coin does not exist yet, so the descent cannot be walked either way | rule 9, launcher absent |
+
+`RecordField` and `OwnershipProof` MUST be enums, never strings. The `detail` string each variant
+carries is prose for humans and logs ONLY; nothing may parse it.
+
+`MintError::ChainUnreachable` stays the FOURTH, separate outcome: nothing about the record is in
+question when the node cannot be reached.
+
+#### A record is resumable only once its launch confirms
+
+This follows from rule 9 and is stated rather than left to be discovered. Before the launch bundle
+is included in a block, the distributor's launcher coin does not exist, and nothing on chain ties
+`distributor_launcher_id` to this account's funding coin. Accepting the record anyway would hand a
+stranger a pending value that becomes evidence the instant the real owner's bundle confirms;
+rejecting it as a forgery would be a false statement about the real owner's own money. The answer
+is `RecordRejection::Unproven`, and the host resumes again once the launch confirms.
+
+The consequence a host must plan for: a resumed `PendingRewardDistributor` can never report
+`Failed`, because `Failed` is precisely the state in which the launcher coin does not exist. A host
+that needs to observe its own mint dying MUST hold the `PendingRewardDistributor` `submit` returned
+for as long as that matters; a record persisted across a restart answers `Unproven` until the launch
+confirms.
 
 **Both coins are SPENT at resume time, and that is the expected state.** The mint the record
 describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role
@@ -1904,8 +1979,9 @@ is UNKNOWN. Telling a user their own record is a forgery because a node was down
 statement about their money; passing them through unproven re-opens the hole this clause closes.
 
 A resumed `PendingRewardDistributor` is indistinguishable from the one `submit` returned: it is
-`==` to it field for field, and `status` (§6BB.8) answers identically on every arm — shallow, buried,
-dead and unreadable.
+`==` to it field for field, and `status` (§6BB.8) answers identically on every arm a resumable
+record can reach — shallow, buried and unreadable. `Failed` is not among them, for the reason just
+given, and that absence is a theorem rather than a gap.
 
 ### 6BB.7 `ConfirmedRewardDistributor` — the evidence invariant (normative)
 
@@ -1959,7 +2035,7 @@ contract and a decoder that honours `discover_distributor`'s: the record was fet
 the source contradicted itself.
 
 The value carries `distributor_launcher_id`, `manager_launcher_id`, `confirmed_height`,
-`generation` and `requested_reserve_base_units` — every one copied from `pending` except
+`generation` — every one copied from `pending` except
 `confirmed_height`, which is the record's. Each has a public getter; nothing else is exposed.
 
 ### 6BB.8 `submit` and `status` — the four answers stay distinct (normative)
@@ -2092,10 +2168,11 @@ comment names this generation. A reader MAY NOT conclude:
 2. **Anything about the generation's CONTENT.** `generation()` is the `store_id:root` the launch
    comment advertised, carried from the request this crate built the bundle from. The chain proves
    the comment was written, not that any store has that root or that any bytes hash to it.
-3. **That a reserve of `requested_reserve_base_units` exists or is spendable.** The value is the
-   amount the request NAMED, echoed back, in $DIG base units. The distributor's live reserve,
-   its entries and its epoch state are read through `dig-rewards-coin`'s own state readers, never
-   inferred from this evidence.
+3. **That the distributor holds ANY reserve at all.** It holds none: the launch creates the reserve
+   coin with the literal amount `0` and refunds the offered CAT whole (§6BB intro). Nothing in this
+   evidence is about a reserve, and no field of it ever was. The distributor's live reserve, its
+   entries and its epoch state are read through `dig-rewards-coin`'s own state readers, and are
+   non-zero only after a `commit_incentives_for_distributor_epoch` spend this crate does not make.
 4. **That the manager is reachable.** `manager_launcher_id()` is the id this mint derived; whether
    the key behind `manager_inner_puzzle` still exists is the caller's for the distributor's lifetime
    (§6BB.3a).
