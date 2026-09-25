@@ -190,18 +190,17 @@ impl RewardDistributorMinter {
     /// - [`RecordRejection::Unproven`] when the distributor's launcher coin is not CONFIRMED —
     ///   absent from the chain, or present only as a mempool observation with no confirmed
     ///   height — and the funding coin's own fate is not yet settled either: it is still unspent,
-    ///   or its spend is shallower than
-    ///   [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH). See that variant's own
-    ///   docs: this is the honest answer, not a refusal.
+    ///   or its spend is shallower than [`MIN_CONFIRMATION_DEPTH`]. See that variant's own docs:
+    ///   this is the honest answer, not a refusal.
     /// - [`RecordRejection::LaunchDead`] when the launcher coin is absent AND `funding_coin_id`'s
-    ///   spend is buried [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH) blocks
-    ///   deep. An included launch creates the launcher in the very block it spends the funding
-    ///   coin, so that pairing means a different spend took the funding coin and this mint can
-    ///   never confirm. Terminal: the host stops retrying and tells the user their coins are
-    ///   back — which is why the burial bar is the same one an ACCEPTED confirmation must clear,
-    ///   and why an unreadable peak is [`MintError::ChainUnreachable`] rather than a verdict.
-    ///   Decided from the funding coin's `CoinRecord` — already read for the ownership proof —
-    ///   plus one `peak_height`, and never from `reward_cat_coin_id`.
+    ///   spend is buried [`MIN_CONFIRMATION_DEPTH`] blocks deep. An included launch creates the
+    ///   launcher in the very block it spends the funding coin, so that pairing means a different
+    ///   spend took the funding coin and this mint can never confirm. Terminal: the host stops
+    ///   retrying and tells the user their coins are back — which is why the burial bar is the
+    ///   same one an ACCEPTED confirmation must clear, and why an unreadable peak is
+    ///   [`MintError::ChainUnreachable`] rather than a verdict. Decided from the funding coin's
+    ///   `CoinRecord` — already read for the ownership proof — plus one `peak_height`, and never
+    ///   from `reward_cat_coin_id`.
     ///
     /// [`MintError::ChainUnreachable`] if a read FAILS. A read failure is never a rejection:
     /// telling a user their own record is a forgery because a node was down is a lie about their
@@ -505,14 +504,13 @@ impl RewardDistributorMinter {
     /// and tells the user their coins are back — so issuing it on a one-block-deep spend files a
     /// funded distributor as dead and invites a second mint over coins the first one will take.
     ///
-    /// This crate already buries every ACCEPTED confirmation behind
-    /// [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH)
+    /// This crate already buries every ACCEPTED confirmation behind [`MIN_CONFIRMATION_DEPTH`]
     /// (`MintedDid::from_confirmed`, §6BB.7's rule (c)); the expensive direction must not be
     /// cheaper. Below that depth the spend is still reversible, so the answer is `Unproven` — ask
-    /// again later — and the record stays live. The one extra read this costs is
-    /// [`peak_height`](crate::mint::did::peak_height), on a rare arm, and it FAILS CLOSED: a
-    /// source with no peak yields [`MintError::ChainUnreachable`], because an unknowable depth
-    /// must never license a terminal verdict.
+    /// again later — and the record stays live. The one extra read this costs is `peak_height`,
+    /// on a rare arm, and it FAILS CLOSED: a source with no peak yields
+    /// [`MintError::ChainUnreachable`], because an unknowable depth must never license a terminal
+    /// verdict.
     ///
     /// `reward_cat_coin_id` is deliberately NOT consulted: it is bound only as "a $DIG coin of
     /// this account's" (`SPEC.md` §6BB.6a rule 7), so deciding death from it would let a user's
