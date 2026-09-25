@@ -94,7 +94,8 @@ impl std::fmt::Display for OwnershipProof {
 /// dig-app keeps rejected records in a different map from live ones, and the three cases mean
 /// different things to a user: [`Malformed`](Self::Malformed) is a typo or a corrupted store,
 /// [`NotYours`](Self::NotYours) is a record describing somebody else's mint, and
-/// [`Unproven`](Self::Unproven) is "ask again later". A fourth case — the node could not be
+/// [`Unproven`](Self::Unproven) is "ask again later", and [`LaunchDead`](Self::LaunchDead) is
+/// "never ask again — this mint can no longer confirm". A fifth case — the node could not be
 /// reached at all — stays [`MintError::ChainUnreachable`], because nothing about the record is in
 /// question there.
 ///
@@ -124,13 +125,41 @@ pub enum RecordRejection {
 
     /// The record MAY be this account's, and the chain cannot yet say either way.
     ///
-    /// The distributor launcher coin does not exist until the launch bundle is included in a
-    /// block, and without it there is no ancestry to walk back to the funding coin. Accepting the
+    /// The distributor launcher coin does not exist — or exists only as a mempool observation,
+    /// with no confirmed height — until the launch bundle is included in a block, and without a
+    /// CONFIRMED launcher there is no ancestry to walk back to the funding coin. Accepting the
     /// record anyway would hand a stranger a pending value that turns into evidence the moment the
     /// real owner's bundle confirms; refusing it as a forgery would be a false statement about the
     /// real owner's own money. So it is neither: the host retries once the launch confirms.
+    ///
+    /// This variant means the launch may STILL confirm — the funding coin is unspent, so the
+    /// bundle is either in flight or droppable and re-mintable. A launch that can never confirm is
+    /// [`LaunchDead`](Self::LaunchDead), which is a terminal answer rather than a retry.
     #[error("this record cannot be proven yet: {detail}")]
     Unproven {
+        /// Human-readable prose. Never parse this.
+        detail: String,
+    },
+
+    /// The record IS this account's, and the mint it describes can never confirm. Terminal.
+    ///
+    /// Deliberately NOT [`NotYours`](Self::NotYours) — nothing here suggests a forgery, and the
+    /// two route to different places in a host — and deliberately not
+    /// [`Unproven`](Self::Unproven), which tells a host to retry. The launcher coin is absent
+    /// while `funding_coin_id` has been SPENT: an included launch bundle creates the launcher in
+    /// the same block it spends the funding coin, so a spent funding coin with no launcher means
+    /// some OTHER spend consumed it and this bundle can never be included. That is §6BB.8 step 3's
+    /// proof-of-death rule, decided from the funding coin alone and from a [`CoinRecord`] that was
+    /// already read — it costs no extra chain read, and it never consults `reward_cat_coin_id`.
+    ///
+    /// Without it a persisted record has no terminal failure state at all: the host that restarted
+    /// no longer holds the `PendingRewardDistributor` `submit` returned, so it can never call
+    /// `status` and never learn `Failed`, and would show "still waiting" forever about money that
+    /// is already back in the user's wallet.
+    ///
+    /// [`CoinRecord`]: dig_chainsource_interface::CoinRecord
+    #[error("this record's mint can never confirm: {detail}")]
+    LaunchDead {
         /// Human-readable prose. Never parse this.
         detail: String,
     },

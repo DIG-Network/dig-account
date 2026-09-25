@@ -186,8 +186,16 @@ impl RewardDistributorMinter {
     ///   whose coins are not at this profile's puzzle hashes or whose launchers do not descend
     ///   from its funding coin. A coin the chain has never heard of is NOT this account's — fail
     ///   closed.
-    /// - [`RecordRejection::Unproven`] when the distributor's launcher coin does not exist on
-    ///   chain yet. See that variant's own docs: this is the honest answer, not a refusal.
+    /// - [`RecordRejection::Unproven`] when the distributor's launcher coin is not CONFIRMED —
+    ///   absent from the chain, or present only as a mempool observation with no confirmed
+    ///   height — while the funding coin is still unspent, so the launch may yet land. See that
+    ///   variant's own docs: this is the honest answer, not a refusal.
+    /// - [`RecordRejection::LaunchDead`] when the launcher coin is absent AND `funding_coin_id`
+    ///   has been spent. An included launch creates the launcher in the very block it spends the
+    ///   funding coin, so that pairing means a different spend took the funding coin and this
+    ///   mint can never confirm. Terminal: the host stops retrying and tells the user their coins
+    ///   are back. Decided from the funding coin's `CoinRecord` — already read for the ownership
+    ///   proof — at ZERO extra chain reads, and never from `reward_cat_coin_id`.
     ///
     /// [`MintError::ChainUnreachable`] if a read FAILS. A read failure is never a rejection:
     /// telling a user their own record is a forgery because a node was down is a lie about their
@@ -211,7 +219,10 @@ impl RewardDistributorMinter {
         let wallet_puzzle_hash = wallet.puzzle_hash();
         let generation = Self::parse_consistent_record(record)?;
 
-        Self::prove_coin_is_ours(
+        // The funding coin's record is KEPT: its `spent_height` is what separates a launch that
+        // may still confirm from one that never can, and re-reading the same coin later would be a
+        // second chance to be answered inconsistently.
+        let funding = Self::prove_coin_is_ours(
             chain,
             record.funding_coin_id,
             wallet_puzzle_hash,
@@ -225,7 +236,7 @@ impl RewardDistributorMinter {
             OwnershipProof::RewardCatCoinIsThisAccounts,
             "the reward CAT coin",
         )?;
-        Self::prove_launchers_descend_from_the_funding_coin(chain, record)?;
+        Self::prove_launchers_descend_from_the_funding_coin(chain, record, &funding)?;
 
         Ok(PendingRewardDistributor::new(
             record.distributor_launcher_id,
@@ -299,14 +310,19 @@ impl RewardDistributorMinter {
     /// never heard of is not this account's. A read FAILURE is [`MintError::ChainUnreachable`],
     /// never a rejection and never a pass.
     ///
-    /// Deliberately no `spent_height` condition — see [`resume`](Self::resume).
+    /// Deliberately no `spent_height` condition — see [`resume`](Self::resume). The proven record
+    /// is RETURNED rather than dropped, because `spent_height` is the evidence the dead-launch
+    /// arm of [`prove_launchers_descend_from_the_funding_coin`][walk] needs, and a second read of
+    /// the same coin would cost a read and admit an inconsistent second answer.
+    ///
+    /// [walk]: Self::prove_launchers_descend_from_the_funding_coin
     fn prove_coin_is_ours<C>(
         chain: &C,
         coin_id: Bytes32,
         expected_puzzle_hash: Bytes32,
         proof: OwnershipProof,
         what: &str,
-    ) -> MintResult<()>
+    ) -> MintResult<CoinRecord>
     where
         C: ChainSource + ?Sized,
     {
@@ -332,7 +348,7 @@ impl RewardDistributorMinter {
             ));
         }
 
-        Ok(())
+        Ok(found)
     }
 
     /// The second OWNERSHIP half, and the one that binds the record to THIS mint: both launcher
@@ -341,9 +357,14 @@ impl RewardDistributorMinter {
     /// Costs exactly **two** `coin_record` reads, both on the distributor leg. The manager leg is
     /// a derivation, and the settlement coin at the end of the distributor leg is a derivation too
     /// — see [`resume`](Self::resume) for the shape of the chain being walked.
+    ///
+    /// `funding` is the record `prove_coin_is_ours` already proved for `record.funding_coin_id`.
+    /// Only its `spent_height` is read here, and only on the arm where the launcher coin is
+    /// absent: it is what tells a launch that has not landed YET from one that never will.
     fn prove_launchers_descend_from_the_funding_coin<C>(
         chain: &C,
         record: &PendingRewardDistributorRecord,
+        funding: &CoinRecord,
     ) -> MintResult<()>
     where
         C: ChainSource + ?Sized,
@@ -368,15 +389,27 @@ impl RewardDistributorMinter {
         let launcher_what = "the distributor's launcher coin";
         let Some(launcher) = Self::read_coin(chain, record.distributor_launcher_id, launcher_what)?
         else {
+            return Err(Self::launcher_absent(record, funding, launcher_what));
+        };
+
+        // A launcher seen ONLY in the mempool is "not yet", never a forgery. Read 2 below asks for
+        // the launch's SECURITY coin, which is created and spent inside the same bundle and so has
+        // no coin record until a block includes it — walking on from an unconfirmed launcher would
+        // hand the real owner of a live mint the attack verdict during the ordinary mempool
+        // window. `confirmed_height.is_some()` is the whole predicate: a burial requirement
+        // belongs to `from_confirmed`, and `spent_height` is deliberately never consulted here,
+        // because both input coins are SPENT at resume time by construction.
+        if launcher.confirmed_height.is_none() {
             return Err(MintError::RecordRejected(RecordRejection::Unproven {
                 detail: format!(
-                    "{launcher_what} {} does not exist on chain, so nothing yet ties this \
-                     distributor to this account's funding coin; resume again once the launch \
+                    "{launcher_what} {} is a mempool observation with no confirmed height, so the \
+                     launch's ephemeral security coin does not exist yet and the descent to this \
+                     account's funding coin cannot be walked; resume again once the launch \
                      confirms",
                     hex::encode(record.distributor_launcher_id)
                 ),
             }));
-        };
+        }
 
         // Read 2: the security coin names the offered XCH settlement coin as ITS parent.
         let security_what = "the launch's security coin";
@@ -442,6 +475,49 @@ impl RewardDistributorMinter {
         }
 
         Ok(found)
+    }
+
+    /// The answer when the distributor's launcher coin does NOT exist: `Unproven` if the launch
+    /// may still land, [`RecordRejection::LaunchDead`] if it can never land.
+    ///
+    /// The two are told apart by `funding.spent_height` and nothing else. A launch bundle creates
+    /// the distributor's launcher in the very block that spends `funding_coin_id`, so a SPENT
+    /// funding coin with no launcher coin means some other spend consumed it first and this mint
+    /// can never confirm — §6BB.8 step 3's proof-of-death rule, evaluated on a record already in
+    /// hand. An UNSPENT funding coin means the bundle is still in flight, or was dropped and the
+    /// mint is simply re-mintable; either way the honest answer is "ask again later".
+    ///
+    /// `reward_cat_coin_id` is deliberately NOT consulted: it is bound only as "a $DIG coin of
+    /// this account's" (`SPEC.md` §6BB.6a rule 7), so deciding death from it would let a user's
+    /// own wrong CAT id declare a live mint dead. The funding coin is bound to this launch by
+    /// rules 8 and 9.
+    fn launcher_absent(
+        record: &PendingRewardDistributorRecord,
+        funding: &CoinRecord,
+        launcher_what: &str,
+    ) -> MintError {
+        let launcher_id = hex::encode(record.distributor_launcher_id);
+        if funding.is_spent() {
+            return MintError::RecordRejected(RecordRejection::LaunchDead {
+                detail: format!(
+                    "{launcher_what} {launcher_id} does not exist on chain, yet funding coin {} \
+                     has been spent; an included launch creates that launcher in the same block \
+                     it spends the funding coin, so a different spend took it and this mint can \
+                     never confirm. The coins are back in this account's wallet; mint again \
+                     rather than retrying this record",
+                    hex::encode(record.funding_coin_id)
+                ),
+            });
+        }
+
+        MintError::RecordRejected(RecordRejection::Unproven {
+            detail: format!(
+                "{launcher_what} {launcher_id} does not exist on chain and funding coin {} is \
+                 still unspent, so nothing yet ties this distributor to this account's funding \
+                 coin and the launch may still confirm; resume again once it does",
+                hex::encode(record.funding_coin_id)
+            ),
+        })
     }
 
     /// A [`RecordRejection::Malformed`] as a [`MintError`], so every arm above is one expression.
@@ -676,12 +752,13 @@ mod tests {
         // Pinned, not a floor: `new` (pub(crate)), `public_key`, `puzzle_hash`, `begin`,
         // `dig_cat_coins` and `resume` are the 6 pub-qualified methods on the inherent impl
         // today. `live_wallet_key`, `parse_consistent_record`, `prove_coin_is_ours`,
-        // `prove_launchers_descend_from_the_funding_coin`, `read_coin`, `malformed` and
-        // `not_yours` are private and exempt. RE-CHECKED deliberately for the launcher-ancestry
-        // binding and the typed rejection: those additions are all private, and removing
-        // `requested_reserve_base_units` removed no method from THIS type, so the count is
-        // unchanged at 6 rather than loosened. A count drift in either direction means a method
-        // was added, removed, or the scan stopped seeing one that exists.
+        // `prove_launchers_descend_from_the_funding_coin`, `read_coin`, `launcher_absent`,
+        // `malformed` and `not_yours` are private and exempt. RE-CHECKED deliberately for the
+        // launcher-ancestry binding, the typed rejection, and the confirmed-launcher /
+        // dead-launch split: every one of those additions is a private associated fn, and
+        // removing `requested_reserve_base_units` removed no method from THIS type, so the count
+        // is unchanged at 6 rather than loosened. A count drift in either direction means a
+        // method was added, removed, or the scan stopped seeing one that exists.
         assert_eq!(
             checked, 6,
             "expected exactly 6 pub-qualified methods (new, public_key, puzzle_hash, begin, \

@@ -24,6 +24,12 @@
 //! role (`SPEC.md` §6BB.8, step 3). And the launch is INCLUDED in a block, because before
 //! inclusion the launcher coin does not exist and the descent cannot be walked in either
 //! direction; that case is `RecordRejection::Unproven` and has its own test below.
+//!
+//! Two neighbouring states are fixtured explicitly because they are where the honest answer is
+//! easiest to get wrong: a launcher seen only in the MEMPOOL (real, since a wallet-protocol source
+//! reports `created_height: None`) must stay `Unproven` rather than becoming the attack verdict,
+//! and a record whose funding coin a DIFFERENT spend took must become the terminal
+//! `RecordRejection::LaunchDead` rather than an eternal `Unproven`.
 
 use std::sync::Arc;
 
@@ -382,10 +388,12 @@ fn a_strangers_record_taken_verbatim_is_rejected_on_the_coins() {
 /// `status` the chain can produce for a record that is resumable at all: shallow, buried, and
 /// unreadable.
 ///
-/// `Failed` is deliberately absent, and its absence is a THEOREM rather than a gap: a resumed
-/// record must name a launcher coin that exists (rule 10), while `Failed` is the state in which it
-/// does not. The `Failed` arm is proven on a non-resumed pending in
-/// `reward_distributor_publish_confirm_simulator.rs`.
+/// `Failed` is absent from the three arms exercised here, and the reason is narrower than it
+/// looks: a resumed record must name a CONFIRMED launcher coin (rule 9), so §6BB.8's **step 3**
+/// proof-of-death path — which requires an absent launcher — cannot be reached from one. Step 5
+/// can still report `Failed` on a resumed record (no distributor advertised, or a parseable but
+/// wrong `generation`), so this is not a claim that `Failed` is unreachable. The step-3 `Failed`
+/// arm is proven on a non-resumed pending in `reward_distributor_publish_confirm_simulator.rs`.
 #[test]
 fn a_resumed_pending_answers_status_exactly_as_the_original_does() {
     let chain = SimulatorChain::new();
@@ -468,6 +476,229 @@ fn a_record_whose_launch_has_not_confirmed_is_unproven_not_rejected() {
             .expect("the record resumes once its launch confirms"),
         pending
     );
+}
+
+/// The mempool WINDOW: a launcher coin the node reports with no `confirmed_height` is `Unproven`,
+/// never `NotYours`. This is the legitimate owner of a live, funded mint.
+///
+/// A wallet-protocol source serves a `CoinState` whose `created_height` is `None` for a coin it has
+/// seen only in the mempool, and `CoinRecord::from_coin_state` maps that straight through. Walking
+/// on from such a launcher reads its parent — the launch's EPHEMERAL security coin, created and
+/// spent inside the same bundle, so it has no coin record until a block includes the bundle — and
+/// that absence is `NotYours`. Handing the real owner the attack verdict is not a cosmetic
+/// mislabel: §6BB.6a requires a host to file `NotYours` records in a different map from live ones,
+/// so a funded in-flight distributor would be permanently discarded.
+///
+/// Mutation: delete the `launcher.confirmed_height.is_none()` check in
+/// `prove_launchers_descend_from_the_funding_coin` and this test goes red.
+#[test]
+fn a_launcher_seen_only_in_the_mempool_is_unproven_not_a_forgery() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let pending = pushed_not_included(&chain, &a);
+    let record = PendingRewardDistributorRecord::from(&pending);
+
+    // The launch creates AND spends its own launcher coin, so the pushed bundle carries the exact
+    // coin a mempool-aware node would report. Nothing here is fabricated.
+    let launcher_coin = chain
+        .accepted_bundles()
+        .iter()
+        .flat_map(|bundle| bundle.coin_spends.clone())
+        .map(|spend| spend.coin)
+        .find(|coin| coin.coin_id() == record.distributor_launcher_id)
+        .expect("the pushed bundle spends the launcher coin it creates");
+    chain.observe_in_mempool(launcher_coin);
+
+    let launcher_record = chain
+        .coin_record(record.distributor_launcher_id)
+        .expect("a reachable chain answers")
+        .expect("the node reports the launcher it has seen in its mempool");
+    assert_eq!(
+        launcher_record.confirmed_height, None,
+        "the fixture must be the mempool window itself: a launcher coin VISIBLE but not confirmed"
+    );
+    assert!(
+        chain
+            .coin_record(launcher_coin.parent_coin_info)
+            .expect("a reachable chain answers")
+            .is_none(),
+        "the fixture must reach production's state: the launch's security coin is ephemeral, so \
+         it has no coin record until a block includes the bundle — which is what makes walking \
+         on from an unconfirmed launcher produce the attack verdict"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("an unconfirmed launch cannot be tied to this account's funding coin"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a launcher seen only in the mempool is Unproven; calling the real owner's own live mint \
+         NotYours files a funded distributor as a forgery: {rejected:?}"
+    );
+
+    // And once it confirms, the SAME bytes resume — the window is a delay, not a refusal.
+    chain
+        .include_in_a_block()
+        .expect("the bundle is included in the next block");
+    assert_eq!(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect("the record resumes once its launch confirms"),
+        pending
+    );
+}
+
+/// A launch that can NEVER confirm is terminal — `LaunchDead`, not `Unproven` forever.
+///
+/// The host that persisted this record has restarted, so the `PendingRewardDistributor` `submit`
+/// returned is gone and `status` is unreachable: `resume` is the only thing left that can say
+/// anything, and "ask again later" about money already back in the wallet is a retry loop with no
+/// exit. The launcher coin is absent while the funding coin has been SPENT — an included launch
+/// creates that launcher in the very block it spends the funding coin, so a different spend took
+/// it. That is §6BB.8 step 3's rule, decided here from the funding coin ALONE.
+///
+/// Mutation: delete the `funding.is_spent()` branch in
+/// `RewardDistributorMinter::launcher_absent` and this test goes red while
+/// `a_record_whose_launch_has_not_confirmed_is_unproven_not_rejected` stays green.
+#[test]
+fn a_record_whose_funding_coin_a_different_spend_took_is_dead_not_unproven() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let pending = pushed_not_included(&chain, &a);
+    let record = PendingRewardDistributorRecord::from(&pending);
+
+    // The control, first: with the funding coin still unspent this very record is `Unproven`, so
+    // the outcome below is the spentness and nothing else.
+    assert!(
+        matches!(
+            rejection(
+                a.account
+                    .resume_reward_distributor(&record, &chain)
+                    .expect_err("a launch that has not landed cannot be proven"),
+            ),
+            RecordRejection::Unproven { .. }
+        ),
+        "before the funding coin is taken, this record is Unproven"
+    );
+
+    // A competing spend takes the funding coin. The launcher coin still does not exist, and now
+    // it never can.
+    chain.report_spent(record.funding_coin_id);
+    assert!(
+        chain
+            .coin_record(record.funding_coin_id)
+            .expect("a reachable chain answers")
+            .expect("the funding coin exists on chain")
+            .is_spent(),
+        "the fixture must really report the funding coin as taken"
+    );
+    assert!(
+        chain
+            .coin_record(record.distributor_launcher_id)
+            .expect("a reachable chain answers")
+            .is_none(),
+        "the fixture must really be a launch that never landed: no launcher coin"
+    );
+    assert!(
+        !chain
+            .coin_record(record.reward_cat_coin_id)
+            .expect("a reachable chain answers")
+            .expect("the reward CAT exists on chain")
+            .is_spent(),
+        "the reward CAT is deliberately left UNSPENT: the death verdict below must be derived \
+         from the funding coin alone, never from the CAT, which rule 7 binds only as 'a $DIG coin \
+         of this account's'"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a mint that can never confirm is not resumable"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::LaunchDead { .. }),
+        "a spent funding coin with no launcher is a DEAD launch, and a host told 'Unproven' here \
+         retries forever about coins already back in the wallet: {rejected:?}"
+    );
+}
+
+/// The manager derivation is the SOLE refusal here: B's own funding coin, own reward CAT and own
+/// genuinely-launched distributor, with ONLY A's `manager_launcher_id` substituted.
+///
+/// This is what the older attack test could not prove. There, deleting the manager check leaves
+/// the record refused anyway by the distributor leg, so the test moves only the reason enum. Here
+/// both ownership reads pass AND the whole ancestry walk passes, so nothing but the derivation
+/// stands between this record and an `Ok`.
+///
+/// It is load-bearing because `manager_launcher_id` is never re-checked downstream:
+/// `ConfirmedRewardDistributor::from_confirmed` copies it straight off the pending and `check()`
+/// never compares it to what was discovered. Without the derivation, `status` would hand B a
+/// `Confirmed` whose `manager_launcher_id()` points at A's manager singleton.
+///
+/// Mutation: drop the `manager_launcher_id != expected_manager` comparison in
+/// `prove_launchers_descend_from_the_funding_coin` and this test goes red ON THE REFUSAL — it is
+/// the second of the two tests that mutation reds.
+#[test]
+fn a_record_naming_another_accounts_manager_launcher_is_refused_by_the_derivation_alone() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let b = funded_account(&chain, "account-b", 0xA5);
+
+    let pending_a = pushed_and_included(&chain, &a);
+    let pending_b = pushed_and_included(&chain, &b);
+    let genuine_b = PendingRewardDistributorRecord::from(&pending_b);
+
+    let attack = PendingRewardDistributorRecord {
+        manager_launcher_id: pending_a.manager_launcher_id(),
+        ..genuine_b.clone()
+    };
+    assert_ne!(
+        attack.manager_launcher_id, genuine_b.manager_launcher_id,
+        "the attack must actually substitute A's manager launcher"
+    );
+    assert_eq!(
+        attack.distributor_launcher_id, genuine_b.distributor_launcher_id,
+        "B keeps her OWN distributor launcher, so the two-read ancestry walk passes in full"
+    );
+    assert_eq!(
+        (attack.funding_coin_id, attack.reward_cat_coin_id),
+        (genuine_b.funding_coin_id, genuine_b.reward_cat_coin_id),
+        "B keeps her OWN coins, so both ownership reads pass"
+    );
+    assert_ne!(
+        attack.manager_launcher_id, attack.distributor_launcher_id,
+        "and the internal-consistency arms pass too"
+    );
+
+    assert_not_yours(
+        b.account
+            .resume_reward_distributor(&attack, &chain)
+            .expect_err(
+                "a manager launcher that does not descend from this account's funding coin is \
+                 not this account's",
+            ),
+        OwnershipProof::ManagerLauncherDescendsFromTheFundingCoin,
+    );
+
+    // The control: the SAME record with B's own manager launcher restored resumes.
+    assert_eq!(
+        b.account
+            .resume_reward_distributor(&genuine_b, &chain)
+            .expect("an account resumes its own record"),
+        pending_b
+    );
+}
+
+/// A dead launch, produced the same way the dead-launch test produces one, for the host-routing
+/// table. Built here rather than inlined so that test reads as four outcomes in four buckets.
+fn dead_launch_outcome() -> Result<PendingRewardDistributor, MintError> {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+    chain.report_spent(record.funding_coin_id);
+    a.account.resume_reward_distributor(&record, &chain)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -725,6 +956,7 @@ fn a_host_routes_every_outcome_by_type_with_no_message_parsing() {
                 .resume_reward_distributor(&genuine, &SimulatorChain::offline()),
         ),
         ("ok", a.account.resume_reward_distributor(&genuine, &chain)),
+        ("dead", dead_launch_outcome()),
     ];
 
     for (label, outcome) in outcomes {
@@ -734,6 +966,7 @@ fn a_host_routes_every_outcome_by_type_with_no_message_parsing() {
             Err(MintError::RecordRejected(RecordRejection::Malformed { .. })) => "malformed",
             Err(MintError::RecordRejected(RecordRejection::NotYours { .. })) => "not yours",
             Err(MintError::RecordRejected(RecordRejection::Unproven { .. })) => "unproven",
+            Err(MintError::RecordRejected(RecordRejection::LaunchDead { .. })) => "dead",
             Err(other) => panic!("resume produced an unroutable error: {other:?}"),
         };
         assert_eq!(routed, label, "a host must route {label} to its own bucket");
