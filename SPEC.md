@@ -1807,6 +1807,76 @@ two-bundle ceremony resumable; a distributor mint is one bundle with one confirm
 (dig-app) owns whatever persistence its flow needs. `PendingRewardDistributor` is `Clone +
 PartialEq + Eq + Debug` so a host can hold, compare and log it; this crate does not serialise it.
 
+### 6BB.6a `PendingRewardDistributorRecord` — resuming a mint the host persisted (normative)
+
+§6BB.6 above stands unchanged: the seam keeps no journal, and the host owns whatever persistence
+its flow needs. This clause states the FORM that persistence takes and the ONE door back.
+
+`PendingRewardDistributorRecord` is a serialisable MIRROR of `PendingRewardDistributor`: `Serialize,
+Deserialize, Clone, Debug, PartialEq, Eq`, `#[serde(deny_unknown_fields)]`, with public fields
+mirroring the §6BB.6 table one-for-one and `generation` in its canonical launch-comment STRING form
+(`LaunchComment`'s `Display`), so the persisted bytes are the same text the launch comment carries
+on chain. It is produced only by `From<&PendingRewardDistributor>`.
+
+**A record is not evidence, and there is deliberately no conversion back from one alone.** There is
+no `From<PendingRewardDistributorRecord> for PendingRewardDistributor` and there MUST never be one,
+for the reason the DID journal states in its own words (`src/registry/journal.rs`): *a file is not a
+chain*. `PendingRewardDistributor::new` stays crate-private; §6BB.6's paragraph on why a public
+constructor is refused applies to a bare record conversion identically, because a record naming
+ANOTHER account's distributor is internally perfect. Both launcher ids and the generation are
+chain-readable by anyone; the two coin ids need only be distinct and non-zero. Every
+internal-consistency check such a record could face passes.
+
+**The one door back is `RewardDistributorMinter::resume(record, chain)`**, with the named facades
+`UnlockedAccount::resume_reward_distributor` and `resume_reward_distributor_at(ix, ...)` delegating
+to it unchanged. It lives on the minter and nowhere else because the minter is the only type that
+holds the seed, and therefore the only type that can derive the puzzle hashes a record must be
+measured against. Proving a record exists is not proving it is yours.
+
+`resume` returns `MintError::Locked` — raised BEFORE any derivation, as on every other method of that
+type — if the account has relocked. Otherwise it refuses with `MintError::Refused`, naming which
+check fired, unless ALL of the following hold:
+
+**Internal consistency.**
+
+1. None of `distributor_launcher_id`, `manager_launcher_id`, `funding_coin_id`,
+   `reward_cat_coin_id` is all-zero.
+2. `funding_coin_id != reward_cat_coin_id` — a mint spends two DISTINCT pre-existing inputs
+   (§6BB.3 rule 2).
+3. `distributor_launcher_id != manager_launcher_id` — a launch creates two DISTINCT singletons
+   (§6BB.3a).
+4. `requested_reserve_base_units != 0`.
+5. `pushed_at_height != 0` — no bundle is pushed at genesis.
+6. `generation` parses as a `LaunchComment`.
+
+**Ownership.** This is the clause the rest exists to reach; 1-6 alone prove nothing.
+
+7. `chain.coin_record(funding_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals this
+   profile's wallet puzzle hash.
+8. `chain.coin_record(reward_cat_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals
+   the $DIG CAT-CURRIED hash for this profile's wallet puzzle hash
+   (`CatArgs::curry_tree_hash(DIG_ASSET_ID, p2)`, §6G) — never the raw p2 hash, which is not where
+   a CAT lives.
+
+Rules 7 and 8 are the SAME predicate `begin_reward_distributor_mint` applies to the request it
+builds from (§6BB.3), so `resume` accepts exactly the coin set `begin` could have spent: no wider,
+no narrower. An absent coin record is a REFUSAL, not a pass — fail closed: a coin the chain has
+never heard of is not this account's.
+
+**Both coins are SPENT at resume time, and that is the expected state.** The mint the record
+describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role
+(§6BB.8, step 3). Rules 7 and 8 therefore compare only the puzzle hash of whatever the chain
+reports, and MUST NOT require `spent_height.is_none()`: a resume that demanded an unspent coin
+would refuse every legitimate record.
+
+**A read failure is `MintError::ChainUnreachable`, never a refusal and never a pass.** The outcome
+is UNKNOWN. Telling a user their own record is a forgery because a node was down is a false
+statement about their money; passing them through unproven re-opens the hole this clause closes.
+
+A resumed `PendingRewardDistributor` is indistinguishable from the one `submit` returned: it is
+`==` to it field for field, and `status` (§6BB.8) answers identically on every arm — shallow, buried,
+dead and unreadable.
+
 ### 6BB.7 `ConfirmedRewardDistributor` — the evidence invariant (normative)
 
 **A distributor is reported only from evidence of an actual on-chain launch.**

@@ -121,7 +121,7 @@ fn inserted_dig_cat(chain: &SimulatorChain, p2_puzzle_hash: Bytes32, amount: u64
 fn request_for(funded: &Funded) -> RewardDistributorMintRequest {
     RewardDistributorMintRequest {
         funding: funded.funding,
-        reward_cat: funded.reward_cat.clone(),
+        reward_cat: funded.reward_cat,
         manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(
             funded
                 .account
@@ -187,6 +187,9 @@ fn pushed_not_included(chain: &SimulatorChain, funded: &Funded) -> PendingReward
         .submit(chain, chain)
         .expect("a real consensus validator accepts the seam's own bundle")
 }
+
+/// One arm of the internal-consistency table, as a mutation applied to a GENUINE record.
+type Mutation = Box<dyn Fn(&mut PendingRewardDistributorRecord)>;
 
 fn refusal_message(error: MintError) -> String {
     match error {
@@ -501,7 +504,7 @@ fn every_internal_consistency_arm_refuses_with_its_own_message() {
         )
     };
 
-    let cases: Vec<(&str, Box<dyn Fn(&mut PendingRewardDistributorRecord)>)> = vec![
+    let cases: Vec<(&str, Mutation)> = vec![
         (
             "distributor_launcher_id is all-zero",
             Box::new(move |r| r.distributor_launcher_id = zero),
