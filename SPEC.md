@@ -1933,8 +1933,10 @@ the shape §6BB's build produces it:
    bundle, so it has no coin record at all until a block includes that bundle. Walking on from an
    unconfirmed launcher therefore fails read 2 and produces the FORGERY verdict for the real owner
    of a live, funded mint, in the ordinary mempool window. `confirmed_height.is_some()` is the
-   whole predicate: a burial requirement belongs to `from_confirmed` (§6BB.7), and `spent_height`
-   MUST NOT be consulted here (see "Both coins are SPENT at resume time" below).
+   whole predicate: no burial of the LAUNCHER is required to say "not yet", and `spent_height`
+   MUST NOT be consulted here (see "Both coins are SPENT at resume time" below). The one burial
+   rule on this rule's ABSENT arm is about the FUNDING coin's spend and exists only because the
+   verdict it gates is terminal — see `LaunchDead` below.
 
 Every `coin_record` answer used above MUST be checked to have the coin id that was ASKED for. A
 source that answers a different question cannot prove anything here.
@@ -1953,8 +1955,9 @@ revision of this clause gave.** That revision said step 3 is unreachable from a 
 Step 3 tests the funding coin FIRST and unconditionally: any record `resume` accepted necessarily
 has a SPENT funding coin, because rule 9's descent requires that coin to have created the
 settlement coin, so `funding.is_some_and(is_spent)` fires and returns `Failed` before
-`reward_cat_coin_id` is ever read. **The reward-CAT branch of step 3 is dead code on every resumed
-pending** — that, and not unreachability of the step, is why substituting any other $DIG coin of
+`reward_cat_coin_id`'s record is ever CONSULTED. Be precise about which: step 3 issues both
+`coin_record` reads up front and only then branches, so the CAT id is read — it is never *used*.
+**The reward-CAT branch of step 3 is dead code on every resumed pending** — that, and not unreachability of the step, is why substituting any other $DIG coin of
 this account's changes nothing. The written reason matters because it is what a future change is
 checked against.
 
@@ -1975,8 +1978,8 @@ the §6BB intro.
 coin of rule 9, absence is a REJECTION: a coin the chain has never heard of is not this account's.
 That includes the security coin specifically — once the launcher is CONFIRMED its parent's absence
 is a contradiction, and that arm MUST stay `NotYours`. For the LAUNCHER coin of rule 9, absence is
-neither a rejection nor a pass; it is `Unproven` or `LaunchDead` depending on the funding coin — see
-the rejection taxonomy below.
+neither a rejection nor a pass; it is `Unproven` or `LaunchDead` depending on the funding coin's
+spend AND that spend's burial — see the rejection taxonomy below.
 
 #### The rejection is TYPED, because a host routes on it
 
@@ -1990,8 +1993,8 @@ decision a host needs MUST be expressible by MATCHING alone:
 |---|---|---|---|
 | `RecordRejection::Malformed` | `RecordField` | a typo or a corrupted store; nothing was read from the chain | 1-5 |
 | `RecordRejection::NotYours` | `OwnershipProof` | the record describes somebody else's mint | 6-9 |
-| `RecordRejection::Unproven` | — | the launcher coin is not confirmed yet AND the funding coin is unspent, so the descent cannot be walked either way and the launch may still land | rule 9, launcher absent or unconfirmed |
-| `RecordRejection::LaunchDead` | — | terminal: the launcher coin is absent and the funding coin was spent by a different spend, so this mint can never confirm | rule 9, launcher absent + funding coin spent |
+| `RecordRejection::Unproven` | — | the launcher coin is not confirmed yet AND the funding coin's fate is unsettled — unspent, or spent less than `MIN_CONFIRMATION_DEPTH` deep — so the descent cannot be walked either way and the launch may still land | rule 9, launcher absent or unconfirmed |
+| `RecordRejection::LaunchDead` | — | terminal: the launcher coin is absent and the funding coin was spent by a different spend, buried `MIN_CONFIRMATION_DEPTH` deep, so this mint can never confirm | rule 9, launcher absent + funding spend buried |
 
 `RecordField` and `OwnershipProof` MUST be enums, never strings. The `detail` string each variant
 carries is prose for humans and logs ONLY; nothing may parse it.
@@ -2016,19 +2019,81 @@ API itself makes unkeepable, because surviving a restart is the entire reason a 
 one signal that survives a restart would have been the one that could never say "dead". So `resume`
 answers it directly: when the launcher coin is absent and `funding_coin_id` has been SPENT, the
 answer is `RecordRejection::LaunchDead`, terminal, and a host stops retrying and tells the user
-their coins are back. It costs NO chain read beyond rule 6's, which already fetched that record.
+their coins are back. It reads the funding coin's record for free — rule 6 already fetched it.
+
+**A terminal verdict MUST clear the same burial bar an ACCEPTED confirmation clears.** `resume`
+reads the funding coin FIRST and the launcher SECOND. Those two reads can straddle a reorg, or two
+peers at different heights, so "funding spent" paired with "no launcher" is a reachable pair of
+answers about a LIVE distributor whose block was orphaned and will ordinarily re-confirm. Nothing
+in the answers themselves tells that apart from a genuinely dead launch; only DEPTH does.
+`RecordRejection::LaunchDead` therefore MUST NOT be returned unless the funding coin's spend is
+buried at least `MIN_CONFIRMATION_DEPTH` blocks (§6BB.7 rule (c)'s bar, applied with the same
+arithmetic: `peak - spent_height + 1`). Below that bar the answer is `RecordRejection::Unproven`
+and the record stays live. This costs ONE `peak_height` read, on that arm only, and it MUST fail
+closed: a source that exposes no peak yields `MintError::ChainUnreachable`, never a verdict,
+because an unknowable depth cannot license an answer that cannot be taken back.
+
+The asymmetry this removes is the reason it is normative rather than advisory. Burying the
+ACCEPTING direction and not the REJECTING one puts the cheaper bar on the more expensive mistake:
+an over-eager accept is retryable, while `LaunchDead` tells a user their coins are back and invites
+a fresh mint over coins a re-confirming bundle is about to take.
+
+**`LaunchDead` assumes one source is SELF-CONSISTENT across two coins, and that assumption is
+stated rather than relied on silently.** The verdict pairs a `spent_height` for the funding coin
+with an absence for the launcher, both from the same `ChainSource`. A source that reported the
+funding coin spent while not yet serving the launcher created in that very block would hand an
+honest owner a terminal answer. The burial requirement above is what bounds this: a source has to
+be inconsistent across `MIN_CONFIRMATION_DEPTH` blocks of history, not across one read pair.
+Hosts that care about the residual beyond that MUST pass an aggregating or trusted `ChainSource`
+(`dig-chainsource-interface`'s registry exists for this) — the same mitigation §6BB.7 names for
+evidence, for the same reason: no check inside this crate can audit a single source's testimony
+against itself.
 
 **What `Unproven` still does not tell a host, stated rather than implied.** A bundle dropped from
 the mempool and never included leaves the funding coin UNSPENT, so the predicate above does not
 fire and the record answers `Unproven` indefinitely. This clause does not close that with a new
 chain read, and deliberately does not: the money is safe and the direction is refuse, never accept.
-What an unspent funding coin means is that **nothing was consumed and the mint is simply
-re-mintable.** A host that has resumed to `Unproven` for longer than it is willing to wait MUST
-offer the user a fresh mint (`begin_reward_distributor_mint` over the same coins) rather than a
-spinner, and MUST NOT render `Unproven` as an indefinite "pending": either the launch lands and the
-same record resumes, or the coins were never spent and a new mint costs nothing. A host that also
-holds the live `PendingRewardDistributor` can distinguish the two with `status` (§6BB.8), which is
-an optimisation, not an obligation.
+
+`Unproven` is now THREE states behind one variant, and the re-mint obligation below is true of
+exactly one of them. An earlier revision of this clause made it unconditional, and that revision
+prescribed a double spend: it was written when `Unproven` meant only "no launcher coin at all",
+and the requirement that the launcher be CONFIRMED (rule 9) later widened the variant to cover a
+launcher visible in the MEMPOOL — a live bundle, with the coins already committed to it. Its
+justifications, *"nothing was consumed"* and *"a new mint costs nothing"*, were false for that
+case from the moment the case was added. They are corrected here:
+
+| the `Unproven` a host is holding | what is true of the coins | the obligation |
+|---|---|---|
+| launcher coin ABSENT, funding coin UNSPENT | nothing was consumed; no bundle this host knows of is in flight | the re-mint obligation below applies |
+| launcher coin present but UNCONFIRMED (a mempool observation) | a live bundle already commits these coins | MUST NOT offer a re-mint; this is a wait, and the wait ends by itself |
+| funding coin SPENT but the spend not yet `MIN_CONFIRMATION_DEPTH` deep | a competing spend may or may not survive a reorg | MUST NOT offer a re-mint; resume again and let the burial rule decide |
+
+**The re-mint obligation, restricted to the arm on which it is true.** A host that has resumed to
+an `Unproven` of the FIRST kind for longer than it is willing to wait MUST offer the user a fresh
+mint rather than a spinner, and MUST NOT render it as an indefinite "pending": either the launch
+lands and the same record resumes, or the coins were never spent and a new mint costs no coins
+this host has already committed. That fresh mint MUST be `begin_reward_distributor_mint` **over
+the same coins** — this is normative, not a parenthetical illustration. The safety of the whole
+arrangement is that consensus admits at most ONE bundle spending `funding_coin_id`, so a re-mint
+that loses the race converges on `LaunchDead` for the record it replaced and the user is told
+something true. A re-mint over DIFFERENT coins abandons that: it creates a second live mint the
+first does not exclude, and the user can end up funding two distributors.
+
+**How a host tells the three apart, and why `status` is not optional.** The three arms are
+distinguishable at the source, so a host is never asked to guess. A host that still holds the live
+`PendingRewardDistributor` MUST consult `status` (§6BB.8) before offering a re-mint — it is the
+discriminator, not an optimisation, and an earlier revision of this clause demoted it wrongly. A
+host that does NOT hold one — the amnesiac restart `resume` exists to serve, and precisely the host
+for which `status` is unreachable — MUST NOT offer a re-mint on `Unproven` alone. It MUST first
+establish that the funding coin is unspent, which is the one arm the obligation covers; the
+`detail` string MUST NOT be parsed for this (§6BB.6a's typed-rejection rule), so a host that cannot
+establish it keeps waiting.
+
+**The re-mint MUST go through the reservation store.** Whatever a host concludes, the coin-level
+guard is not advisory: a fresh mint over a coin with a live in-flight spend is refused with
+`MintError::CoinsReserved`, which means "wait", not "add funds". A host MUST surface that refusal
+as the wait it is and MUST NOT retry around it — it is the last thing standing between a
+mis-timed re-mint and two bundles racing for one coin.
 
 **Both coins are SPENT at resume time, and that is the expected state.** The mint the record
 describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role

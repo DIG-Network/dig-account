@@ -213,6 +213,25 @@ fn rejection(error: MintError) -> RecordRejection {
     }
 }
 
+/// How many blocks deep the chain reports `coin_id`'s SPEND, by the same arithmetic the crate
+/// applies to an accepted confirmation: the spending block is the first of the depth.
+///
+/// Every dead-launch fixture below asserts this number rather than assuming it, because the whole
+/// verdict under test turns on which side of [`MIN_CONFIRMATION_DEPTH`] it falls.
+fn spend_depth(chain: &SimulatorChain, coin_id: Bytes32) -> u32 {
+    let spent_height = chain
+        .coin_record(coin_id)
+        .expect("a reachable chain answers")
+        .expect("the coin exists on chain")
+        .spent_height
+        .expect("the fixture reports this coin as spent");
+    let peak = chain
+        .peak_height()
+        .expect("a reachable chain answers")
+        .expect("the simulator tracks a peak");
+    peak.saturating_sub(spent_height).saturating_add(1)
+}
+
 /// Assert the rejection is `NotYours` because of exactly `expected` — matched by TYPE. Nothing
 /// here reads the `detail` prose, which is the whole point of the typed shape (`SPEC.md` §6BB.6a).
 fn assert_not_yours(error: MintError, expected: OwnershipProof) {
@@ -559,7 +578,12 @@ fn a_launcher_seen_only_in_the_mempool_is_unproven_not_a_forgery() {
 /// creates that launcher in the very block it spends the funding coin, so a different spend took
 /// it. That is §6BB.8 step 3's rule, decided here from the funding coin ALONE.
 ///
-/// Mutation: delete the `funding.is_spent()` branch in
+/// The spend is BURIED past `MIN_CONFIRMATION_DEPTH` before the verdict is asked for, and the
+/// depth is asserted rather than assumed: a terminal verdict must clear the same bar an accepted
+/// confirmation clears, and `a_funding_spend_too_shallow_to_be_final_is_unproven_not_dead` below
+/// is the other side of that line.
+///
+/// Mutation: delete the `funding.spent_height` branch in
 /// `RewardDistributorMinter::launcher_absent` and this test goes red while
 /// `a_record_whose_launch_has_not_confirmed_is_unproven_not_rejected` stays green.
 #[test]
@@ -583,9 +607,11 @@ fn a_record_whose_funding_coin_a_different_spend_took_is_dead_not_unproven() {
         "before the funding coin is taken, this record is Unproven"
     );
 
-    // A competing spend takes the funding coin. The launcher coin still does not exist, and now
-    // it never can.
+    // A competing spend takes the funding coin, and the chain builds on top of it until that spend
+    // is as deeply buried as an ACCEPTED confirmation has to be. The launcher coin still does not
+    // exist, and now it never can.
     chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
     assert!(
         chain
             .coin_record(record.funding_coin_id)
@@ -593,6 +619,12 @@ fn a_record_whose_funding_coin_a_different_spend_took_is_dead_not_unproven() {
             .expect("the funding coin exists on chain")
             .is_spent(),
         "the fixture must really report the funding coin as taken"
+    );
+    let depth = spend_depth(&chain, record.funding_coin_id);
+    assert!(
+        depth >= MIN_CONFIRMATION_DEPTH,
+        "a TERMINAL verdict is only honest on an irreversible spend, so this fixture must bury it \
+         at least {MIN_CONFIRMATION_DEPTH} deep; it is {depth}"
     );
     assert!(
         chain
@@ -621,6 +653,118 @@ fn a_record_whose_funding_coin_a_different_spend_took_is_dead_not_unproven() {
         matches!(rejected, RecordRejection::LaunchDead { .. }),
         "a spent funding coin with no launcher is a DEAD launch, and a host told 'Unproven' here \
          retries forever about coins already back in the wallet: {rejected:?}"
+    );
+}
+
+/// A funding spend too SHALLOW to be irreversible is `Unproven`, never the terminal `LaunchDead`.
+///
+/// This is the read-skew case, and it is the reason a terminal verdict needs burial at all.
+/// `resume` reads the funding coin FIRST and the launcher SECOND, so a reorg between the two — or
+/// a second peer that has not got the block — presents exactly this pair of answers about a LIVE
+/// distributor: "funding spent" and "no launcher". One block later the original bundle is
+/// re-eligible and ordinarily re-confirms. A host told `LaunchDead` has by then filed a funded
+/// distributor as terminally dead in its rejected map and invited the user to mint again over
+/// coins the first mint is about to take.
+///
+/// Nothing distinguishes that from a genuinely dead launch except DEPTH, and this crate already
+/// buries every accepted confirmation behind `MIN_CONFIRMATION_DEPTH`
+/// (`MintedDid::from_confirmed`, §6BB.7 rule (c)). The expensive direction must not be cheaper
+/// than the cheap one. Below the bar the record stays live and the host retries; above it — the
+/// test above — it is terminal.
+///
+/// Mutation: delete the depth requirement in `RewardDistributorMinter::launcher_absent` and this
+/// test goes red while `a_record_whose_funding_coin_a_different_spend_took_is_dead_not_unproven`
+/// stays green.
+#[test]
+fn a_funding_spend_too_shallow_to_be_final_is_unproven_not_dead() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    // The SAME fixture as the terminal test, stopped one block short of the bar rather than buried
+    // past it — so the verdict below moves on depth and on nothing else.
+    chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH - spend_depth(&chain, record.funding_coin_id) - 1);
+    let depth = spend_depth(&chain, record.funding_coin_id);
+    assert_eq!(
+        depth,
+        MIN_CONFIRMATION_DEPTH - 1,
+        "the fixture must sit exactly ONE block under the bar: a test that passed by being far \
+         from it would not prove the bound is the bound"
+    );
+    assert!(
+        chain
+            .coin_record(record.distributor_launcher_id)
+            .expect("a reachable chain answers")
+            .is_none(),
+        "the fixture must really be the skew pair: a spent funding coin and NO launcher coin"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a reversible spend proves nothing about the launch yet"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a spend {depth} blocks deep is still reorg-reversible, and calling it LaunchDead files a \
+         live distributor as terminally dead: {rejected:?}"
+    );
+
+    // And once the SAME spend is buried, the SAME bytes go terminal — the bar is a delay, not a
+    // different answer.
+    chain.bury(1);
+    assert_eq!(
+        spend_depth(&chain, record.funding_coin_id),
+        MIN_CONFIRMATION_DEPTH,
+        "one more block puts the spend exactly at the bar"
+    );
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a buried spend with no launcher is a dead launch"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::LaunchDead { .. }),
+        "exactly at {MIN_CONFIRMATION_DEPTH} deep the verdict is terminal: {rejected:?}"
+    );
+}
+
+/// A source that exposes NO peak cannot buy a terminal verdict: `ChainUnreachable`, not
+/// `LaunchDead`.
+///
+/// Depth is unknowable without a peak, and `LaunchDead` is the one answer that cannot be taken
+/// back. This is the same fail-closed direction `mint::did::peak_height` already takes for an
+/// accepted confirmation, applied to the rejecting side — and `ChainUnreachable` is the FOURTH
+/// outcome, outside the `RecordRejection` taxonomy entirely (§6BB.6a), so a host reads it as "ask
+/// again", never as a statement about the record.
+///
+/// Mutation: make the peak read fall back to any default instead of propagating its error, and
+/// this test goes red.
+#[test]
+fn a_dead_launch_verdict_is_refused_when_the_source_exposes_no_peak() {
+    let mut chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+    assert!(
+        spend_depth(&chain, record.funding_coin_id) >= MIN_CONFIRMATION_DEPTH,
+        "the spend is deep enough that ONLY the missing peak can stop the terminal verdict"
+    );
+
+    // The node still answers every coin read; it simply does not track a peak.
+    chain.no_peak = true;
+
+    let error = a
+        .account
+        .resume_reward_distributor(&record, &chain)
+        .expect_err("a depth that cannot be established is not a verdict");
+    assert!(
+        matches!(error, MintError::ChainUnreachable(_)),
+        "without a peak the depth is unknowable, and an unknowable depth must never license a \
+         TERMINAL LaunchDead: {error:?}"
     );
 }
 
@@ -698,6 +842,7 @@ fn dead_launch_outcome() -> Result<PendingRewardDistributor, MintError> {
     let a = funded_account(&chain, "account-a", 0x5A);
     let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
     chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
     a.account.resume_reward_distributor(&record, &chain)
 }
 

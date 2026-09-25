@@ -17,6 +17,7 @@ use dig_session::UnlockedMasterSeed;
 
 use crate::id::ProfileIx;
 use crate::keys::wallet_key::WalletKey;
+use crate::mint::did::peak_height;
 use crate::mint::error::{MintError, MintResult, OwnershipProof, RecordField, RecordRejection};
 use crate::mint::reward_distributor::{
     begin_reward_distributor_mint, manager_launcher_coin, offered_xch_settlement_coin,
@@ -25,7 +26,7 @@ use crate::mint::reward_distributor::{
 use crate::mint::reward_distributor_evidence::{
     PendingRewardDistributor, PendingRewardDistributorRecord,
 };
-use crate::mint::MintNetwork;
+use crate::mint::{MintNetwork, MIN_CONFIRMATION_DEPTH};
 use crate::session_residency::Residency;
 use crate::wallet::cat_transfer::{
     self, dig_curried_puzzle_hash, CatCoinListing, CatTransferError, CatTransferResult,
@@ -188,14 +189,19 @@ impl RewardDistributorMinter {
     ///   closed.
     /// - [`RecordRejection::Unproven`] when the distributor's launcher coin is not CONFIRMED —
     ///   absent from the chain, or present only as a mempool observation with no confirmed
-    ///   height — while the funding coin is still unspent, so the launch may yet land. See that
-    ///   variant's own docs: this is the honest answer, not a refusal.
-    /// - [`RecordRejection::LaunchDead`] when the launcher coin is absent AND `funding_coin_id`
-    ///   has been spent. An included launch creates the launcher in the very block it spends the
-    ///   funding coin, so that pairing means a different spend took the funding coin and this
-    ///   mint can never confirm. Terminal: the host stops retrying and tells the user their coins
-    ///   are back. Decided from the funding coin's `CoinRecord` — already read for the ownership
-    ///   proof — at ZERO extra chain reads, and never from `reward_cat_coin_id`.
+    ///   height — and the funding coin's own fate is not yet settled either: it is still unspent,
+    ///   or its spend is shallower than
+    ///   [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH). See that variant's own
+    ///   docs: this is the honest answer, not a refusal.
+    /// - [`RecordRejection::LaunchDead`] when the launcher coin is absent AND `funding_coin_id`'s
+    ///   spend is buried [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH) blocks
+    ///   deep. An included launch creates the launcher in the very block it spends the funding
+    ///   coin, so that pairing means a different spend took the funding coin and this mint can
+    ///   never confirm. Terminal: the host stops retrying and tells the user their coins are
+    ///   back — which is why the burial bar is the same one an ACCEPTED confirmation must clear,
+    ///   and why an unreadable peak is [`MintError::ChainUnreachable`] rather than a verdict.
+    ///   Decided from the funding coin's `CoinRecord` — already read for the ownership proof —
+    ///   plus one `peak_height`, and never from `reward_cat_coin_id`.
     ///
     /// [`MintError::ChainUnreachable`] if a read FAILS. A read failure is never a rejection:
     /// telling a user their own record is a forgery because a node was down is a lie about their
@@ -356,7 +362,9 @@ impl RewardDistributorMinter {
     ///
     /// Costs exactly **two** `coin_record` reads, both on the distributor leg. The manager leg is
     /// a derivation, and the settlement coin at the end of the distributor leg is a derivation too
-    /// — see [`resume`](Self::resume) for the shape of the chain being walked.
+    /// — see [`resume`](Self::resume) for the shape of the chain being walked. The one arm where
+    /// the launcher coin is ABSENT pays a third read, `peak_height`, for the reason
+    /// [`launcher_absent`](Self::launcher_absent) gives.
     ///
     /// `funding` is the record `prove_coin_is_ours` already proved for `record.funding_coin_id`.
     /// Only its `spent_height` is read here, and only on the arm where the launcher coin is
@@ -389,7 +397,7 @@ impl RewardDistributorMinter {
         let launcher_what = "the distributor's launcher coin";
         let Some(launcher) = Self::read_coin(chain, record.distributor_launcher_id, launcher_what)?
         else {
-            return Err(Self::launcher_absent(record, funding, launcher_what));
+            return Err(Self::launcher_absent(chain, record, funding, launcher_what));
         };
 
         // A launcher seen ONLY in the mempool is "not yet", never a forgery. Read 2 below asks for
@@ -480,42 +488,88 @@ impl RewardDistributorMinter {
     /// The answer when the distributor's launcher coin does NOT exist: `Unproven` if the launch
     /// may still land, [`RecordRejection::LaunchDead`] if it can never land.
     ///
-    /// The two are told apart by `funding.spent_height` and nothing else. A launch bundle creates
-    /// the distributor's launcher in the very block that spends `funding_coin_id`, so a SPENT
-    /// funding coin with no launcher coin means some other spend consumed it first and this mint
-    /// can never confirm — §6BB.8 step 3's proof-of-death rule, evaluated on a record already in
-    /// hand. An UNSPENT funding coin means the bundle is still in flight, or was dropped and the
-    /// mint is simply re-mintable; either way the honest answer is "ask again later".
+    /// The two are told apart by `funding.spent_height` and the BURIAL of that spend, and by
+    /// nothing else. A launch bundle creates the distributor's launcher in the very block that
+    /// spends `funding_coin_id`, so a SPENT funding coin with no launcher coin means some other
+    /// spend consumed it first and this mint can never confirm — §6BB.8 step 3's proof-of-death
+    /// rule, evaluated on a record already in hand. An UNSPENT funding coin means the bundle is
+    /// still in flight, or was dropped and the mint is simply re-mintable; either way the honest
+    /// answer is "ask again later".
+    ///
+    /// # Why a terminal verdict needs the same burial an ACCEPTED confirmation needs
+    ///
+    /// The two reads are ordered funding-first, launcher-second, so they can straddle a reorg or
+    /// two peers at different heights: "funding spent at T0" and "no launcher at T1 > T0" is a
+    /// reachable pair of answers about a LIVE distributor whose block was orphaned and will
+    /// ordinarily re-confirm. [`RecordRejection::LaunchDead`] is terminal — a host stops retrying
+    /// and tells the user their coins are back — so issuing it on a one-block-deep spend files a
+    /// funded distributor as dead and invites a second mint over coins the first one will take.
+    ///
+    /// This crate already buries every ACCEPTED confirmation behind
+    /// [`MIN_CONFIRMATION_DEPTH`](crate::mint::MIN_CONFIRMATION_DEPTH)
+    /// (`MintedDid::from_confirmed`, §6BB.7's rule (c)); the expensive direction must not be
+    /// cheaper. Below that depth the spend is still reversible, so the answer is `Unproven` — ask
+    /// again later — and the record stays live. The one extra read this costs is
+    /// [`peak_height`](crate::mint::did::peak_height), on a rare arm, and it FAILS CLOSED: a
+    /// source with no peak yields [`MintError::ChainUnreachable`], because an unknowable depth
+    /// must never license a terminal verdict.
     ///
     /// `reward_cat_coin_id` is deliberately NOT consulted: it is bound only as "a $DIG coin of
     /// this account's" (`SPEC.md` §6BB.6a rule 7), so deciding death from it would let a user's
     /// own wrong CAT id declare a live mint dead. The funding coin is bound to this launch by
     /// rules 8 and 9.
-    fn launcher_absent(
+    fn launcher_absent<C>(
+        chain: &C,
         record: &PendingRewardDistributorRecord,
         funding: &CoinRecord,
         launcher_what: &str,
-    ) -> MintError {
+    ) -> MintError
+    where
+        C: ChainSource + ?Sized,
+    {
         let launcher_id = hex::encode(record.distributor_launcher_id);
-        if funding.is_spent() {
-            return MintError::RecordRejected(RecordRejection::LaunchDead {
+        let funding_id = hex::encode(record.funding_coin_id);
+
+        let Some(spent_height) = funding.spent_height else {
+            return MintError::RecordRejected(RecordRejection::Unproven {
                 detail: format!(
-                    "{launcher_what} {launcher_id} does not exist on chain, yet funding coin {} \
-                     has been spent; an included launch creates that launcher in the same block \
-                     it spends the funding coin, so a different spend took it and this mint can \
-                     never confirm. The coins are back in this account's wallet; mint again \
-                     rather than retrying this record",
-                    hex::encode(record.funding_coin_id)
+                    "{launcher_what} {launcher_id} does not exist on chain and funding coin \
+                     {funding_id} is still unspent, so nothing yet ties this distributor to this \
+                     account's funding coin and the launch may still confirm; resume again once \
+                     it does"
+                ),
+            });
+        };
+
+        let peak = match peak_height(chain) {
+            Ok(peak) => peak,
+            Err(unreachable) => return unreachable,
+        };
+
+        // `peak - spent` is the number of blocks built ON TOP; the spending block is the first of
+        // the depth, hence the +1. `saturating_sub` also gives a spend height in the FUTURE a
+        // depth of 1, so a source claiming one cannot buy a terminal verdict with it.
+        let depth = peak.saturating_sub(spent_height).saturating_add(1);
+        if depth < MIN_CONFIRMATION_DEPTH {
+            return MintError::RecordRejected(RecordRejection::Unproven {
+                detail: format!(
+                    "{launcher_what} {launcher_id} does not exist on chain and funding coin \
+                     {funding_id} was spent at height {spent_height}, only {depth} block(s) under \
+                     a peak of {peak}; a spend that shallow is still reversible, and the two reads \
+                     can straddle a reorg, so this is not yet proof the launch is dead; resume \
+                     again once the spend is {MIN_CONFIRMATION_DEPTH} blocks deep"
                 ),
             });
         }
 
-        MintError::RecordRejected(RecordRejection::Unproven {
+        MintError::RecordRejected(RecordRejection::LaunchDead {
             detail: format!(
-                "{launcher_what} {launcher_id} does not exist on chain and funding coin {} is \
-                 still unspent, so nothing yet ties this distributor to this account's funding \
-                 coin and the launch may still confirm; resume again once it does",
-                hex::encode(record.funding_coin_id)
+                "{launcher_what} {launcher_id} does not exist on chain, yet funding coin \
+                 {funding_id} has been spent at height {spent_height} and buried {depth} blocks \
+                 deep; an included launch creates that launcher in the same block it spends the \
+                 funding coin, so a different spend took it and this mint can never confirm. The \
+                 coins are back in this account's wallet; mint again rather than retrying this \
+                 record"
             ),
         })
     }
