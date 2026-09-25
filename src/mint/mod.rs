@@ -49,11 +49,12 @@ pub use coinset_push::{
     COINSET_MAINNET_PUSH_URL,
 };
 pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
-pub use error::{MintError, MintResult};
+pub use error::{MintError, MintResult, OwnershipProof, RecordField, RecordRejection};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use profile::ProfileMintStatus;
 pub use reward_distributor_evidence::{
-    ConfirmedRewardDistributor, PendingRewardDistributor, RewardDistributorStatus,
+    ConfirmedRewardDistributor, PendingRewardDistributor, PendingRewardDistributorRecord,
+    RewardDistributorStatus,
 };
 pub use seed::ProfileSeed;
 pub use status::MintStatus;

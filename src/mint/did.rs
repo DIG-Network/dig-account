@@ -325,7 +325,7 @@ where
 /// A source that does not expose a peak (`Ok(None)`) is not an absence to work around: without a
 /// peak, a claimed confirmation height cannot be bounded, so the mint refuses to evaluate evidence
 /// at all rather than accept an unbounded one.
-pub(super) fn peak_height<C>(chain: &C) -> MintResult<u32>
+pub(crate) fn peak_height<C>(chain: &C) -> MintResult<u32>
 where
     C: ChainSource + ?Sized,
 {

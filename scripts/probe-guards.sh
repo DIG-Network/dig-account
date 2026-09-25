@@ -248,6 +248,42 @@ probe "G24 the confirmation-prompt ceiling" $E \
   'if prompts.len() as u64 >= u64::from(self.auto_send.max_confirmations_per_period) {' \
   'if false {'
 
+# ------------------------------------------- the resumed reward-distributor mint's terminal verdict
+#
+# `RecordRejection::LaunchDead` is the one answer this crate gives that a host cannot take back: it
+# tells a user their coins are back and to mint again. Everything standing between a live distributor
+# and that answer is probed here, because a guard proved only by its own test's narration is a guard
+# nothing keeps load-bearing after the next refactor.
+
+R=src/reward_distributor_mint.rs
+
+probe "G26 a launcher seen only in the MEMPOOL is not walked" $R \
+  'if launcher.confirmed_height.is_none() {' \
+  'if false {'
+
+probe "G27 a terminal LaunchDead needs MIN_CONFIRMATION_DEPTH burial" $R \
+  'if depth < MIN_CONFIRMATION_DEPTH {' \
+  'if false {'
+
+probe "G28 an unknowable peak refuses rather than assuming one" $R \
+  'let peak = match peak_height(chain) {
+            Ok(peak) => peak,
+            Err(unreachable) => return unreachable,
+        };' \
+  'let peak = peak_height(chain).unwrap_or(0);'
+
+probe "G29 a funding record with no creation height is not evidence" $R \
+  'let Some(created_at) = funding.confirmed_height else {' \
+  'let Some(created_at) = funding.confirmed_height.or(Some(1)) else {'
+
+probe "G30 a creation height in genesis is not evidence" $R \
+  'if created_at == 0 {' \
+  'if false {'
+
+probe "G31 a spend height predating the coin is not evidence" $R \
+  'if spent_height < created_at {' \
+  'if false {'
+
 echo
 echo "SUMMARY: $misses pattern-miss, $inconclusive inconclusive, $vacuous vacuous"
 if [ $((misses + inconclusive + vacuous)) -ne 0 ]; then

@@ -142,6 +142,12 @@ fn amounts_convert_to_whole_dig_and_thousandths() {
 ///
 /// A divergence would not fail loudly: `cat_transfer` would keep paying the old id while a
 /// distributor's reserve expected the new one, and a wallet holding "$DIG" could not fund a mint.
+///
+/// `RewardDistributorMinter::resume` (§6BB.6a rule 8) is the sharpest consumer of this agreement:
+/// it measures a persisted record's reward CAT coin against `dig_curried_puzzle_hash(p2)`, which
+/// is the 0.11.1 line, while the mint that produced that coin was gated against the 0.13.1 line.
+/// Divergence would make `resume` reject every legitimate record. Both the raw ids and the CURRIED
+/// hashes are pinned below, because the curried hash is the value actually compared.
 #[test]
 fn both_dig_constants_lines_agree_on_the_dig_asset_id() {
     let reserve_asset_id = dig_rewards_coin::dig_distributor_constants(
@@ -158,5 +164,11 @@ fn both_dig_constants_lines_agree_on_the_dig_asset_id() {
         reserve_asset_id,
         Bytes32::from(DIG_ASSET_ID),
         "the $DIG asset id this crate PAYS with (dig-constants 0.11.1, via cat_transfer) and the one a reward distributor's reserve REQUIRES (dig-constants 0.13.1, via dig-rewards-coin) have diverged; every $DIG balance this crate shows is then about a different asset than the one a distributor mint will accept"
+    );
+
+    assert_eq!(
+        dig_curried_puzzle_hash(P2),
+        cat_curried_puzzle_hash(reserve_asset_id, P2),
+        "the curried hash `resume` measures a record's reward CAT coin against is not the one a distributor's reserve asset id produces; `resume` would reject every legitimate record"
     );
 }

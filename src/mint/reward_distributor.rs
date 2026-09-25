@@ -7,10 +7,25 @@
 //! 1. a **manager singleton** is launched — its launcher id is curried into the distributor's
 //!    action puzzles and can never be rotated, so it must exist before the constants table does;
 //! 2. the wallet's XCH funding coin pays the offer mojo, the manager singleton's mojo and the fee;
-//! 3. the wallet's $DIG CAT coin is locked to the settlement puzzle, which is what an `Offer` IS at
-//!    the byte level;
+//! 3. the wallet's $DIG CAT coin is spent WHOLE into the settlement puzzle — which is what an
+//!    `Offer` IS at the byte level;
 //! 4. `launch_dig_distributor` consumes that offer and stages the launcher, the eve singleton, the
 //!    reserve CAT and the ephemeral security coin.
+//!
+//! # The launch creates an EMPTY reserve, and refunds the offered CAT WHOLE
+//!
+//! This is the property a mint request cannot change, so there is deliberately no knob for it.
+//! `chia-sdk-driver` 0.36.0's `launch_reward_distributor`
+//! (`src/primitives/action_layer/launch_drivers.rs:660-667`) spends the offered CAT into an interim
+//! coin whose quoted puzzle makes exactly two creations: the reserve coin at the distributor's
+//! `P2DelegatedBySingletonLayer` hash with the **literal amount `0`**, and a refund of the WHOLE
+//! `total_cat_amount` to `constants.fee_payout_puzzle_hash`. This seam builds those constants with
+//! this wallet's own puzzle hash (§6BB.3a clause 1), so every base unit offered comes straight back
+//! to the caller in one hinted $DIG coin.
+//!
+//! A distributor is therefore FUNDED after launch, never at it: the funding act is
+//! `commit_incentives_for_distributor_epoch`, which is a separate spend this seam does not make.
+//! The amount offered here changes no byte of the distributor that results.
 //!
 //! # What this module exists to close
 //!
@@ -39,7 +54,7 @@ use chia_wallet_sdk::chia::consensus::consensus_constants::ConsensusConstants;
 use chia_wallet_sdk::clvm_traits::{clvm_quote, ToClvm};
 use chia_wallet_sdk::driver::{Cat, Offer, SingleCatSpend, Spend, SpendContext, StandardLayer};
 use chia_wallet_sdk::prelude::{Conditions, Memos};
-use chia_wallet_sdk::puzzles::SETTLEMENT_PAYMENT_HASH;
+use chia_wallet_sdk::puzzles::{SETTLEMENT_PAYMENT_HASH, SINGLETON_LAUNCHER_HASH};
 use chia_wallet_sdk::signer::RequiredSignature;
 use clvmr::{NodePtr, SExp};
 use dig_chainsource_interface::{ChainSource, CoinRecord};
@@ -63,6 +78,37 @@ use crate::mint::reward_distributor_evidence::{
 /// XCH coin: a caller-chosen amount would change the security coin's identity for no gain.
 pub const OFFER_XCH_AMOUNT: u64 = 1;
 
+/// The XCH settlement coin this launch's funding spend creates, derived from the funding coin id.
+///
+/// The funding spend's `create_coin(SETTLEMENT_PAYMENT_HASH, OFFER_XCH_AMOUNT, Memos::None)` in
+/// `build_and_sign_reward_distributor_launch` is what produces it, and every input to its identity
+/// — parent, puzzle hash, amount — is fixed by this module. It lives here, beside that
+/// `create_coin`, so a change to either moves both: `reward_distributor_mint::resume` re-derives
+/// this coin to prove that a persisted record's distributor launcher really descends from the
+/// funding coin (`SPEC.md` §6BB.6a).
+pub(crate) fn offered_xch_settlement_coin(funding_coin_id: Bytes32) -> Coin {
+    Coin::new(
+        funding_coin_id,
+        SETTLEMENT_PAYMENT_HASH.into(),
+        OFFER_XCH_AMOUNT,
+    )
+}
+
+/// The manager singleton's launcher coin, derived from the funding coin id — **no chain read**.
+///
+/// `launch_manager_singleton` passes `request.funding.coin_id()` straight to
+/// `Launcher::new(parent_coin_id, MANAGER_SINGLETON_AMOUNT_MOJOS)`, which is
+/// `Coin::new(parent, SINGLETON_LAUNCHER_HASH, amount)` (`chia-sdk-driver` 0.36.0
+/// `src/primitives/launcher.rs:38-43`). So `manager_launcher_id` is a pure function of the funding
+/// coin, and `resume` can check it against a record without asking the chain anything at all.
+pub(crate) fn manager_launcher_coin(funding_coin_id: Bytes32) -> Coin {
+    Coin::new(
+        funding_coin_id,
+        SINGLETON_LAUNCHER_HASH.into(),
+        MANAGER_SINGLETON_AMOUNT_MOJOS,
+    )
+}
+
 /// Everything one reward-distributor mint needs that this crate cannot derive.
 ///
 /// A struct rather than nine positional arguments: `funding` and `reward_cat` are both coins and
@@ -77,8 +123,13 @@ pub struct RewardDistributorMintRequest {
     /// A confirmed XCH coin at THIS wallet's puzzle hash, paying the offer mojo, the manager
     /// singleton's mojo and `fee`.
     pub funding: Coin,
-    /// The $DIG CAT coin whose whole amount becomes the distributor's reserve. Its p2 puzzle hash
-    /// must be this wallet's, or nothing is built.
+    /// The $DIG CAT coin the launch offer carries. Its p2 puzzle hash must be this wallet's, and
+    /// its asset id must be $DIG, or nothing is built.
+    ///
+    /// **The whole coin is offered and the whole coin comes back.** The launch creates the
+    /// distributor's reserve coin with the literal amount `0` and refunds `total_cat_amount` to
+    /// this wallet — see the module docs. There is deliberately no field naming an amount, because
+    /// no amount a caller could name would change the distributor that results.
     pub reward_cat: Cat,
     /// The manager singleton's inner puzzle. **Permanent after launch**: if its key is lost the
     /// entry set freezes forever, so there is no default and the caller must choose.
@@ -129,9 +180,6 @@ pub struct SignedRewardDistributorMint {
     reward_cat_coin_id: Bytes32,
     /// The generation (`store_id:root`) this launch's comment advertises, echoed from the request.
     generation: LaunchComment,
-    /// The reward CAT coin's amount, echoed from the request. See the accessor for why the name
-    /// carries `requested`.
-    requested_reserve_base_units: u64,
     /// The launch's ephemeral security-coin key, kept ONLY under `cfg(test)`.
     ///
     /// The mutation proofs have to rebuild this bundle's signature while omitting exactly one
@@ -172,17 +220,6 @@ impl SignedRewardDistributorMint {
         self.manager_launcher_id
     }
 
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve: the reward CAT
-    /// coin's amount, read back from the request.
-    ///
-    /// Named for what it is. It is not an observation of the launched distributor's reserve state,
-    /// and nothing here could make it one — no reserve exists until this bundle confirms. A caller
-    /// wanting the reserve as it ended up must read the confirmed distributor from the chain.
-    #[must_use]
-    pub const fn requested_reserve_base_units(&self) -> u64 {
-        self.requested_reserve_base_units
-    }
-
     /// The launch's ephemeral security-coin key. See the field's own docs for why this is
     /// `cfg(test)` and nothing else.
     #[cfg(test)]
@@ -219,7 +256,6 @@ impl SignedRewardDistributorMint {
             self.manager_launcher_id,
             self.funding_coin_id,
             self.reward_cat_coin_id,
-            self.requested_reserve_base_units,
             self.generation,
             pushed_at_height,
         ))
@@ -542,7 +578,7 @@ fn build_and_sign_reward_distributor_launch(
         ));
     }
 
-    // Step 4: the whole reward CAT to the settlement puzzle. This is the offer's CAT half.
+    // Step 4: the reward CAT, whole, to the settlement puzzle. This is the offer's CAT half.
     spend_reward_cat_into_settlement(&mut ctx, wallet, request.reward_cat)?;
 
     // Step 5: split the two offer spends out of the context and put everything else back.
@@ -645,7 +681,6 @@ fn build_and_sign_reward_distributor_launch(
         funding_coin_id,
         reward_cat_coin_id,
         generation: request.generation,
-        requested_reserve_base_units: request.reward_cat.coin.amount,
         #[cfg(test)]
         security_coin_secret_key: launched.security_coin_secret_key,
     })
@@ -748,23 +783,38 @@ fn verify_aggregate_discharges(
     Ok(())
 }
 
-/// Locks the whole reward CAT to the settlement puzzle — the CAT half of the launch offer.
+/// Locks the reward CAT — WHOLE — to the settlement puzzle: the CAT half of the launch offer.
 ///
 /// The CAT is spent through the SDK's own `Cat::spend` with a delegated inner spend from
 /// [`StandardLayer`], never a hand-rolled p2 spend: a bespoke CAT spend here is exactly the class of
 /// custody bug `src/wallet/money_signer.rs` exists to keep out of this crate.
+///
+/// # There is no change coin here, because the refund is the launch's job
+///
+/// The whole coin goes into the offer and `launch_dig_distributor` creates the reserve EMPTY and
+/// refunds `total_cat_amount` to `constants.fee_payout_puzzle_hash` — this wallet's own puzzle
+/// hash, hinted by the driver (`chia-sdk-driver` 0.36.0
+/// `src/primitives/action_layer/launch_drivers.rs:660-667`). A change coin split off HERE would
+/// only divide the caller's own money into two of the caller's own coins for no gain, and the
+/// distributor would be byte-identical either way. The production read that finds the refund is
+/// `wallet::cat_transfer::dig_cat_coins` (§6G).
+///
+/// The amount is read off the coin actually being spent, never from a denomination table or a
+/// compiled-in constant (CLAUDE.md §2.6 clause 2).
 fn spend_reward_cat_into_settlement(
     ctx: &mut SpendContext,
     wallet: &WalletKey,
     reward_cat: Cat,
 ) -> MintResult<()> {
-    let inner_puzzle = clvm_quote!(Conditions::new().create_coin(
+    let conditions = Conditions::new().create_coin(
         SETTLEMENT_PAYMENT_HASH.into(),
         reward_cat.coin.amount,
-        Memos::None
-    ))
-    .to_clvm(ctx)
-    .map_err(|e| MintError::Build(format!("CAT settlement puzzle: {e}")))?;
+        Memos::None,
+    );
+
+    let inner_puzzle = clvm_quote!(conditions)
+        .to_clvm(ctx)
+        .map_err(|e| MintError::Build(format!("CAT settlement puzzle: {e}")))?;
 
     let p2_spend = StandardLayer::new(wallet.public_key())
         .delegated_inner_spend(
@@ -1065,7 +1115,6 @@ mod status_tests {
             Bytes32::new([0x22; 32]),
             Bytes32::new([0x33; 32]),
             Bytes32::new([0x44; 32]),
-            1_000,
             generation(1),
             PUSHED_AT,
         )

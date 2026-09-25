@@ -6,13 +6,13 @@ error: cannot construct `PendingRewardDistributor` with struct literal syntax du
 14 |         distributor_launcher_id: [0u8; 32].into(),
    |         ----------------------------------------- private field
    |
-   = note: ...and other private fields `manager_launcher_id`, `funding_coin_id`, `reward_cat_coin_id`, `requested_reserve_base_units`, `generation` and `pushed_at_height` that were not provided
+   = note: ...and other private fields `manager_launcher_id`, `funding_coin_id`, `reward_cat_coin_id`, `generation` and `pushed_at_height` that were not provided
 help: you might have meant to use the `new` associated function
    |
 13 -     let _pending_literal = PendingRewardDistributor {
 14 -         distributor_launcher_id: [0u8; 32].into(),
 15 -     };
-13 +     let _pending_literal = PendingRewardDistributor::new(_, _, _, _, _, _, _);
+13 +     let _pending_literal = PendingRewardDistributor::new(_, _, _, _, _, _);
    |
 
 error: cannot construct `ConfirmedRewardDistributor` with struct literal syntax due to private fields
@@ -23,7 +23,7 @@ error: cannot construct `ConfirmedRewardDistributor` with struct literal syntax 
 18 |         distributor_launcher_id: [0u8; 32].into(),
    |         ----------------------------------------- private field
    |
-   = note: ...and other private fields `manager_launcher_id`, `confirmed_height`, `generation` and `requested_reserve_base_units` that were not provided
+   = note: ...and other private fields `manager_launcher_id`, `confirmed_height` and `generation` that were not provided
 
 error[E0624]: associated function `new` is private
   --> tests/compile_fail/a_distributor_needs_chain_evidence.rs:22:31
@@ -42,7 +42,7 @@ error[E0624]: associated function `new` is private
    | |     ) -> Self {
    | |_____________- private associated function defined here
 
-error[E0061]: this function takes 7 arguments but 0 arguments were supplied
+error[E0061]: this function takes 6 arguments but 0 arguments were supplied
   --> tests/compile_fail/a_distributor_needs_chain_evidence.rs:22:5
    |
 22 |     PendingRewardDistributor::new();
@@ -55,8 +55,8 @@ note: associated function defined here
    |                   ^^^
 help: provide the arguments
    |
-22 |     PendingRewardDistributor::new(/* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* u64 */, /* dig_rewards_coin::comment::LaunchComment */, /* u32 */);
-   |                                   ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+22 |     PendingRewardDistributor::new(/* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* dig_rewards_coin::comment::LaunchComment */, /* u32 */);
+   |                                   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 error[E0624]: associated function `from_confirmed` is private
   --> tests/compile_fail/a_distributor_needs_chain_evidence.rs:23:33

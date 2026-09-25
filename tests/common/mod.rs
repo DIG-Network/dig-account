@@ -51,6 +51,19 @@ pub struct SimulatorChain {
     /// Coin ids this node reports as SPENT, whatever the simulator holds — how a node answers once
     /// some other spend has consumed a coin.
     pub spent_elsewhere: RefCell<Vec<Bytes32>>,
+    /// Coin ids this node reports as spent at a height the CHAIN CANNOT HAVE PRODUCED, paired with
+    /// that height — a source zero-filling `spent_block_index` instead of nulling it (so an UNSPENT
+    /// coin reads as `Some(0)`), or one placing a spend before the coin it spends existed.
+    ///
+    /// Distinct from [`spent_elsewhere`](Self::spent_elsewhere), which reports an HONEST spend:
+    /// there the height is the coin's own confirmed height, and no floor can tell it from real
+    /// evidence. Only a source that can lie about the NUMBER exercises the floor.
+    pub spent_at_fabricated_height: RefCell<Vec<(Bytes32, u32)>>,
+    /// Coin ids whose CONFIRMED height this node misreports, paired with what it reports — `None`
+    /// for a source that serves a coin record with no creation height at all, `Some(0)` for one
+    /// that places the creation in genesis. Both are heights no chain produced for a coin it is
+    /// also serving a spend for.
+    pub confirmed_height_override: RefCell<Vec<(Bytes32, Option<u32>)>>,
     /// How many bundles this node has ACCEPTED into its mempool, counted for the lifetime of the
     /// double rather than drained by [`farm`](Self::farm).
     ///
@@ -80,6 +93,8 @@ impl SimulatorChain {
             no_peak: false,
             mempool_observed: RefCell::new(Vec::new()),
             spent_elsewhere: RefCell::new(Vec::new()),
+            spent_at_fabricated_height: RefCell::new(Vec::new()),
+            confirmed_height_override: RefCell::new(Vec::new()),
             pushes: RefCell::new(0),
             accepted: RefCell::new(Vec::new()),
             push_attempts: RefCell::new(0),
@@ -93,6 +108,23 @@ impl SimulatorChain {
     /// Make this node report `coin_id` as spent — a different spend got there first.
     pub fn report_spent(&self, coin_id: Bytes32) {
         self.spent_elsewhere.borrow_mut().push(coin_id);
+    }
+
+    /// Make this node report `coin_id` as spent at `height`, whatever the simulator holds — the
+    /// one thing a real source can get wrong that no downstream check can detect from the value
+    /// alone.
+    pub fn report_spent_at(&self, coin_id: Bytes32, height: u32) {
+        self.spent_at_fabricated_height
+            .borrow_mut()
+            .push((coin_id, height));
+    }
+
+    /// Make this node report `coin_id`'s CONFIRMED height as `height`, whatever the simulator
+    /// holds — the other half of the pair a burial depth is computed from.
+    pub fn report_confirmed_at(&self, coin_id: Bytes32, height: Option<u32>) {
+        self.confirmed_height_override
+            .borrow_mut()
+            .push((coin_id, height));
     }
 
     /// Make this node report `coin` the way a mempool-aware node reports a coin it has seen but no
@@ -205,6 +237,22 @@ impl ChainSource for SimulatorChain {
             let mut record = CoinRecord::from_coin_state(state);
             if self.spent_elsewhere.borrow().contains(&coin_id) {
                 record.spent_height = record.confirmed_height;
+            }
+            if let Some((_, height)) = self
+                .spent_at_fabricated_height
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == coin_id)
+            {
+                record.spent_height = Some(*height);
+            }
+            if let Some((_, height)) = self
+                .confirmed_height_override
+                .borrow()
+                .iter()
+                .find(|(id, _)| *id == coin_id)
+            {
+                record.confirmed_height = *height;
             }
             return Ok(Some(record));
         }

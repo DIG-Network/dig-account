@@ -1663,10 +1663,26 @@ ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never
 ## 6BB. The reward-distributor mint (`begin_reward_distributor_mint`)
 
 `begin_reward_distributor_mint` is the ONLY path by which this crate signs a DIG reward-distributor
-launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH
-funding coin and the whole $DIG reserve CAT, both locked to the settlement puzzle), the distributor
-launcher, the eve singleton, the reserve CAT and the launch's ephemeral security coin — into ONE
-`SpendContext`, and returns a `SignedRewardDistributorMint` or an error.
+launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH funding
+coin, with its change returned to the wallet, and the $DIG reward CAT WHOLE, both locked to the
+settlement puzzle), the distributor launcher, the eve singleton, the reserve CAT and the launch's
+ephemeral security coin — into ONE `SpendContext`, and returns a `SignedRewardDistributorMint` or an
+error.
+
+**The launch creates an EMPTY reserve and refunds the offered CAT whole.** This is a property of
+the launch driver, not a choice this seam makes: `chia-sdk-driver` 0.36.0's
+`launch_reward_distributor` (`src/primitives/action_layer/launch_drivers.rs:660-667`) spends the
+offered CAT into an interim coin whose quoted puzzle makes exactly two creations — the reserve coin
+at the distributor's `P2DelegatedBySingletonLayer` hash with the **literal amount `0`**, and a
+refund of the WHOLE `total_cat_amount` to `constants.fee_payout_puzzle_hash`, which §6BB.3a clause 1
+fixes to this wallet's own puzzle hash. A distributor is therefore FUNDED after launch, never at
+it: the funding act is `commit_incentives_for_distributor_epoch`, a separate spend this seam does
+not make.
+
+Consequently `RewardDistributorMintRequest` carries NO field naming a reserve amount, and MUST NOT
+gain one. No amount a caller could name would change a byte of the distributor that results; a
+field that appeared to size the reserve and did not would be a false statement about money in the
+type system, and a doc apologising for it would be the tell that the type is wrong.
 
 ### 6BB.1 The bundle is complete or there is no bundle
 
@@ -1722,6 +1738,11 @@ and the seam MUST state that refusal ITSELF. Today a wrong-asset CAT also fails 
 `chia-sdk-driver`'s offer lookup, so no bundle is built — but that is a transitive crate's internal
 behaviour at a caret range, and it names the driver's problem rather than the caller's.
 
+The reward CAT is offered WHOLE. There is no reserve-amount refusal because there is no reserve
+amount: see the §6BB intro. The amount written into the settlement creation MUST be read off the
+coin actually being spent, never from a denomination table or any compiled-in constant (CLAUDE.md
+§2.6 clause 2).
+
 The request's `distributor_epoch_seconds` MUST be non-zero, and the seam MUST state that
 refusal ITSELF, before anything is staged. A zero epoch length is an epoch that can never
 advance; today `dig-rewards-coin`'s constants builder also refuses it, but that is a transitive
@@ -1743,6 +1764,25 @@ understood by any host building a flow on this seam.
    lifetime.** The manager singleton's launcher id is curried into the distributor's action puzzles
    and can never be rotated. There is deliberately no default: if the key behind that inner puzzle
    is lost, the distributor's entry set freezes forever.
+
+### 6BB.3b The offered CAT comes home WHOLE, and it MUST be findable
+
+The reward CAT's spend makes exactly ONE creation: the whole coin to the settlement puzzle. The
+money comes back one step later, from the launch itself.
+
+1. This seam MUST NOT split a CAT change coin off here. The launch refunds `total_cat_amount` to
+   `constants.fee_payout_puzzle_hash` — this wallet — and a change coin created here would only
+   divide the caller's own money into two of the caller's own coins while leaving the distributor
+   byte-identical.
+2. The refund MUST be findable at this wallet's $DIG puzzle hash. The launch driver hints it
+   (`launch_drivers.rs:660-667`), and the production read that finds it is
+   `wallet::cat_transfer::dig_cat_coins` (§6G). An acceptance test MUST discover the refunded
+   amount through a chain read at that puzzle hash rather than by finding a coin of the right
+   amount inside the bundle, and MUST separately assert that `read_distributor` reports a reserve
+   of **zero** immediately post-launch — a source read of the driver is a hypothesis, and only the
+   chain read is evidence.
+
+`begin_reward_distributor_mint`'s signature is unchanged by this.
 
 ### 6BB.4 Building and signing are one function
 
@@ -1789,7 +1829,6 @@ built from, and one peak read — never from a chain answer, so a chain source c
 | `manager_launcher_id` | `Bytes32` | the bundle's own spends (= `predicted_manager_launcher_id()`) |
 | `funding_coin_id` | `Bytes32` | `RewardDistributorMintRequest::funding.coin_id()` |
 | `reward_cat_coin_id` | `Bytes32` | `RewardDistributorMintRequest::reward_cat.coin.coin_id()` |
-| `requested_reserve_base_units` | `u64` | the reward CAT's amount in $DIG base units (1 $DIG = 1,000 base units); a REQUEST, not a reserve |
 | `generation` | `LaunchComment` | `RewardDistributorMintRequest::generation` — the `store_id:root` the launch comment advertises |
 | `pushed_at_height` | `u32` | the chain's peak, read immediately BEFORE the push |
 
@@ -1806,6 +1845,313 @@ This seam keeps NO journal and NO registry. The profile mint's journal (§6B.2) 
 two-bundle ceremony resumable; a distributor mint is one bundle with one confirmation, and the host
 (dig-app) owns whatever persistence its flow needs. `PendingRewardDistributor` is `Clone +
 PartialEq + Eq + Debug` so a host can hold, compare and log it; this crate does not serialise it.
+
+### 6BB.6a `PendingRewardDistributorRecord` — resuming a mint the host persisted (normative)
+
+§6BB.6 above stands unchanged: the seam keeps no journal, and the host owns whatever persistence
+its flow needs. This clause states the FORM that persistence takes and the ONE door back.
+
+`PendingRewardDistributorRecord` is a serialisable MIRROR of `PendingRewardDistributor`: `Serialize,
+Deserialize, Clone, Debug, PartialEq, Eq`, `#[serde(deny_unknown_fields)]`, with public fields
+mirroring the §6BB.6 table one-for-one and `generation` in its canonical launch-comment STRING form
+(`LaunchComment`'s `Display`), so the persisted bytes are the same text the launch comment carries
+on chain. It is produced only by `From<&PendingRewardDistributor>`.
+
+**A record is not evidence, and there is deliberately no conversion back from one alone.** There is
+no `From<PendingRewardDistributorRecord> for PendingRewardDistributor` and there MUST never be one,
+for the reason the DID journal states in its own words (`src/registry/journal.rs`): *a file is not a
+chain*. `PendingRewardDistributor::new` stays crate-private; §6BB.6's paragraph on why a public
+constructor is refused applies to a bare record conversion identically, because a record naming
+ANOTHER account's distributor is internally perfect. Both launcher ids and the generation are
+chain-readable by anyone; the two coin ids need only be distinct and non-zero. Every
+internal-consistency check such a record could face passes.
+
+**The one door back is `RewardDistributorMinter::resume(record, chain)`**, with the named facades
+`UnlockedAccount::resume_reward_distributor` and `resume_reward_distributor_at(ix, ...)` delegating
+to it unchanged. It lives on the minter and nowhere else because the minter is the only type that
+holds the seed, and therefore the only type that can derive the puzzle hashes a record must be
+measured against. Proving a record exists is not proving it is yours.
+
+`resume` returns `MintError::Locked` — raised BEFORE any derivation, as on every other method of that
+type — if the account has relocked. Otherwise it refuses with
+`MintError::RecordRejected(RecordRejection)`, typed by the taxonomy table below, unless ALL of the
+following hold. It MUST NOT refuse with `MintError::Refused`: that is §6BB's pre-signing gate and
+keeps meaning *this account will not sign that*, while a host routes a rejected RECORD by matching
+the variant. An earlier revision of this clause said `Refused` here; the taxonomy is what the code
+implements and what a host may rely on.
+
+**Internal consistency.** Nothing is read from the chain for any of these.
+
+1. None of `distributor_launcher_id`, `manager_launcher_id`, `funding_coin_id`,
+   `reward_cat_coin_id` is all-zero.
+2. `funding_coin_id != reward_cat_coin_id` — a mint spends two DISTINCT pre-existing inputs
+   (§6BB.3 rule 2).
+3. `distributor_launcher_id != manager_launcher_id` — a launch creates two DISTINCT singletons
+   (§6BB.3a).
+4. `pushed_at_height != 0` — no bundle is pushed at genesis.
+5. `generation` parses as a `LaunchComment`.
+
+**The coins are this account's.**
+
+6. `chain.coin_record(funding_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals this
+   profile's wallet puzzle hash.
+7. `chain.coin_record(reward_cat_coin_id)` is `Some`, and that record's `coin.puzzle_hash` equals
+   the $DIG CAT-CURRIED hash for this profile's wallet puzzle hash
+   (`CatArgs::curry_tree_hash(DIG_ASSET_ID, p2)`, §6G) — never the raw p2 hash, which is not where
+   a CAT lives.
+
+**The coins are the coins that produced THIS launch.** Rules 6 and 7 alone do NOT establish
+ownership of the distributor, and a version of this clause that stopped there was exploitable.
+
+Rules 6 and 7 are the same predicate `begin_reward_distributor_mint` applies to the request it
+builds from (§6BB.3) — but matching that predicate does not reproduce what `begin` has.
+`begin` DERIVES both launcher ids from the bundle it builds, so its coins are bound to the object
+by construction; a record carries the launcher ids as data and binds them to nothing. Both launcher
+ids and the generation are chain-readable by anyone, so an attacker pairs a victim's launcher ids
+and generation with two coins of her OWN, passes rules 1-7, and `status` hands her a
+`ConfirmedRewardDistributor` for a distributor she never funded. **Ownership MUST therefore mean
+both: these coins are mine, AND they are the coins that produced this launcher.**
+
+The binding is re-established by walking the launch's own ancestry back to `funding_coin_id`, in
+the shape §6BB's build produces it:
+
+8. `manager_launcher_id` MUST equal `Coin::new(funding_coin_id, SINGLETON_LAUNCHER_HASH,
+   MANAGER_SINGLETON_AMOUNT_MOJOS).coin_id()`. `launch_manager_singleton` passes the funding coin
+   id straight to `Launcher::new`, so this is a pure derivation and MUST cost **no chain read**.
+9. `distributor_launcher_id`'s launcher coin MUST be CONFIRMED — its `CoinRecord` MUST carry a
+   `confirmed_height` — and MUST trace back to `funding_coin_id`: its `parent_coin_info` is the
+   launch's ephemeral security coin, whose own `parent_coin_info` MUST equal
+   `Coin::new(funding_coin_id, SETTLEMENT_PAYMENT_HASH, OFFER_XCH_AMOUNT).coin_id()`. This
+   costs exactly **two** `coin_record` reads — the launcher coin and the security coin — because
+   the security coin's identity depends on a random key the mint discarded. The settlement coin at
+   the end MUST be DERIVED, not read: every input to its identity is fixed by §6BB's build, and
+   re-deriving it is stronger than trusting a third chain answer.
+
+   The confirmation requirement is load-bearing, not decorative. A source that tracks the mempool
+   reports a launcher it has seen with `created_height: None` — `CoinRecord::from_coin_state` maps
+   that to `confirmed_height: None` — and the security coin is created AND spent inside the launch
+   bundle, so it has no coin record at all until a block includes that bundle. Walking on from an
+   unconfirmed launcher therefore fails read 2 and produces the FORGERY verdict for the real owner
+   of a live, funded mint, in the ordinary mempool window. `confirmed_height.is_some()` is the
+   whole predicate: no burial of the LAUNCHER is required to say "not yet", and `spent_height`
+   MUST NOT be consulted here (see "Both coins are SPENT at resume time" below). The one burial
+   rule on this rule's ABSENT arm is about the FUNDING coin's spend and exists only because the
+   verdict it gates is terminal — see `LaunchDead` below.
+
+Every `coin_record` answer used above MUST be checked to have the coin id that was ASKED for. A
+source that answers a different question cannot prove anything here.
+
+**What rules 8 and 9 do NOT establish, stated rather than implied.** They bind both LAUNCHER ids to
+`funding_coin_id`. `reward_cat_coin_id` remains bound only by rule 7 — it is proven to be a $DIG
+coin of this account's, not proven to be the CAT this particular launch consumed. Binding it would
+need a further walk through the offer's settlement CAT and the launch's interim CAT coin, at more
+reads than the property is worth: with rules 8 and 9 in place an attacker cannot reach a
+`ConfirmedRewardDistributor` at all, because the launchers are the ids `status` compares the chain's
+answers against.
+
+The one place `reward_cat_coin_id` is load-bearing on its own is the proof-of-death path to
+`Failed` (§6BB.8, step 3), and **the reason that path is harmless here is not the reason an earlier
+revision of this clause gave.** That revision said step 3 is unreachable from a resumed pending.
+Step 3 tests the funding coin FIRST and unconditionally: any record `resume` accepted necessarily
+has a SPENT funding coin, because rule 9's descent requires that coin to have created the
+settlement coin, so `funding.is_some_and(is_spent)` fires and returns `Failed` before
+`reward_cat_coin_id`'s record is ever CONSULTED. Be precise about which: step 3 issues both
+`coin_record` reads up front and only then branches, so the CAT id is read — it is never *used*.
+**The reward-CAT branch of step 3 is dead code on every resumed pending** — that, and not unreachability of the step, is why substituting any other $DIG coin of
+this account's changes nothing. The written reason matters because it is what a future change is
+checked against.
+
+The revisit that rule was written to trigger HAS happened, and this is its conclusion. Rule 9 now
+requires a CONFIRMED launcher, so a resumed pending cannot enter step 3 at the moment it is
+resumed; a later `status` on one whose launcher is reorged out CAN enter it, and lands on the
+funding-coin branch above. Separately, `resume` itself now answers `RecordRejection::LaunchDead`
+for the dead-launch case, and that verdict is derived from `funding_coin_id` ALONE — deriving it
+from `reward_cat_coin_id`'s spentness would have made a field bound by rule 7 alone decide whether
+a live mint is reported dead, and MUST NOT be done. A future change that lets `reward_cat_coin_id`
+decide anything on its own, or that removes the funding-coin branch's precedence in step 3, MUST
+revisit this again.
+
+**Reserve.** There is no `requested_reserve_base_units` rule, because there is no such field: see
+the §6BB intro.
+
+**An absent coin record is fail-closed, with one typed exception.** For rules 6, 7 and the security
+coin of rule 9, absence is a REJECTION: a coin the chain has never heard of is not this account's.
+That includes the security coin specifically — once the launcher is CONFIRMED its parent's absence
+is a contradiction, and that arm MUST stay `NotYours`. For the LAUNCHER coin of rule 9, absence is
+neither a rejection nor a pass; it is `Unproven` or `LaunchDead` depending on the funding coin's
+spend AND that spend's burial — see the rejection taxonomy below.
+
+#### The rejection is TYPED, because a host routes on it
+
+`resume` MUST NOT report these outcomes as one stringly-typed refusal. A host (dig-app) keeps
+rejected records in a different place from live ones and shows a user different things, and a host
+that had to match a substring of a message would break on the next copy-edit. `resume` therefore
+returns `MintError::RecordRejected(RecordRejection)` with these variants, and every routing
+decision a host needs MUST be expressible by MATCHING alone:
+
+| variant | carries | means | rules |
+|---|---|---|---|
+| `RecordRejection::Malformed` | `RecordField` | a typo or a corrupted store; nothing was read from the chain | 1-5 |
+| `RecordRejection::NotYours` | `OwnershipProof` | the record describes somebody else's mint | 6-9 |
+| `RecordRejection::Unproven` | — | the launcher coin is not confirmed yet AND the funding coin's fate is unsettled — unspent, or spent less than `MIN_CONFIRMATION_DEPTH` deep — so the descent cannot be walked either way and the launch may still land | rule 9, launcher absent or unconfirmed |
+| `RecordRejection::LaunchDead` | — | terminal: the launcher coin is absent and the funding coin was spent by a different spend, buried `MIN_CONFIRMATION_DEPTH` deep, so this mint can never confirm | rule 9, launcher absent + funding spend buried |
+
+`RecordField` and `OwnershipProof` MUST be enums, never strings. The `detail` string each variant
+carries is prose for humans and logs ONLY; nothing may parse it.
+
+`MintError::ChainUnreachable` stays the FOURTH, separate outcome: nothing about the record is in
+question when the node cannot be reached.
+
+#### A record is resumable only once its launch confirms
+
+This follows from rule 9 and is stated rather than left to be discovered. Before the launch bundle
+is included in a block, the distributor's launcher coin either does not exist or is visible only as
+a mempool observation with no confirmed height, and nothing on chain ties `distributor_launcher_id`
+to this account's funding coin. Accepting the record anyway would hand a stranger a pending value
+that becomes evidence the instant the real owner's bundle confirms; rejecting it as a forgery would
+be a false statement about the real owner's own money. The answer is `RecordRejection::Unproven`,
+and the host resumes again once the launch confirms.
+
+**A host MUST NOT need to hold anything in memory to learn that its mint died.** An earlier
+revision of this clause discharged the dead-launch case as a host obligation — *hold the
+`PendingRewardDistributor` `submit` returned for as long as that matters* — which is a promise this
+API itself makes unkeepable, because surviving a restart is the entire reason a record exists. The
+one signal that survives a restart would have been the one that could never say "dead". So `resume`
+answers it directly: when the launcher coin is absent and `funding_coin_id` has been SPENT, the
+answer is `RecordRejection::LaunchDead`, terminal, and a host stops retrying and tells the user
+their coins are back. It reads the funding coin's record for free — rule 6 already fetched it.
+
+**A terminal verdict MUST clear the same burial bar an ACCEPTED confirmation clears.** `resume`
+reads the funding coin FIRST and the launcher SECOND. Those two reads can straddle a reorg, or two
+peers at different heights, so "funding spent" paired with "no launcher" is a reachable pair of
+answers about a LIVE distributor whose block was orphaned and will ordinarily re-confirm. Nothing
+in the answers themselves tells that apart from a genuinely dead launch; only DEPTH does.
+`RecordRejection::LaunchDead` therefore MUST NOT be returned unless the funding coin's spend is
+buried at least `MIN_CONFIRMATION_DEPTH` blocks (§6BB.7 rule (c)'s bar, applied with the same
+arithmetic: `peak - spent_height + 1`). Below that bar the answer is `RecordRejection::Unproven`
+and the record stays live. This costs ONE `peak_height` read, on that arm only, and it MUST fail
+closed: a source that exposes no peak yields `MintError::ChainUnreachable`, never a verdict,
+because an unknowable depth cannot license an answer that cannot be taken back.
+
+**The height the burial is computed from MUST be a height the chain could have produced.** Burial is
+arithmetic on a number the SOURCE supplied, and it is most convincing exactly where that number is
+least trustworthy. `CoinRecord::is_spent()` is `spent_height.is_some()`, so a source that ZERO-FILLS
+`spent_block_index` instead of nulling it — the full-node RPC shape, in which `0` means UNSPENT, and
+the representation `chia-query`'s peer translation produces — reports `Some(0)` for a coin nobody has
+touched; `peak - 0 + 1` is `peak + 1`, which clears any bar. `LaunchDead` therefore MUST NOT be
+returned unless the funding record's own `confirmed_height` is present and non-zero and its
+`spent_height` is neither zero nor below that `confirmed_height` — the same genesis and no-predate
+floors §6BB.7 rule (c) already applies to an ACCEPTED confirmation, adopted here with the arithmetic
+rather than after it. Both floors read the SAME authenticated record the spend height came from, so
+they cost no extra read. Below any of them the answer is `RecordRejection::Unproven`. This is
+robustness against a buggy or stale source, not a defence against a deliberate liar: the
+`ChainSource` is the trust root, and a liar can pick a plausible height instead.
+
+The asymmetry this removes is the reason it is normative rather than advisory. Burying the
+ACCEPTING direction and not the REJECTING one puts the cheaper bar on the more expensive mistake:
+an over-eager accept is retryable, while `LaunchDead` tells a user their coins are back and invites
+a fresh mint over coins a re-confirming bundle is about to take.
+
+**`LaunchDead` assumes one source is SELF-CONSISTENT across two coins, and that assumption is
+stated rather than relied on silently.** The verdict pairs a `spent_height` for the funding coin
+with an absence for the launcher, both from the same `ChainSource`, and measures the depth against
+a peak from that same source. A source that reported the funding coin spent while not yet serving
+the launcher created in that very block would hand an honest owner a terminal answer.
+
+The burial requirement above bounds this ONLY for a source that is SELF-CONSISTENT across the three
+reads: against a single peer it forces an inconsistency spanning `MIN_CONFIRMATION_DEPTH` blocks of
+history rather than one read pair. It does NOT bound a source that serves the three reads from
+different views. A registry that round-robins across peers can answer the funding record and the
+peak from a current peer and the launcher record from a peer six or more blocks behind: each answer
+is internally honest, the pair is exactly the skew this clause exists to stop, and the depth —
+measured against the OTHER peer's peak — clears the bar. An aggregating source is therefore not a
+strictly stronger source here, and a host that added one to harden this could weaken it.
+
+A `ChainSource` a host passes to `resume` MUST therefore satisfy one of two things: it serves all
+three reads of one `resume` call from ONE peer, or it never serves a view more than
+`MIN_CONFIRMATION_DEPTH` blocks behind its own reported peak. `dig-chainsource-interface`'s registry
+MUST be configured to one of those before it is used here; §6BB.7's recommendation of an aggregating
+or trusted source stands for EVIDENCE, where the reads are not compared against each other, and does
+not carry to this verdict unchanged. Beyond that bound the residual is irreducible in this crate: no
+check inside it can audit a single source's testimony against itself.
+
+**What `Unproven` still does not tell a host, stated rather than implied.** A bundle dropped from
+the mempool and never included leaves the funding coin UNSPENT, so the predicate above does not
+fire and the record answers `Unproven` indefinitely. This clause does not close that with a new
+chain read, and deliberately does not: the money is safe and the direction is refuse, never accept.
+
+`Unproven` is now THREE states behind one variant, and the re-mint obligation below is true of
+exactly one of them. An earlier revision of this clause made it unconditional, and that revision
+prescribed a double spend: it was written when `Unproven` meant only "no launcher coin at all",
+and the requirement that the launcher be CONFIRMED (rule 9) later widened the variant to cover a
+launcher visible in the MEMPOOL — a live bundle, with the coins already committed to it. Its
+justifications, *"nothing was consumed"* and *"a new mint costs nothing"*, were false for that
+case from the moment the case was added. They are corrected here:
+
+| the `Unproven` a host is holding | what is true of the coins | the obligation |
+|---|---|---|
+| launcher coin ABSENT, funding coin UNSPENT | nothing was consumed; no bundle this host knows of is in flight | the re-mint obligation below applies |
+| launcher coin present but UNCONFIRMED (a mempool observation) | a live bundle already commits these coins | MUST NOT offer a re-mint; this is a wait, and the wait ends by itself |
+| funding coin SPENT but the spend not yet `MIN_CONFIRMATION_DEPTH` deep | a competing spend may or may not survive a reorg | MUST NOT offer a re-mint; resume again and let the burial rule decide |
+
+**The re-mint obligation, restricted to the arm on which it is true.** A host that has resumed to
+an `Unproven` of the FIRST kind for longer than it is willing to wait MUST offer the user a fresh
+mint rather than a spinner, and MUST NOT render it as an indefinite "pending": either the launch
+lands and the same record resumes, or the coins were never spent and a new mint costs no coins
+this host has already committed. That fresh mint MUST be `begin_reward_distributor_mint` **over
+the same coins** — this is normative, not a parenthetical illustration. The safety of the whole
+arrangement is that consensus admits at most ONE bundle spending `funding_coin_id`, so a re-mint
+that loses the race converges on `LaunchDead` for the record it replaced and the user is told
+something true. A re-mint over DIFFERENT coins abandons that: it creates a second live mint the
+first does not exclude, and the user can end up funding two distributors.
+
+**How a host tells the three apart, and why `status` is not optional.** The three arms are
+distinguishable at the source, so a host is never asked to guess. A host that still holds the live
+`PendingRewardDistributor` MUST consult `status` (§6BB.8) before offering a re-mint — it is the
+discriminator, not an optimisation, and an earlier revision of this clause demoted it wrongly. A
+host that does NOT hold one — the amnesiac restart `resume` exists to serve, and precisely the host
+for which `status` is unreachable — MUST NOT offer a re-mint on `Unproven` alone. It MUST first
+establish that the funding coin is unspent, which is the one arm the obligation covers; the
+`detail` string MUST NOT be parsed for this (§6BB.6a's typed-rejection rule), so a host that cannot
+establish it keeps waiting.
+
+**The re-mint MUST go through the reservation store, where the host still has one.** The coin-level
+guard is not advisory: a fresh mint over a coin with a live in-flight spend is refused with
+`MintError::CoinsReserved`, which means "wait", not "add funds". A host MUST surface that refusal as
+the wait it is and MUST NOT retry around it.
+
+That guard is NOT what makes the arrangement safe for the host this clause is written for.
+`CoinReservations` is a set the CALLER supplies; the host the amnesiac restart `resume` exists to
+serve lost it along with the `PendingRewardDistributor` it lost, passes an empty set, and the guard is silent.
+What holds unconditionally is the same-coins MUST above: consensus admits at most ONE bundle
+spending `funding_coin_id`, so a mis-timed re-mint over the same coins races and loses rather than
+funding a second distributor, and the loser converges on `LaunchDead`. The reservation store turns
+that race into a refusal for a host that still has its in-memory state; it is a first line, not a
+last one.
+
+**Both coins are SPENT at resume time, and that is the expected state.** The mint the record
+describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role
+(§6BB.8, step 3). Rules 6 and 7 therefore compare only the puzzle hash of whatever the chain
+reports, and MUST NOT require `spent_height.is_none()`: a resume that demanded an unspent coin
+would refuse every legitimate record.
+
+**A read failure is `MintError::ChainUnreachable`, never a refusal and never a pass.** The outcome
+is UNKNOWN. Telling a user their own record is a forgery because a node was down is a false
+statement about their money; passing them through unproven re-opens the hole this clause closes.
+
+A resumed `PendingRewardDistributor` is indistinguishable from the one `submit` returned: it is
+`==` to it field for field, and `status` (§6BB.8) answers identically on the three arms the resume
+suite exercises — shallow, buried and unreadable.
+
+`Failed` is NOT excluded, and an earlier revision of this clause wrongly called its absence a
+theorem. Two §6BB.8 **step 5** arms are reachable from a resumed pending: a confirmed launcher
+whose parent spend `discover_distributor` cannot decode (no distributor advertised), and rule (e)'s
+generation mismatch — rule 5 above checks only that `generation` PARSES, so a parseable-but-wrong
+`store_id`/`root` resumes and then fails there. What IS true, and is the narrower claim the
+`reward_cat_coin_id` residual rests on, is that **step 3** specifically cannot be reached at the
+moment of a resume: step 3 requires an absent launcher coin and rule 9 requires a confirmed one.
+Closing the step-5 gap would mean binding `generation` to the chain in `resume`, which is a design
+change and is not made here.
 
 ### 6BB.7 `ConfirmedRewardDistributor` — the evidence invariant (normative)
 
@@ -1859,7 +2205,7 @@ contract and a decoder that honours `discover_distributor`'s: the record was fet
 the source contradicted itself.
 
 The value carries `distributor_launcher_id`, `manager_launcher_id`, `confirmed_height`,
-`generation` and `requested_reserve_base_units` — every one copied from `pending` except
+`generation` — every one copied from `pending` except
 `confirmed_height`, which is the record's. Each has a public getter; nothing else is exposed.
 
 ### 6BB.8 `submit` and `status` — the four answers stay distinct (normative)
@@ -1992,10 +2338,11 @@ comment names this generation. A reader MAY NOT conclude:
 2. **Anything about the generation's CONTENT.** `generation()` is the `store_id:root` the launch
    comment advertised, carried from the request this crate built the bundle from. The chain proves
    the comment was written, not that any store has that root or that any bytes hash to it.
-3. **That a reserve of `requested_reserve_base_units` exists or is spendable.** The value is the
-   reward CAT's amount echoed from the request, in $DIG base units. The distributor's live reserve,
-   its entries and its epoch state are read through `dig-rewards-coin`'s own state readers, never
-   inferred from this evidence.
+3. **That the distributor holds ANY reserve at all.** It holds none: the launch creates the reserve
+   coin with the literal amount `0` and refunds the offered CAT whole (§6BB intro). Nothing in this
+   evidence is about a reserve, and no field of it ever was. The distributor's live reserve, its
+   entries and its epoch state are read through `dig-rewards-coin`'s own state readers, and are
+   non-zero only after a `commit_incentives_for_distributor_epoch` spend this crate does not make.
 4. **That the manager is reachable.** `manager_launcher_id()` is the id this mint derived; whether
    the key behind `manager_inner_puzzle` still exists is the caller's for the distributor's lifetime
    (§6BB.3a).

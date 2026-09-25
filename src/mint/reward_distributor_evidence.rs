@@ -50,9 +50,6 @@ pub struct PendingRewardDistributor {
     funding_coin_id: Bytes32,
     /// The reward CAT coin this mint spent. Same proof-of-death role as `funding_coin_id`.
     reward_cat_coin_id: Bytes32,
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve — a request, not
-    /// an observed reserve.
-    requested_reserve_base_units: u64,
     /// The generation (`store_id:root`) this mint's launch comment advertises.
     generation: LaunchComment,
     /// The chain's peak immediately BEFORE the push. A confirmation cannot predate it.
@@ -68,13 +65,11 @@ impl PendingRewardDistributor {
     /// would make `status` an evidence oracle. A caller supplying ANOTHER distributor's launcher id
     /// and generation would receive a [`ConfirmedRewardDistributor`] for a distributor this account
     /// never funded — proving a record exists is not proving it is yours.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         distributor_launcher_id: Bytes32,
         manager_launcher_id: Bytes32,
         funding_coin_id: Bytes32,
         reward_cat_coin_id: Bytes32,
-        requested_reserve_base_units: u64,
         generation: LaunchComment,
         pushed_at_height: u32,
     ) -> Self {
@@ -83,7 +78,6 @@ impl PendingRewardDistributor {
             manager_launcher_id,
             funding_coin_id,
             reward_cat_coin_id,
-            requested_reserve_base_units,
             generation,
             pushed_at_height,
         }
@@ -113,12 +107,6 @@ impl PendingRewardDistributor {
         self.reward_cat_coin_id
     }
 
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve.
-    #[must_use]
-    pub const fn requested_reserve_base_units(&self) -> u64 {
-        self.requested_reserve_base_units
-    }
-
     /// The generation (`store_id:root`) this mint's launch comment advertises.
     #[must_use]
     pub const fn generation(&self) -> LaunchComment {
@@ -132,6 +120,56 @@ impl PendingRewardDistributor {
     #[must_use]
     pub const fn pushed_at_height(&self) -> u32 {
         self.pushed_at_height
+    }
+}
+
+/// A serializable MIRROR of a [`PendingRewardDistributor`], so a host can persist an in-flight
+/// distributor mint across a restart (`SPEC.md` §6BB.6a).
+///
+/// # This is not evidence, and there is deliberately no way back from it alone
+///
+/// Exactly the shape `registry::journal` states for the DID mint, and for the identical reason
+/// (`src/registry/journal.rs`): *a file is not a chain*. There is no
+/// `From<PendingRewardDistributorRecord> for PendingRewardDistributor` and there must never be
+/// one — a record naming ANOTHER account's distributor is internally perfect, and a bare
+/// conversion would hand its holder a `ConfirmedRewardDistributor` for a launch they never funded.
+///
+/// The one door back is
+/// [`RewardDistributorMinter::resume`](crate::reward_distributor_mint::RewardDistributorMinter::resume),
+/// which lives on the minter precisely because only the minter holds the seed, and therefore only
+/// the minter can ask the chain whether the two coins this record names were at THIS account's own
+/// puzzle hashes. Proving a record exists is not proving it is yours.
+///
+/// Every field mirrors the §6BB.6 table one-for-one, with `generation` in its canonical string
+/// form ([`LaunchComment`]'s `Display`) so the persisted bytes are the same text the launch comment
+/// carries on chain.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingRewardDistributorRecord {
+    /// The distributor singleton's launcher id.
+    pub distributor_launcher_id: Bytes32,
+    /// The manager singleton's launcher id.
+    pub manager_launcher_id: Bytes32,
+    /// The XCH funding coin the mint spent.
+    pub funding_coin_id: Bytes32,
+    /// The reward CAT coin the mint spent.
+    pub reward_cat_coin_id: Bytes32,
+    /// The generation in its canonical launch-comment string form (`LaunchComment::to_string`).
+    pub generation: String,
+    /// The chain's peak immediately BEFORE the push.
+    pub pushed_at_height: u32,
+}
+
+impl From<&PendingRewardDistributor> for PendingRewardDistributorRecord {
+    fn from(pending: &PendingRewardDistributor) -> Self {
+        Self {
+            distributor_launcher_id: pending.distributor_launcher_id(),
+            manager_launcher_id: pending.manager_launcher_id(),
+            funding_coin_id: pending.funding_coin_id(),
+            reward_cat_coin_id: pending.reward_cat_coin_id(),
+            generation: pending.generation().to_string(),
+            pushed_at_height: pending.pushed_at_height(),
+        }
     }
 }
 
@@ -151,9 +189,6 @@ pub struct ConfirmedRewardDistributor {
     confirmed_height: u32,
     /// The generation (`store_id:root`) this distributor pays mirrors of.
     generation: LaunchComment,
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve, carried through
-    /// from `pending`. See `SPEC.md` §6BB.9: this is not proof a live reserve of this size exists.
-    requested_reserve_base_units: u64,
 }
 
 /// Names exactly one of the five rules `from_confirmed` applies (`SPEC.md` §6BB.7), so a `Failed`
@@ -251,7 +286,6 @@ impl ConfirmedRewardDistributor {
                 .confirmed_height
                 .expect("check() returned Ok, which requires confirmed_height to be Some"),
             generation: pending.generation(),
-            requested_reserve_base_units: pending.requested_reserve_base_units(),
         })
     }
 
@@ -277,16 +311,6 @@ impl ConfirmedRewardDistributor {
     #[must_use]
     pub const fn generation(&self) -> LaunchComment {
         self.generation
-    }
-
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve.
-    ///
-    /// This is not proof a live reserve of this size exists (`SPEC.md` §6BB.9): the distributor's
-    /// live reserve is read through `dig-rewards-coin`'s own state readers, never inferred from
-    /// this evidence.
-    #[must_use]
-    pub const fn requested_reserve_base_units(&self) -> u64 {
-        self.requested_reserve_base_units
     }
 }
 
@@ -357,7 +381,6 @@ mod tests {
             Bytes32::new([0x22; 32]),
             Bytes32::new([0x33; 32]),
             Bytes32::new([0x44; 32]),
-            1_000,
             generation,
             PUSHED_AT,
         )
@@ -400,10 +423,6 @@ mod tests {
         );
         assert_eq!(evidence.confirmed_height(), PUSHED_AT);
         assert_eq!(evidence.generation(), pending.generation());
-        assert_eq!(
-            evidence.requested_reserve_base_units(),
-            pending.requested_reserve_base_units()
-        );
     }
 
     /// An UNCONFIRMED record is a mempool observation. Mutation: turn the `confirmed_height?` early
@@ -459,7 +478,6 @@ mod tests {
             Bytes32::new([0x22; 32]),
             Bytes32::new([0x33; 32]),
             Bytes32::new([0x44; 32]),
-            1_000,
             gen,
             0,
         );
