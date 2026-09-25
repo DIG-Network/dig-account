@@ -7,8 +7,9 @@
 //! 1. a **manager singleton** is launched — its launcher id is curried into the distributor's
 //!    action puzzles and can never be rotated, so it must exist before the constants table does;
 //! 2. the wallet's XCH funding coin pays the offer mojo, the manager singleton's mojo and the fee;
-//! 3. the wallet's $DIG CAT coin is locked to the settlement puzzle, which is what an `Offer` IS at
-//!    the byte level;
+//! 3. the wallet's $DIG CAT coin is spent, the requested reserve locked to the settlement puzzle —
+//!    which is what an `Offer` IS at the byte level — and any remainder returned to the wallet as
+//!    hinted CAT change;
 //! 4. `launch_dig_distributor` consumes that offer and stages the launcher, the eve singleton, the
 //!    reserve CAT and the ephemeral security coin.
 //!
@@ -77,9 +78,23 @@ pub struct RewardDistributorMintRequest {
     /// A confirmed XCH coin at THIS wallet's puzzle hash, paying the offer mojo, the manager
     /// singleton's mojo and `fee`.
     pub funding: Coin,
-    /// The $DIG CAT coin whose whole amount becomes the distributor's reserve. Its p2 puzzle hash
-    /// must be this wallet's, or nothing is built.
+    /// The $DIG CAT coin the distributor's reserve is taken out of. Its p2 puzzle hash must be
+    /// this wallet's, or nothing is built.
+    ///
+    /// The whole coin is spent, but only [`reserve_base_units`](Self::reserve_base_units) of it
+    /// becomes the reserve; the rest comes back as wallet-owned CAT change.
     pub reward_cat: Cat,
+    /// How much of [`reward_cat`](Self::reward_cat) becomes the distributor's reserve, in $DIG
+    /// base units.
+    ///
+    /// Zero is REFUSED, and so is more than [`reward_cat`](Self::reward_cat) holds — both before
+    /// any signature exists. The remainder is returned to this wallet as an ordinary hinted $DIG
+    /// change coin, the same treatment the XCH funding leg already gives its own change, so a
+    /// caller wanting an exact reserve no longer needs a coin of exactly that size to exist.
+    ///
+    /// There is deliberately no "the whole coin" default: a reserve is permanent once launched,
+    /// and a caller that omitted the amount would get the largest possible one by accident.
+    pub reserve_base_units: u64,
     /// The manager singleton's inner puzzle. **Permanent after launch**: if its key is lost the
     /// entry set freezes forever, so there is no default and the caller must choose.
     pub manager_inner_puzzle: ManagerInnerPuzzle,
@@ -129,7 +144,7 @@ pub struct SignedRewardDistributorMint {
     reward_cat_coin_id: Bytes32,
     /// The generation (`store_id:root`) this launch's comment advertises, echoed from the request.
     generation: LaunchComment,
-    /// The reward CAT coin's amount, echoed from the request. See the accessor for why the name
+    /// The reserve amount the request NAMED, echoed from it. See the accessor for why the name
     /// carries `requested`.
     requested_reserve_base_units: u64,
     /// The launch's ephemeral security-coin key, kept ONLY under `cfg(test)`.
@@ -172,8 +187,8 @@ impl SignedRewardDistributorMint {
         self.manager_launcher_id
     }
 
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve: the reward CAT
-    /// coin's amount, read back from the request.
+    /// The $DIG base units this mint REQUESTED go into the distributor's reserve:
+    /// [`RewardDistributorMintRequest::reserve_base_units`], read back from the request.
     ///
     /// Named for what it is. It is not an observation of the launched distributor's reserve state,
     /// and nothing here could make it one — no reserve exists until this bundle confirms. A caller
@@ -458,6 +473,25 @@ fn build_and_sign_reward_distributor_launch(
         ));
     }
 
+    // The reserve is refused HERE, in the same pre-build block as the two ownership refusals and
+    // before a single spend — let alone a signature — exists. A refusal that fired after the
+    // signing loop would be a refusal of a bundle this account had already authorized.
+    //
+    // Both bounds are read off the coin actually being spent, never from a denomination table or a
+    // compiled-in constant (CLAUDE.md §2.6 clause 2).
+    if request.reserve_base_units == 0 {
+        return Err(MintError::Refused(
+            "the requested reserve is zero; a distributor whose reserve is empty can pay no              mirror, and launching one would lock the whole reward CAT away to fund nothing"
+                .into(),
+        ));
+    }
+    if request.reserve_base_units > request.reward_cat.coin.amount {
+        return Err(MintError::Refused(format!(
+            "the requested reserve of {} base units is more than the reward CAT's {}; this seam              splits the ONE coin it was handed and never aggregates a second",
+            request.reserve_base_units, request.reward_cat.coin.amount
+        )));
+    }
+
     // A zero epoch length is refused HERE, ahead of every call into the dependency and before a
     // single spend is staged. `dig-rewards-coin`'s constants builder happens to refuse it today,
     // but that is a transitive crate's internal check held at a caret range, and this seam calls
@@ -542,8 +576,14 @@ fn build_and_sign_reward_distributor_launch(
         ));
     }
 
-    // Step 4: the whole reward CAT to the settlement puzzle. This is the offer's CAT half.
-    spend_reward_cat_into_settlement(&mut ctx, wallet, request.reward_cat)?;
+    // Step 4: the reward CAT to the settlement puzzle, with any remainder back to this wallet.
+    // This is the offer's CAT half.
+    spend_reward_cat_into_settlement(
+        &mut ctx,
+        wallet,
+        request.reward_cat,
+        request.reserve_base_units,
+    )?;
 
     // Step 5: split the two offer spends out of the context and put everything else back.
     //
@@ -645,7 +685,7 @@ fn build_and_sign_reward_distributor_launch(
         funding_coin_id,
         reward_cat_coin_id,
         generation: request.generation,
-        requested_reserve_base_units: request.reward_cat.coin.amount,
+        requested_reserve_base_units: request.reserve_base_units,
         #[cfg(test)]
         security_coin_secret_key: launched.security_coin_secret_key,
     })
@@ -748,23 +788,59 @@ fn verify_aggregate_discharges(
     Ok(())
 }
 
-/// Locks the whole reward CAT to the settlement puzzle — the CAT half of the launch offer.
+/// Locks `reserve_base_units` of the reward CAT to the settlement puzzle and returns the rest to
+/// this wallet — the CAT half of the launch offer.
 ///
 /// The CAT is spent through the SDK's own `Cat::spend` with a delegated inner spend from
 /// [`StandardLayer`], never a hand-rolled p2 spend: a bespoke CAT spend here is exactly the class of
 /// custody bug `src/wallet/money_signer.rs` exists to keep out of this crate.
+///
+/// # The remainder must be FINDABLE, not merely created
+///
+/// The change coin carries a `hint` of this wallet's p2 puzzle hash, exactly as the XCH funding
+/// leg's change and `wallet::cat_transfer`'s own CAT change do. A CAT change coin without it is
+/// still the wallet's money and no wallet in the ecosystem would ever show it again, which is the
+/// same thing as losing it. `wallet::cat_transfer::dig_cat_coins` is the production path that
+/// finds it.
+///
+/// A remainder of zero emits NO change coin: when the caller asked for the whole coin there is
+/// nothing to return, and a zero-value `CREATE_COIN` would be a coin that exists and can never be
+/// spent for anything.
 fn spend_reward_cat_into_settlement(
     ctx: &mut SpendContext,
     wallet: &WalletKey,
     reward_cat: Cat,
+    reserve_base_units: u64,
 ) -> MintResult<()> {
-    let inner_puzzle = clvm_quote!(Conditions::new().create_coin(
+    // Read off the coin being spent rather than any table of denominations (CLAUDE.md §2.6
+    // clause 2). `build_and_sign_reward_distributor_launch` already refused an over-large
+    // reserve; this restates the bound rather than assuming it, because an `Ok` here with a
+    // wrapped remainder would be an unbalanced CAT ring.
+    let remainder = reward_cat
+        .coin
+        .amount
+        .checked_sub(reserve_base_units)
+        .ok_or_else(|| {
+            MintError::Build(
+                "the requested reserve is larger than the reward CAT being spent".into(),
+            )
+        })?;
+
+    let mut conditions = Conditions::new().create_coin(
         SETTLEMENT_PAYMENT_HASH.into(),
-        reward_cat.coin.amount,
-        Memos::None
-    ))
-    .to_clvm(ctx)
-    .map_err(|e| MintError::Build(format!("CAT settlement puzzle: {e}")))?;
+        reserve_base_units,
+        Memos::None,
+    );
+    if remainder > 0 {
+        let change_hint = ctx
+            .hint(wallet.puzzle_hash())
+            .map_err(|e| MintError::Build(format!("CAT change hint: {e}")))?;
+        conditions = conditions.create_coin(wallet.puzzle_hash(), remainder, change_hint);
+    }
+
+    let inner_puzzle = clvm_quote!(conditions)
+        .to_clvm(ctx)
+        .map_err(|e| MintError::Build(format!("CAT settlement puzzle: {e}")))?;
 
     let p2_spend = StandardLayer::new(wallet.public_key())
         .delegated_inner_spend(
