@@ -1873,8 +1873,12 @@ holds the seed, and therefore the only type that can derive the puzzle hashes a 
 measured against. Proving a record exists is not proving it is yours.
 
 `resume` returns `MintError::Locked` — raised BEFORE any derivation, as on every other method of that
-type — if the account has relocked. Otherwise it refuses with `MintError::Refused`, naming which
-check fired, unless ALL of the following hold:
+type — if the account has relocked. Otherwise it refuses with
+`MintError::RecordRejected(RecordRejection)`, typed by the taxonomy table below, unless ALL of the
+following hold. It MUST NOT refuse with `MintError::Refused`: that is §6BB's pre-signing gate and
+keeps meaning *this account will not sign that*, while a host routes a rejected RECORD by matching
+the variant. An earlier revision of this clause said `Refused` here; the taxonomy is what the code
+implements and what a host may rely on.
 
 **Internal consistency.** Nothing is read from the chain for any of these.
 
@@ -1914,13 +1918,23 @@ the shape §6BB's build produces it:
 8. `manager_launcher_id` MUST equal `Coin::new(funding_coin_id, SINGLETON_LAUNCHER_HASH,
    MANAGER_SINGLETON_AMOUNT_MOJOS).coin_id()`. `launch_manager_singleton` passes the funding coin
    id straight to `Launcher::new`, so this is a pure derivation and MUST cost **no chain read**.
-9. `distributor_launcher_id`'s launcher coin MUST trace back to `funding_coin_id`: its
-   `parent_coin_info` is the launch's ephemeral security coin, whose own `parent_coin_info` MUST
-   equal `Coin::new(funding_coin_id, SETTLEMENT_PAYMENT_HASH, OFFER_XCH_AMOUNT).coin_id()`. This
+9. `distributor_launcher_id`'s launcher coin MUST be CONFIRMED — its `CoinRecord` MUST carry a
+   `confirmed_height` — and MUST trace back to `funding_coin_id`: its `parent_coin_info` is the
+   launch's ephemeral security coin, whose own `parent_coin_info` MUST equal
+   `Coin::new(funding_coin_id, SETTLEMENT_PAYMENT_HASH, OFFER_XCH_AMOUNT).coin_id()`. This
    costs exactly **two** `coin_record` reads — the launcher coin and the security coin — because
    the security coin's identity depends on a random key the mint discarded. The settlement coin at
    the end MUST be DERIVED, not read: every input to its identity is fixed by §6BB's build, and
    re-deriving it is stronger than trusting a third chain answer.
+
+   The confirmation requirement is load-bearing, not decorative. A source that tracks the mempool
+   reports a launcher it has seen with `created_height: None` — `CoinRecord::from_coin_state` maps
+   that to `confirmed_height: None` — and the security coin is created AND spent inside the launch
+   bundle, so it has no coin record at all until a block includes that bundle. Walking on from an
+   unconfirmed launcher therefore fails read 2 and produces the FORGERY verdict for the real owner
+   of a live, funded mint, in the ordinary mempool window. `confirmed_height.is_some()` is the
+   whole predicate: a burial requirement belongs to `from_confirmed` (§6BB.7), and `spent_height`
+   MUST NOT be consulted here (see "Both coins are SPENT at resume time" below).
 
 Every `coin_record` answer used above MUST be checked to have the coin id that was ASKED for. A
 source that answers a different question cannot prove anything here.
@@ -1931,17 +1945,38 @@ coin of this account's, not proven to be the CAT this particular launch consumed
 need a further walk through the offer's settlement CAT and the launch's interim CAT coin, at more
 reads than the property is worth: with rules 8 and 9 in place an attacker cannot reach a
 `ConfirmedRewardDistributor` at all, because the launchers are the ids `status` compares the chain's
-answers against, and the one place `reward_cat_coin_id` is load-bearing on its own — the
-proof-of-death path to `Failed` (§6BB.8, step 3) — is unreachable from a resumed pending by the
-clause above. A future change that made `Failed` reachable from a resumed record MUST revisit this.
+answers against.
+
+The one place `reward_cat_coin_id` is load-bearing on its own is the proof-of-death path to
+`Failed` (§6BB.8, step 3), and **the reason that path is harmless here is not the reason an earlier
+revision of this clause gave.** That revision said step 3 is unreachable from a resumed pending.
+Step 3 tests the funding coin FIRST and unconditionally: any record `resume` accepted necessarily
+has a SPENT funding coin, because rule 9's descent requires that coin to have created the
+settlement coin, so `funding.is_some_and(is_spent)` fires and returns `Failed` before
+`reward_cat_coin_id` is ever read. **The reward-CAT branch of step 3 is dead code on every resumed
+pending** — that, and not unreachability of the step, is why substituting any other $DIG coin of
+this account's changes nothing. The written reason matters because it is what a future change is
+checked against.
+
+The revisit that rule was written to trigger HAS happened, and this is its conclusion. Rule 9 now
+requires a CONFIRMED launcher, so a resumed pending cannot enter step 3 at the moment it is
+resumed; a later `status` on one whose launcher is reorged out CAN enter it, and lands on the
+funding-coin branch above. Separately, `resume` itself now answers `RecordRejection::LaunchDead`
+for the dead-launch case, and that verdict is derived from `funding_coin_id` ALONE — deriving it
+from `reward_cat_coin_id`'s spentness would have made a field bound by rule 7 alone decide whether
+a live mint is reported dead, and MUST NOT be done. A future change that lets `reward_cat_coin_id`
+decide anything on its own, or that removes the funding-coin branch's precedence in step 3, MUST
+revisit this again.
 
 **Reserve.** There is no `requested_reserve_base_units` rule, because there is no such field: see
 the §6BB intro.
 
 **An absent coin record is fail-closed, with one typed exception.** For rules 6, 7 and the security
 coin of rule 9, absence is a REJECTION: a coin the chain has never heard of is not this account's.
-For the LAUNCHER coin of rule 9 it is neither a rejection nor a pass — see the rejection taxonomy
-below.
+That includes the security coin specifically — once the launcher is CONFIRMED its parent's absence
+is a contradiction, and that arm MUST stay `NotYours`. For the LAUNCHER coin of rule 9, absence is
+neither a rejection nor a pass; it is `Unproven` or `LaunchDead` depending on the funding coin — see
+the rejection taxonomy below.
 
 #### The rejection is TYPED, because a host routes on it
 
@@ -1955,7 +1990,8 @@ decision a host needs MUST be expressible by MATCHING alone:
 |---|---|---|---|
 | `RecordRejection::Malformed` | `RecordField` | a typo or a corrupted store; nothing was read from the chain | 1-5 |
 | `RecordRejection::NotYours` | `OwnershipProof` | the record describes somebody else's mint | 6-9 |
-| `RecordRejection::Unproven` | — | the launcher coin does not exist yet, so the descent cannot be walked either way | rule 9, launcher absent |
+| `RecordRejection::Unproven` | — | the launcher coin is not confirmed yet AND the funding coin is unspent, so the descent cannot be walked either way and the launch may still land | rule 9, launcher absent or unconfirmed |
+| `RecordRejection::LaunchDead` | — | terminal: the launcher coin is absent and the funding coin was spent by a different spend, so this mint can never confirm | rule 9, launcher absent + funding coin spent |
 
 `RecordField` and `OwnershipProof` MUST be enums, never strings. The `detail` string each variant
 carries is prose for humans and logs ONLY; nothing may parse it.
@@ -1966,17 +2002,33 @@ question when the node cannot be reached.
 #### A record is resumable only once its launch confirms
 
 This follows from rule 9 and is stated rather than left to be discovered. Before the launch bundle
-is included in a block, the distributor's launcher coin does not exist, and nothing on chain ties
-`distributor_launcher_id` to this account's funding coin. Accepting the record anyway would hand a
-stranger a pending value that becomes evidence the instant the real owner's bundle confirms;
-rejecting it as a forgery would be a false statement about the real owner's own money. The answer
-is `RecordRejection::Unproven`, and the host resumes again once the launch confirms.
+is included in a block, the distributor's launcher coin either does not exist or is visible only as
+a mempool observation with no confirmed height, and nothing on chain ties `distributor_launcher_id`
+to this account's funding coin. Accepting the record anyway would hand a stranger a pending value
+that becomes evidence the instant the real owner's bundle confirms; rejecting it as a forgery would
+be a false statement about the real owner's own money. The answer is `RecordRejection::Unproven`,
+and the host resumes again once the launch confirms.
 
-The consequence a host must plan for: a resumed `PendingRewardDistributor` can never report
-`Failed`, because `Failed` is precisely the state in which the launcher coin does not exist. A host
-that needs to observe its own mint dying MUST hold the `PendingRewardDistributor` `submit` returned
-for as long as that matters; a record persisted across a restart answers `Unproven` until the launch
-confirms.
+**A host MUST NOT need to hold anything in memory to learn that its mint died.** An earlier
+revision of this clause discharged the dead-launch case as a host obligation — *hold the
+`PendingRewardDistributor` `submit` returned for as long as that matters* — which is a promise this
+API itself makes unkeepable, because surviving a restart is the entire reason a record exists. The
+one signal that survives a restart would have been the one that could never say "dead". So `resume`
+answers it directly: when the launcher coin is absent and `funding_coin_id` has been SPENT, the
+answer is `RecordRejection::LaunchDead`, terminal, and a host stops retrying and tells the user
+their coins are back. It costs NO chain read beyond rule 6's, which already fetched that record.
+
+**What `Unproven` still does not tell a host, stated rather than implied.** A bundle dropped from
+the mempool and never included leaves the funding coin UNSPENT, so the predicate above does not
+fire and the record answers `Unproven` indefinitely. This clause does not close that with a new
+chain read, and deliberately does not: the money is safe and the direction is refuse, never accept.
+What an unspent funding coin means is that **nothing was consumed and the mint is simply
+re-mintable.** A host that has resumed to `Unproven` for longer than it is willing to wait MUST
+offer the user a fresh mint (`begin_reward_distributor_mint` over the same coins) rather than a
+spinner, and MUST NOT render `Unproven` as an indefinite "pending": either the launch lands and the
+same record resumes, or the coins were never spent and a new mint costs nothing. A host that also
+holds the live `PendingRewardDistributor` can distinguish the two with `status` (§6BB.8), which is
+an optimisation, not an obligation.
 
 **Both coins are SPENT at resume time, and that is the expected state.** The mint the record
 describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role
@@ -1989,9 +2041,18 @@ is UNKNOWN. Telling a user their own record is a forgery because a node was down
 statement about their money; passing them through unproven re-opens the hole this clause closes.
 
 A resumed `PendingRewardDistributor` is indistinguishable from the one `submit` returned: it is
-`==` to it field for field, and `status` (§6BB.8) answers identically on every arm a resumable
-record can reach — shallow, buried and unreadable. `Failed` is not among them, for the reason just
-given, and that absence is a theorem rather than a gap.
+`==` to it field for field, and `status` (§6BB.8) answers identically on the three arms the resume
+suite exercises — shallow, buried and unreadable.
+
+`Failed` is NOT excluded, and an earlier revision of this clause wrongly called its absence a
+theorem. Two §6BB.8 **step 5** arms are reachable from a resumed pending: a confirmed launcher
+whose parent spend `discover_distributor` cannot decode (no distributor advertised), and rule (e)'s
+generation mismatch — rule 5 above checks only that `generation` PARSES, so a parseable-but-wrong
+`store_id`/`root` resumes and then fails there. What IS true, and is the narrower claim the
+`reward_cat_coin_id` residual rests on, is that **step 3** specifically cannot be reached at the
+moment of a resume: step 3 requires an absent launcher coin and rule 9 requires a confirmed one.
+Closing the step-5 gap would mean binding `generation` to the chain in `resume`, which is a design
+change and is not made here.
 
 ### 6BB.7 `ConfirmedRewardDistributor` — the evidence invariant (normative)
 
