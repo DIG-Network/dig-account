@@ -246,6 +246,12 @@ fn a_record_naming_another_accounts_distributor_is_refused_by_resume() {
         refusal.contains("is not at this profile's puzzle hash"),
         "the refusal must be the OWNERSHIP one, not an incidental consistency check: {refusal}"
     );
+    // Named down to WHICH coin, so deleting either puzzle-hash comparison turns THIS test red
+    // rather than being masked by the other one still firing. The funding coin is checked first.
+    assert!(
+        refusal.contains("the funding coin"),
+        "the funding coin is the first ownership check; a refusal naming anything else means          that check no longer fires: {refusal}"
+    );
 
     // THE MIRROR. The same bytes, resumed by the account that actually minted them.
     let resumed = a
