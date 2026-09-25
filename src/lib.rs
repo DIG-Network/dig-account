@@ -93,9 +93,10 @@ pub use mint::BlockingHttpTransport;
 pub use mint::{
     interpret_push_answer, push_tx_request_json, ChainUnavailable, CoinsetPublisher,
     ConfirmedRewardDistributor, ConfirmedStore, HttpAnswer, MintError, MintNetwork, MintOptions,
-    MintResult, MintStatus, MintedDid, PendingMint, PendingRewardDistributor, PendingStoreLaunch,
-    ProfileMintStatus, ProfileSeed, PushOutcome, PushTransport, RewardDistributorStatus,
-    SpendPublisher, COINSET_MAINNET_PUSH_URL, MAX_MINT_FEE_MOJOS, MIN_CONFIRMATION_DEPTH,
+    MintResult, MintStatus, MintedDid, PendingMint, PendingRewardDistributor,
+    PendingRewardDistributorRecord, PendingStoreLaunch, ProfileMintStatus, ProfileSeed,
+    PushOutcome, PushTransport, RewardDistributorStatus, SpendPublisher, COINSET_MAINNET_PUSH_URL,
+    MAX_MINT_FEE_MOJOS, MIN_CONFIRMATION_DEPTH,
 };
 pub use model::{Account, AccountRecord, Profile};
 pub use profile_mint::ProfileMinter;

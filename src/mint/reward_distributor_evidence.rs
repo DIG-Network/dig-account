@@ -135,6 +135,59 @@ impl PendingRewardDistributor {
     }
 }
 
+/// A serializable MIRROR of a [`PendingRewardDistributor`], so a host can persist an in-flight
+/// distributor mint across a restart (`SPEC.md` §6BB.6a).
+///
+/// # This is not evidence, and there is deliberately no way back from it alone
+///
+/// Exactly the shape `registry::journal` states for the DID mint, and for the identical reason
+/// (`src/registry/journal.rs`): *a file is not a chain*. There is no
+/// `From<PendingRewardDistributorRecord> for PendingRewardDistributor` and there must never be
+/// one — a record naming ANOTHER account's distributor is internally perfect, and a bare
+/// conversion would hand its holder a `ConfirmedRewardDistributor` for a launch they never funded.
+///
+/// The one door back is
+/// [`RewardDistributorMinter::resume`](crate::reward_distributor_mint::RewardDistributorMinter::resume),
+/// which lives on the minter precisely because only the minter holds the seed, and therefore only
+/// the minter can ask the chain whether the two coins this record names were at THIS account's own
+/// puzzle hashes. Proving a record exists is not proving it is yours.
+///
+/// Every field mirrors the §6BB.6 table one-for-one, with `generation` in its canonical string
+/// form ([`LaunchComment`]'s `Display`) so the persisted bytes are the same text the launch comment
+/// carries on chain.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingRewardDistributorRecord {
+    /// The distributor singleton's launcher id.
+    pub distributor_launcher_id: Bytes32,
+    /// The manager singleton's launcher id.
+    pub manager_launcher_id: Bytes32,
+    /// The XCH funding coin the mint spent.
+    pub funding_coin_id: Bytes32,
+    /// The reward CAT coin the mint spent.
+    pub reward_cat_coin_id: Bytes32,
+    /// The $DIG base units the mint REQUESTED go into the reserve.
+    pub requested_reserve_base_units: u64,
+    /// The generation in its canonical launch-comment string form (`LaunchComment::to_string`).
+    pub generation: String,
+    /// The chain's peak immediately BEFORE the push.
+    pub pushed_at_height: u32,
+}
+
+impl From<&PendingRewardDistributor> for PendingRewardDistributorRecord {
+    fn from(pending: &PendingRewardDistributor) -> Self {
+        Self {
+            distributor_launcher_id: pending.distributor_launcher_id(),
+            manager_launcher_id: pending.manager_launcher_id(),
+            funding_coin_id: pending.funding_coin_id(),
+            reward_cat_coin_id: pending.reward_cat_coin_id(),
+            requested_reserve_base_units: pending.requested_reserve_base_units(),
+            generation: pending.generation().to_string(),
+            pushed_at_height: pending.pushed_at_height(),
+        }
+    }
+}
+
 /// A reward distributor that EXISTS on chain, and the evidence that it does.
 ///
 /// Constructible only by `from_confirmed` from a confirmed [`CoinRecord`]

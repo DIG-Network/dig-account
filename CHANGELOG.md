@@ -4,11 +4,6 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [Unreleased]
-
-### Features
-- **mint:** `PendingRewardDistributorRecord` + ownership-proving `resume` seam (#66)
-
 ## [0.31.0] - 2026-09-24
 
 ### Features

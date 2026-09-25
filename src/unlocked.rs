@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use dig_chainsource_interface::ChainSource;
 use dig_session::{UnlockedMasterSeed, MASTER_SEED_LEN};
 use zeroize::Zeroizing;
 
@@ -15,6 +16,10 @@ use crate::id::{AccountId, ProfileIx};
 use crate::keys::dek::profile_dek;
 use crate::keys::sealing::{profile_sealing_public_key, profile_sealing_secret};
 use crate::melt::ProfileMelter;
+use crate::mint::error::MintResult;
+use crate::mint::reward_distributor_evidence::{
+    PendingRewardDistributor, PendingRewardDistributorRecord,
+};
 use crate::profile_mint::ProfileMinter;
 use crate::reward_distributor_mint::RewardDistributorMinter;
 use crate::session_residency::Residency;
@@ -153,6 +158,39 @@ impl UnlockedAccount {
     /// [`reward_distributor_minter`](Self::reward_distributor_minter).
     pub fn reward_distributor_minter_at(&self, ix: ProfileIx) -> RewardDistributorMinter {
         RewardDistributorMinter::new(self.seed.clone(), ix, self.residency.clone())
+    }
+
+    /// Rebuild an in-flight reward-distributor mint this host persisted as `record`, for the
+    /// default profile (`SPEC.md` §6BB.6a).
+    ///
+    /// The named twin of [`reward_distributor_minter`](Self::reward_distributor_minter) plus
+    /// [`RewardDistributorMinter::resume`], with the profile parity `begin` already has. The work
+    /// — and every refusal, including the ownership proof against this account's OWN puzzle hashes
+    /// — lives on the minter, because the minter is what holds the seed; this is a delegation and
+    /// adds nothing.
+    pub fn resume_reward_distributor<C>(
+        &self,
+        record: &PendingRewardDistributorRecord,
+        chain: &C,
+    ) -> MintResult<PendingRewardDistributor>
+    where
+        C: ChainSource + ?Sized,
+    {
+        self.resume_reward_distributor_at(self.default_profile_ix, record, chain)
+    }
+
+    /// Rebuild an in-flight reward-distributor mint for the profile at `ix`. See
+    /// [`resume_reward_distributor`](Self::resume_reward_distributor).
+    pub fn resume_reward_distributor_at<C>(
+        &self,
+        ix: ProfileIx,
+        record: &PendingRewardDistributorRecord,
+        chain: &C,
+    ) -> MintResult<PendingRewardDistributor>
+    where
+        C: ChainSource + ?Sized,
+    {
+        self.reward_distributor_minter_at(ix).resume(record, chain)
     }
 
     /// An editor for the profiles this account already owns.

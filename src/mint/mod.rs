@@ -53,7 +53,8 @@ pub use error::{MintError, MintResult};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use profile::ProfileMintStatus;
 pub use reward_distributor_evidence::{
-    ConfirmedRewardDistributor, PendingRewardDistributor, RewardDistributorStatus,
+    ConfirmedRewardDistributor, PendingRewardDistributor, PendingRewardDistributorRecord,
+    RewardDistributorStatus,
 };
 pub use seed::ProfileSeed;
 pub use status::MintStatus;
