@@ -1925,6 +1925,16 @@ the shape §6BB's build produces it:
 Every `coin_record` answer used above MUST be checked to have the coin id that was ASKED for. A
 source that answers a different question cannot prove anything here.
 
+**What rules 8 and 9 do NOT establish, stated rather than implied.** They bind both LAUNCHER ids to
+`funding_coin_id`. `reward_cat_coin_id` remains bound only by rule 7 — it is proven to be a $DIG
+coin of this account's, not proven to be the CAT this particular launch consumed. Binding it would
+need a further walk through the offer's settlement CAT and the launch's interim CAT coin, at more
+reads than the property is worth: with rules 8 and 9 in place an attacker cannot reach a
+`ConfirmedRewardDistributor` at all, because the launchers are the ids `status` compares the chain's
+answers against, and the one place `reward_cat_coin_id` is load-bearing on its own — the
+proof-of-death path to `Failed` (§6BB.8, step 3) — is unreachable from a resumed pending by the
+clause above. A future change that made `Failed` reachable from a resumed record MUST revisit this.
+
 **Reserve.** There is no `requested_reserve_base_units` rule, because there is no such field: see
 the §6BB intro.
 
