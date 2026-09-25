@@ -139,6 +139,7 @@ fn request(fixture: &Fixture) -> RewardDistributorMintRequest {
     RewardDistributorMintRequest {
         funding: fixture.funding,
         reward_cat: fixture.reward_cat,
+        reserve_base_units: fixture.reward_cat.coin.amount,
         manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(fixture.wallet.public_key()),
         distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
         first_epoch_start: FIRST_EPOCH_START,

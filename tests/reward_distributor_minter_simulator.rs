@@ -163,6 +163,7 @@ fn request_for(
     RewardDistributorMintRequest {
         funding,
         reward_cat,
+        reserve_base_units: reward_cat.coin.amount,
         manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(manager_pubkey),
         distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
         first_epoch_start: FIRST_EPOCH_START,
