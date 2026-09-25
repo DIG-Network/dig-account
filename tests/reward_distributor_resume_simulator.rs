@@ -15,7 +15,7 @@
 //!
 //! `begin` has no such gap only because it DERIVES the launcher ids from the bundle it builds. A
 //! record carries them as data, so `resume` re-establishes the binding from the chain: see
-//! `SPEC.md` §6BB.6a rules 9 and 10.
+//! `SPEC.md` §6BB.6a rules 8 and 9.
 //!
 //! # Every fixture resumes from a state production actually reaches
 //!
@@ -181,7 +181,7 @@ fn pushed_and_included(chain: &SimulatorChain, funded: &Funded) -> PendingReward
             .expect("a reachable chain answers")
             .is_some(),
         "the fixture must reach production's state: an included launch has a launcher coin, \
-         which is what the ancestry walk in SPEC §6BB.6a rule 10 reads"
+         which is what the ancestry walk in SPEC §6BB.6a rule 9 reads"
     );
 
     pending

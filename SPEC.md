@@ -2032,7 +2032,7 @@ an optimisation, not an obligation.
 
 **Both coins are SPENT at resume time, and that is the expected state.** The mint the record
 describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role
-(§6BB.8, step 3). Rules 7 and 8 therefore compare only the puzzle hash of whatever the chain
+(§6BB.8, step 3). Rules 6 and 7 therefore compare only the puzzle hash of whatever the chain
 reports, and MUST NOT require `spent_height.is_none()`: a resume that demanded an unspent coin
 would refuse every legitimate record.
 

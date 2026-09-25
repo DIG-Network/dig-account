@@ -352,7 +352,7 @@ impl RewardDistributorMinter {
     }
 
     /// The second OWNERSHIP half, and the one that binds the record to THIS mint: both launcher
-    /// ids must descend from `record.funding_coin_id` (`SPEC.md` §6BB.6a rules 9 and 10).
+    /// ids must descend from `record.funding_coin_id` (`SPEC.md` §6BB.6a rules 8 and 9).
     ///
     /// Costs exactly **two** `coin_record` reads, both on the distributor leg. The manager leg is
     /// a derivation, and the settlement coin at the end of the distributor leg is a derivation too
