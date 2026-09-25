@@ -169,6 +169,6 @@ fn both_dig_constants_lines_agree_on_the_dig_asset_id() {
     assert_eq!(
         dig_curried_puzzle_hash(P2),
         cat_curried_puzzle_hash(reserve_asset_id, P2),
-        "the curried hash `resume` measures a record's reward CAT coin against is not the one a          distributor's reserve asset id produces; `resume` would reject every legitimate record"
+        "the curried hash `resume` measures a record's reward CAT coin against is not the one a distributor's reserve asset id produces; `resume` would reject every legitimate record"
     );
 }

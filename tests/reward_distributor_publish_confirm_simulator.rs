@@ -242,7 +242,7 @@ fn a_launched_distributor_reports_a_zero_reserve_and_refunds_the_whole_cat() {
     assert_eq!(
         snapshot.distributor().reserve.coin.amount,
         0,
-        "the launch creates the reserve coin EMPTY; any non-zero reading here means the driver          changed and the `reserve_base_units` withdrawal (#68) has to be revisited"
+        "the launch creates the reserve coin EMPTY; any non-zero reading here means the driver changed and the `reserve_base_units` withdrawal (#68) has to be revisited"
     );
 
     // The other half of the same claim: the offered CAT came back whole, to this wallet, findable.
