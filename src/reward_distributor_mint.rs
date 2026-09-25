@@ -880,7 +880,7 @@ mod tests {
         // `dig_cat_coins` and `resume` are the 6 pub-qualified methods on the inherent impl
         // today. `live_wallet_key`, `parse_consistent_record`, `prove_coin_is_ours`,
         // `prove_launchers_descend_from_the_funding_coin`, `read_coin`, `launcher_absent`,
-        // `malformed` and `not_yours` are private and exempt. RE-CHECKED deliberately for the
+        // `malformed`, `not_yours` and `unusable_spend_height` are private and exempt. RE-CHECKED deliberately for the
         // launcher-ancestry binding, the typed rejection, and the confirmed-launcher /
         // dead-launch split: every one of those additions is a private associated fn, and
         // removing `requested_reserve_base_units` removed no method from THIS type, so the count

@@ -2121,8 +2121,8 @@ guard is not advisory: a fresh mint over a coin with a live in-flight spend is r
 the wait it is and MUST NOT retry around it.
 
 That guard is NOT what makes the arrangement safe for the host this clause is written for.
-`CoinReservations` is a set the CALLER supplies; the amnesiac restart `resume` exists to serve lost
-it along with the `PendingRewardDistributor` it lost, passes an empty set, and the guard is silent.
+`CoinReservations` is a set the CALLER supplies; the host the amnesiac restart `resume` exists to
+serve lost it along with the `PendingRewardDistributor` it lost, passes an empty set, and the guard is silent.
 What holds unconditionally is the same-coins MUST above: consensus admits at most ONE bundle
 spending `funding_coin_id`, so a mis-timed re-mint over the same coins races and loses rather than
 funding a second distributor, and the loser converges on `LaunchDead`. The reservation store turns

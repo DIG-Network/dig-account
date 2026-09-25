@@ -755,9 +755,10 @@ fn confirmed_height(chain: &SimulatorChain, coin_id: Bytes32) -> u32 {
 /// depth explicitly, because a fixture that merely sat under the bar would prove the floor was
 /// never reached rather than that it holds.
 ///
-/// Mutation M16: delete the `spent_height == 0` arm of
-/// `RewardDistributorMinter::unusable_spend_height` and this test goes red, while every other
-/// dead-launch test stays green.
+/// Mutation M16: delete the `spent_height < created_at` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test AND
+/// `a_spend_height_before_the_funding_coin_existed_is_unproven_not_a_dead_launch` both go red —
+/// the predate arm, not a genesis arm, is what refuses the zero-fill shape.
 #[test]
 fn a_zero_filled_spent_height_is_unproven_not_a_dead_launch() {
     let chain = SimulatorChain::new();
@@ -815,16 +816,19 @@ fn a_zero_filled_spent_height_is_unproven_not_a_dead_launch() {
 /// later — a source whose heights are not the chain's heights — and it is caught for free, because
 /// `confirmed_height` rides on the SAME authenticated record the spend height came from.
 ///
-/// The fabricated height is asserted non-zero, so the genesis arm cannot be what refuses this.
+/// The fabricated height is asserted non-zero, so this fixture is distinct from the zero-fill
+/// shape above rather than a second spelling of it.
 ///
-/// Mutation M16b: delete the `spent_height < created_at` arm of
-/// `RewardDistributorMinter::unusable_spend_height` and this test goes red.
+/// Mutation M16: delete the `spent_height < created_at` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test goes red — the SAME arm and the
+/// same mutation as the zero-fill test above, which is why both carry one label: there is one arm,
+/// covered by two tests.
 #[test]
 fn a_spend_height_before_the_funding_coin_existed_is_unproven_not_a_dead_launch() {
     let chain = SimulatorChain::new();
     // The funding coin is created a few blocks in, so that a height BELOW it is still above
     // genesis: a fixture whose coin was confirmed in block 1 could only predate it with a zero,
-    // and the zero arm — not this one — would be what refused it.
+    // which is the zero-fill fixture above rather than a second, independent shape.
     chain.bury(3);
     let a = funded_account(&chain, "account-a", 0x5A);
     let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
