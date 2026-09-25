@@ -616,32 +616,32 @@ impl RewardDistributorMinter {
     /// An ABSENT or genesis `confirmed_height` is itself disqualifying rather than something to
     /// default: it is a record claiming a spend of a coin it cannot place on chain, and an
     /// unplaceable coin must never license an answer that cannot be taken back.
+    ///
+    /// There is deliberately no separate `spent_height == 0` arm even though the zero-fill is the
+    /// motivating case. Once the creation height is known to be real, a zero spend height IS a
+    /// spend before the coin existed, so a genesis arm could never fire — and an arm that cannot
+    /// fire is one a delete-probe reports as load-bearing when the arm beside it is doing the work.
+    /// The zero-fill shape is covered by
+    /// `a_zero_filled_spent_height_is_unproven_not_a_dead_launch`, which exercises it end to end
+    /// through the arm that actually refuses it.
     fn unusable_spend_height(funding: &CoinRecord, spent_height: u32) -> Option<String> {
         let Some(created_at) = funding.confirmed_height else {
             return Some(
-                "the same record gives that coin no confirmed height at all, so the chain \
-                 cannot place the coin the spend is claimed against"
+                "the same record gives that coin no confirmed height at all, so the chain cannot \
+                 place the coin whose spend is being claimed"
                     .to_string(),
             );
         };
         if created_at == 0 {
             return Some(
-                "the same record places the coin's own creation in block 0, which no coin has"
-                    .to_string(),
-            );
-        }
-        if spent_height == 0 {
-            return Some(
-                "no coin is spent in block 0, so a zero here is a source zero-filling the \
-                 field rather than leaving it empty, the shape in which an UNSPENT coin reads \
-                 as spent"
+                "the same record places that coin's own creation in block 0, which no coin has"
                     .to_string(),
             );
         }
         if spent_height < created_at {
             return Some(format!(
-                "the same record places that coin's creation later, at height {created_at}, \
-                 and no coin is spent before it exists"
+                "the same record places that coin's creation later, at height {created_at}, and no \
+                 coin is spent before it exists"
             ));
         }
         None

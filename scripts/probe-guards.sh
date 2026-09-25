@@ -272,11 +272,15 @@ probe "G28 an unknowable peak refuses rather than assuming one" $R \
         };' \
   'let peak = peak_height(chain).unwrap_or(0);'
 
-probe "G29 a ZERO-FILLED spend height is not evidence" $R \
-  'if spent_height == 0 {' \
+probe "G29 a funding record with no creation height is not evidence" $R \
+  'let Some(created_at) = funding.confirmed_height else {' \
+  'let Some(created_at) = funding.confirmed_height.or(Some(1)) else {'
+
+probe "G30 a creation height in genesis is not evidence" $R \
+  'if created_at == 0 {' \
   'if false {'
 
-probe "G30 a spend height predating the coin is not evidence" $R \
+probe "G31 a spend height predating the coin is not evidence" $R \
   'if spent_height < created_at {' \
   'if false {'
 

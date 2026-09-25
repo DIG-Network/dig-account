@@ -863,6 +863,98 @@ fn a_spend_height_before_the_funding_coin_existed_is_unproven_not_a_dead_launch(
     );
 }
 
+/// A funding record with NO confirmed height cannot support a terminal verdict either.
+///
+/// The burial depth is a subtraction between two heights on one record. A source serving a spend
+/// height for a coin it cannot place on chain has given half a pair, and the half it gave is the
+/// half that makes the answer terminal. The record stays live rather than defaulting the missing
+/// half to anything.
+///
+/// Mutation M17: delete the `funding.confirmed_height` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test goes red.
+#[test]
+fn a_funding_record_with_no_confirmed_height_is_unproven_not_a_dead_launch() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+    let honest_spend = spend_depth(&chain, record.funding_coin_id);
+    assert!(
+        honest_spend >= MIN_CONFIRMATION_DEPTH,
+        "the spend is genuinely buried, so ONLY the missing creation height can refuse here"
+    );
+
+    // The same node now serves that coin without a creation height.
+    chain.report_confirmed_at(record.funding_coin_id, None);
+    assert!(
+        chain
+            .coin_record(record.funding_coin_id)
+            .expect("a reachable chain answers")
+            .expect("the funding coin exists on chain")
+            .confirmed_height
+            .is_none(),
+        "the fixture must really be the half-pair shape: a spend height with no creation height"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("half a height pair is not proof of anything"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a coin the source cannot place on chain must not license the one answer a host cannot \
+         take back: {rejected:?}"
+    );
+}
+
+/// A funding record whose own creation is in block 0 cannot support a terminal verdict.
+///
+/// The genesis floor `MintEvidence::from_confirmed` applies to a confirmation height, applied to
+/// the OTHER end of the same subtraction: no coin is created in block 0, so a record claiming it is
+/// a fabrication, and a fabricated creation height makes every spend height measured against it
+/// meaningless.
+///
+/// Mutation M18: delete the `created_at == 0` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test goes red.
+#[test]
+fn a_funding_record_created_in_genesis_is_unproven_not_a_dead_launch() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    chain.report_spent(record.funding_coin_id);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+    let honest_spend = chain
+        .coin_record(record.funding_coin_id)
+        .expect("a reachable chain answers")
+        .expect("the funding coin exists on chain")
+        .spent_height
+        .expect("the fixture reports the coin as spent");
+    chain.report_confirmed_at(record.funding_coin_id, Some(0));
+    assert!(
+        honest_spend > 0,
+        "the spend height stays HONEST and above genesis, so only the creation height can refuse"
+    );
+    assert!(
+        spend_depth(&chain, record.funding_coin_id) >= MIN_CONFIRMATION_DEPTH,
+        "the spend is genuinely buried: this fixture moves the CREATION height and nothing else"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a coin claimed to be created in genesis is a fabricated record"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a creation height no chain produced makes the depth measured against it meaningless, and \
+         a meaningless depth must not be terminal: {rejected:?}"
+    );
+}
+
 /// A source that exposes NO peak cannot buy a terminal verdict: `ChainUnreachable`, not
 /// `LaunchDead`.
 ///
