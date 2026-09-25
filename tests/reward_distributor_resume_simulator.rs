@@ -730,6 +730,139 @@ fn a_funding_spend_too_shallow_to_be_final_is_unproven_not_dead() {
     );
 }
 
+/// The confirmed height the chain reports for `coin_id` — the floor a spend height is measured
+/// against, read from the same record production reads it from.
+fn confirmed_height(chain: &SimulatorChain, coin_id: Bytes32) -> u32 {
+    chain
+        .coin_record(coin_id)
+        .expect("a reachable chain answers")
+        .expect("the coin exists on chain")
+        .confirmed_height
+        .expect("the fixture's coin is confirmed")
+}
+
+/// A ZERO-FILLED `spent_height` on an UNSPENT funding coin is `Unproven`, never `LaunchDead`.
+///
+/// `CoinRecord::is_spent` is `spent_height.is_some()`, so "spent" is whatever the source put in
+/// the field. The full-node RPC shape reports `spent_block_index: 0` for an unspent coin, and
+/// `chia-query`'s peer translation produces the same representation
+/// (`spent_height: cs.spent_height.unwrap_or(0)`) — so `Some(0)` about a coin nobody has touched
+/// is a live shape in this ecosystem, not a hypothetical.
+///
+/// It is the worst possible input to the burial rule: `peak - 0 + 1` clears
+/// `MIN_CONFIRMATION_DEPTH` by the widest margin any number can, so the check written to make a
+/// terminal verdict HARDER is exactly what waves this one through. The test asserts that naive
+/// depth explicitly, because a fixture that merely sat under the bar would prove the floor was
+/// never reached rather than that it holds.
+///
+/// Mutation M16: delete the `spent_height == 0` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test goes red, while every other
+/// dead-launch test stays green.
+#[test]
+fn a_zero_filled_spent_height_is_unproven_not_a_dead_launch() {
+    let chain = SimulatorChain::new();
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    // Nobody spends the funding coin. The SOURCE merely zero-fills the field.
+    chain.report_spent_at(record.funding_coin_id, 0);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+
+    let funding = chain
+        .coin_record(record.funding_coin_id)
+        .expect("a reachable chain answers")
+        .expect("the funding coin exists on chain");
+    assert_eq!(
+        funding.spent_height,
+        Some(0),
+        "the fixture must really be the zero-fill shape: a Some(0) spent height"
+    );
+    assert!(
+        funding.is_spent(),
+        "the zero-fill shape reads as SPENT through the only predicate the crate has, which is why \
+         a floor on the VALUE is the check that has to catch it"
+    );
+    assert!(
+        spend_depth(&chain, record.funding_coin_id) >= MIN_CONFIRMATION_DEPTH,
+        "the fabricated height must CLEAR the burial bar, or this fixture would be testing the \
+         depth rule rather than the floor under it"
+    );
+    assert!(
+        chain
+            .coin_record(record.distributor_launcher_id)
+            .expect("a reachable chain answers")
+            .is_none(),
+        "the fixture must be the terminal pair otherwise: no launcher coin"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a launch that has not landed cannot be proven"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a coin nobody spent must never be reported as a DEAD launch: LaunchDead tells the user \
+         their coins are back and invites a second mint over coins the first still holds: \
+         {rejected:?}"
+    );
+}
+
+/// A spend height that PREDATES the coin's own creation is `Unproven`, never `LaunchDead`.
+///
+/// The second floor `MintEvidence::from_confirmed` applies, on the rejecting side: a coin cannot
+/// be spent in a block that existed before it did. This is the zero-fill fabrication one block
+/// later — a source whose heights are not the chain's heights — and it is caught for free, because
+/// `confirmed_height` rides on the SAME authenticated record the spend height came from.
+///
+/// The fabricated height is asserted non-zero, so the genesis arm cannot be what refuses this.
+///
+/// Mutation M16b: delete the `spent_height < created_at` arm of
+/// `RewardDistributorMinter::unusable_spend_height` and this test goes red.
+#[test]
+fn a_spend_height_before_the_funding_coin_existed_is_unproven_not_a_dead_launch() {
+    let chain = SimulatorChain::new();
+    // The funding coin is created a few blocks in, so that a height BELOW it is still above
+    // genesis: a fixture whose coin was confirmed in block 1 could only predate it with a zero,
+    // and the zero arm — not this one — would be what refused it.
+    chain.bury(3);
+    let a = funded_account(&chain, "account-a", 0x5A);
+    let record = PendingRewardDistributorRecord::from(&pushed_not_included(&chain, &a));
+
+    let created_at = confirmed_height(&chain, record.funding_coin_id);
+    let before_it_existed = created_at - 1;
+    assert!(
+        before_it_existed > 0,
+        "the fixture must predate WITHOUT being genesis, or the zero floor would be what refuses \
+         it and this test would prove nothing about the predate floor"
+    );
+
+    chain.report_spent_at(record.funding_coin_id, before_it_existed);
+    chain.bury(MIN_CONFIRMATION_DEPTH);
+    assert!(
+        spend_depth(&chain, record.funding_coin_id) >= MIN_CONFIRMATION_DEPTH,
+        "the fabricated height must CLEAR the burial bar, so only the floor can refuse"
+    );
+    assert!(
+        chain
+            .coin_record(record.distributor_launcher_id)
+            .expect("a reachable chain answers")
+            .is_none(),
+        "the fixture must be the terminal pair otherwise: no launcher coin"
+    );
+
+    let rejected = rejection(
+        a.account
+            .resume_reward_distributor(&record, &chain)
+            .expect_err("a launch that has not landed cannot be proven"),
+    );
+    assert!(
+        matches!(rejected, RecordRejection::Unproven { .. }),
+        "a spend the chain places before the coin existed is a fabricated height, and a fabricated \
+         height must not be the most convincing evidence in the system: {rejected:?}"
+    );
+}
+
 /// A source that exposes NO peak cannot buy a terminal verdict: `ChainUnreachable`, not
 /// `LaunchDead`.
 ///

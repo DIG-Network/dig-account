@@ -2033,6 +2033,20 @@ and the record stays live. This costs ONE `peak_height` read, on that arm only, 
 closed: a source that exposes no peak yields `MintError::ChainUnreachable`, never a verdict,
 because an unknowable depth cannot license an answer that cannot be taken back.
 
+**The height the burial is computed from MUST be a height the chain could have produced.** Burial is
+arithmetic on a number the SOURCE supplied, and it is most convincing exactly where that number is
+least trustworthy. `CoinRecord::is_spent()` is `spent_height.is_some()`, so a source that ZERO-FILLS
+`spent_block_index` instead of nulling it — the full-node RPC shape, in which `0` means UNSPENT, and
+the representation `chia-query`'s peer translation produces — reports `Some(0)` for a coin nobody has
+touched; `peak - 0 + 1` is `peak + 1`, which clears any bar. `LaunchDead` therefore MUST NOT be
+returned unless the funding record's own `confirmed_height` is present and non-zero and its
+`spent_height` is neither zero nor below that `confirmed_height` — the same genesis and no-predate
+floors §6BB.7 rule (c) already applies to an ACCEPTED confirmation, adopted here with the arithmetic
+rather than after it. Both floors read the SAME authenticated record the spend height came from, so
+they cost no extra read. Below any of them the answer is `RecordRejection::Unproven`. This is
+robustness against a buggy or stale source, not a defence against a deliberate liar: the
+`ChainSource` is the trust root, and a liar can pick a plausible height instead.
+
 The asymmetry this removes is the reason it is normative rather than advisory. Burying the
 ACCEPTING direction and not the REJECTING one puts the cheaper bar on the more expensive mistake:
 an over-eager accept is retryable, while `LaunchDead` tells a user their coins are back and invites
@@ -2040,14 +2054,26 @@ a fresh mint over coins a re-confirming bundle is about to take.
 
 **`LaunchDead` assumes one source is SELF-CONSISTENT across two coins, and that assumption is
 stated rather than relied on silently.** The verdict pairs a `spent_height` for the funding coin
-with an absence for the launcher, both from the same `ChainSource`. A source that reported the
-funding coin spent while not yet serving the launcher created in that very block would hand an
-honest owner a terminal answer. The burial requirement above is what bounds this: a source has to
-be inconsistent across `MIN_CONFIRMATION_DEPTH` blocks of history, not across one read pair.
-Hosts that care about the residual beyond that MUST pass an aggregating or trusted `ChainSource`
-(`dig-chainsource-interface`'s registry exists for this) — the same mitigation §6BB.7 names for
-evidence, for the same reason: no check inside this crate can audit a single source's testimony
-against itself.
+with an absence for the launcher, both from the same `ChainSource`, and measures the depth against
+a peak from that same source. A source that reported the funding coin spent while not yet serving
+the launcher created in that very block would hand an honest owner a terminal answer.
+
+The burial requirement above bounds this ONLY for a source that is SELF-CONSISTENT across the three
+reads: against a single peer it forces an inconsistency spanning `MIN_CONFIRMATION_DEPTH` blocks of
+history rather than one read pair. It does NOT bound a source that serves the three reads from
+different views. A registry that round-robins across peers can answer the funding record and the
+peak from a current peer and the launcher record from a peer six or more blocks behind: each answer
+is internally honest, the pair is exactly the skew this clause exists to stop, and the depth —
+measured against the OTHER peer's peak — clears the bar. An aggregating source is therefore not a
+strictly stronger source here, and a host that added one to harden this could weaken it.
+
+A `ChainSource` a host passes to `resume` MUST therefore satisfy one of two things: it serves all
+three reads of one `resume` call from ONE peer, or it never serves a view more than
+`MIN_CONFIRMATION_DEPTH` blocks behind its own reported peak. `dig-chainsource-interface`'s registry
+MUST be configured to one of those before it is used here; §6BB.7's recommendation of an aggregating
+or trusted source stands for EVIDENCE, where the reads are not compared against each other, and does
+not carry to this verdict unchanged. Beyond that bound the residual is irreducible in this crate: no
+check inside it can audit a single source's testimony against itself.
 
 **What `Unproven` still does not tell a host, stated rather than implied.** A bundle dropped from
 the mempool and never included leaves the funding coin UNSPENT, so the predicate above does not
@@ -2089,11 +2115,19 @@ establish that the funding coin is unspent, which is the one arm the obligation 
 `detail` string MUST NOT be parsed for this (§6BB.6a's typed-rejection rule), so a host that cannot
 establish it keeps waiting.
 
-**The re-mint MUST go through the reservation store.** Whatever a host concludes, the coin-level
+**The re-mint MUST go through the reservation store, where the host still has one.** The coin-level
 guard is not advisory: a fresh mint over a coin with a live in-flight spend is refused with
-`MintError::CoinsReserved`, which means "wait", not "add funds". A host MUST surface that refusal
-as the wait it is and MUST NOT retry around it — it is the last thing standing between a
-mis-timed re-mint and two bundles racing for one coin.
+`MintError::CoinsReserved`, which means "wait", not "add funds". A host MUST surface that refusal as
+the wait it is and MUST NOT retry around it.
+
+That guard is NOT what makes the arrangement safe for the host this clause is written for.
+`CoinReservations` is a set the CALLER supplies; the amnesiac restart `resume` exists to serve lost
+it along with the `PendingRewardDistributor` it lost, passes an empty set, and the guard is silent.
+What holds unconditionally is the same-coins MUST above: consensus admits at most ONE bundle
+spending `funding_coin_id`, so a mis-timed re-mint over the same coins races and loses rather than
+funding a second distributor, and the loser converges on `LaunchDead`. The reservation store turns
+that race into a refusal for a host that still has its in-memory state; it is a first line, not a
+last one.
 
 **Both coins are SPENT at resume time, and that is the expected state.** The mint the record
 describes already spent them, which is the whole point of `funding_coin_id`'s proof-of-death role

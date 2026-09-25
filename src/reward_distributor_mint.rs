@@ -512,6 +512,14 @@ impl RewardDistributorMinter {
     /// [`MintError::ChainUnreachable`], because an unknowable depth must never license a terminal
     /// verdict.
     ///
+    /// # Why the depth is only asked for once the height is a height the chain could produce
+    ///
+    /// Burial is arithmetic on a number the SOURCE supplied, and the arithmetic is at its most
+    /// convincing exactly where the number is least trustworthy: a zero-filled `spent_height`
+    /// computes a depth of `peak + 1`. The floor
+    /// [`unusable_spend_height`](Self::unusable_spend_height) runs FIRST for that reason, from the
+    /// same authenticated record and with no extra read.
+    ///
     /// `reward_cat_coin_id` is deliberately NOT consulted: it is bound only as "a $DIG coin of
     /// this account's" (`SPEC.md` §6BB.6a rule 7), so deciding death from it would let a user's
     /// own wrong CAT id declare a live mint dead. The funding coin is bound to this launch by
@@ -538,6 +546,18 @@ impl RewardDistributorMinter {
                 ),
             });
         };
+
+        if let Some(unusable) = Self::unusable_spend_height(funding, spent_height) {
+            return MintError::RecordRejected(RecordRejection::Unproven {
+                detail: format!(
+                    "{launcher_what} {launcher_id} does not exist on chain and funding coin \
+                     {funding_id} is reported spent at height {spent_height}, but {unusable}; \
+                     a height the chain cannot have produced is not evidence the launch is \
+                     dead, and the record stays live; resume again once a source reports the \
+                     spend honestly"
+                ),
+            });
+        }
 
         let peak = match peak_height(chain) {
             Ok(peak) => peak,
@@ -570,6 +590,61 @@ impl RewardDistributorMinter {
                  record"
             ),
         })
+    }
+
+    /// Why `funding`'s reported `spent_height` is not a height the chain can have produced — the
+    /// FLOOR a terminal verdict rests on — or `None` when the pair is usable evidence.
+    ///
+    /// [`CoinRecord::is_spent`] is `spent_height.is_some()`, so "spent" is whatever the source
+    /// chose to put in the field. A source that ZERO-FILLS it rather than leaving it empty — the
+    /// full-node RPC shape, where `spent_block_index: 0` means UNSPENT, and the representation
+    /// `chia-query`'s peer translation produces (`spent_height.unwrap_or(0)`) — reports `Some(0)`
+    /// for a coin nobody has touched. That value is the WORST possible input to the burial
+    /// arithmetic below it: `peak - 0 + 1` is `peak + 1`, which clears
+    /// [`MIN_CONFIRMATION_DEPTH`] by the widest margin any number can and turns an UNSPENT funding
+    /// coin into a terminal [`RecordRejection::LaunchDead`] — telling a user their coins are back,
+    /// and inviting a second mint, while a live bundle still holds them. A fabricated height must
+    /// not be the most convincing evidence in the system.
+    ///
+    /// A coin also cannot be spent before it existed, so this checks the same two floors
+    /// `MintEvidence::from_confirmed` applies to a CONFIRMATION height (§6BB.7 rule (c)) and
+    /// `wallet::transfer` applies to a source coin's spend: not genesis, and not predating the
+    /// coin's own creation. `confirmed_height` rides on the SAME authenticated record — the
+    /// binding `prove_coin_is_ours` returns from `read_coin` — so both floors cost no extra read,
+    /// and together they are strictly stronger than a genesis check alone.
+    ///
+    /// An ABSENT or genesis `confirmed_height` is itself disqualifying rather than something to
+    /// default: it is a record claiming a spend of a coin it cannot place on chain, and an
+    /// unplaceable coin must never license an answer that cannot be taken back.
+    fn unusable_spend_height(funding: &CoinRecord, spent_height: u32) -> Option<String> {
+        let Some(created_at) = funding.confirmed_height else {
+            return Some(
+                "the same record gives that coin no confirmed height at all, so the chain \
+                 cannot place the coin the spend is claimed against"
+                    .to_string(),
+            );
+        };
+        if created_at == 0 {
+            return Some(
+                "the same record places the coin's own creation in block 0, which no coin has"
+                    .to_string(),
+            );
+        }
+        if spent_height == 0 {
+            return Some(
+                "no coin is spent in block 0, so a zero here is a source zero-filling the \
+                 field rather than leaving it empty, the shape in which an UNSPENT coin reads \
+                 as spent"
+                    .to_string(),
+            );
+        }
+        if spent_height < created_at {
+            return Some(format!(
+                "the same record places that coin's creation later, at height {created_at}, \
+                 and no coin is spent before it exists"
+            ));
+        }
+        None
     }
 
     /// A [`RecordRejection::Malformed`] as a [`MintError`], so every arm above is one expression.
