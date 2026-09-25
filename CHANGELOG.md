@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.32.0] - 2026-09-25
+
+### Features
+- **mint:** Resume binds a record to the mint that produced it; reserve knob withdrawn (#70)
+
 ## [0.31.0] - 2026-09-24
 
 ### Features
