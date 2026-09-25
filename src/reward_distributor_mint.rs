@@ -12,14 +12,15 @@ use std::sync::Arc;
 use chia_bls::PublicKey;
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::chia::consensus::consensus_constants::ConsensusConstants;
-use dig_chainsource_interface::ChainSource;
+use dig_chainsource_interface::{ChainSource, CoinRecord};
 use dig_session::UnlockedMasterSeed;
 
 use crate::id::ProfileIx;
 use crate::keys::wallet_key::WalletKey;
-use crate::mint::error::{MintError, MintResult};
+use crate::mint::error::{MintError, MintResult, OwnershipProof, RecordField, RecordRejection};
 use crate::mint::reward_distributor::{
-    begin_reward_distributor_mint, RewardDistributorMintRequest, SignedRewardDistributorMint,
+    begin_reward_distributor_mint, manager_launcher_coin, offered_xch_settlement_coin,
+    RewardDistributorMintRequest, SignedRewardDistributorMint,
 };
 use crate::mint::reward_distributor_evidence::{
     PendingRewardDistributor, PendingRewardDistributorRecord,
@@ -137,7 +138,8 @@ impl RewardDistributorMinter {
     }
 
     /// Rebuild the [`PendingRewardDistributor`] a host persisted as `record`, **after proving on
-    /// chain that the two coins it names were this profile's own** (`SPEC.md` §6BB.6a).
+    /// chain that this account's own funding coin is the coin that produced this distributor**
+    /// (`SPEC.md` §6BB.6a).
     ///
     /// # Why this door is here and not on the pending value
     ///
@@ -149,30 +151,49 @@ impl RewardDistributorMinter {
     /// — which is why `PendingRewardDistributor::new` stays crate-private and this is the one way
     /// back. Proving a record exists is not proving it is yours.
     ///
-    /// # What it refuses, and how each refusal is typed
+    /// # Ownership binds the coins to THIS mint, not merely to this account
+    ///
+    /// Proving "these two coins are mine" is not enough, and an earlier draft of this seam that
+    /// stopped there was exploitable: an attacker pairs the victim's chain-readable launcher ids
+    /// and generation with two coins of her OWN, both ownership reads pass, and `status` reports a
+    /// distributor she never funded. `begin` has no such gap only because it DERIVES the launcher
+    /// ids from the bundle it builds — they are bound to the coins by construction. A record
+    /// carries them as data, so the binding has to be re-established here, from the chain.
+    ///
+    /// It is re-established by walking the launch's own ancestry back to the funding coin, in the
+    /// exact shape [`mint::reward_distributor`](crate::mint::reward_distributor) builds it:
+    ///
+    /// - the **manager** launcher coin is `Launcher::new(funding_coin_id, …)`, so
+    ///   `manager_launcher_id` is a pure derivation from the funding coin and costs **no read**;
+    /// - the **distributor** launcher coin's parent is the launch's ephemeral security coin, whose
+    ///   own parent is the offered XCH settlement coin, whose parent is the funding coin. The
+    ///   security coin's identity depends on a random key this seam discarded, so that leg costs
+    ///   two `coin_record` reads — the launcher coin and the security coin — while the settlement
+    ///   coin at the end is derived rather than read.
+    ///
+    /// # What it refuses, and how each refusal is TYPED
     ///
     /// [`MintError::Locked`] if the account relocked, raised before any derivation.
     ///
-    /// [`MintError::Refused`] — naming which check fired — for each of:
-    /// - any of the four ids is all-zero;
-    /// - `funding_coin_id == reward_cat_coin_id` (one coin cannot be both inputs);
-    /// - `distributor_launcher_id == manager_launcher_id` (§6BB.3a: two distinct singletons);
-    /// - `requested_reserve_base_units == 0`;
-    /// - `pushed_at_height == 0` (no bundle is pushed at genesis);
-    /// - `generation` is not a parseable launch comment;
-    /// - the chain has NO record of the funding coin, or of the reward CAT coin;
-    /// - the funding coin is not at this profile's wallet puzzle hash;
-    /// - the reward CAT coin is not at this profile's $DIG CAT-curried puzzle hash.
+    /// [`MintError::RecordRejected`] otherwise, carrying a [`RecordRejection`] a host routes on
+    /// without parsing any message:
     ///
-    /// The last three are the point of the whole seam, and they are the SAME predicate
-    /// `begin_reward_distributor_mint` applies to the request it builds from — the funding coin at
-    /// the wallet's puzzle hash, the reward CAT at the wallet's p2 hash under the $DIG asset id —
-    /// so `resume` accepts exactly the coin set `begin` could have spent: no wider, no narrower.
+    /// - [`RecordRejection::Malformed`], naming the [`RecordField`], for a record that fails on
+    ///   its own bytes — an all-zero id, `funding_coin_id == reward_cat_coin_id`,
+    ///   `distributor_launcher_id == manager_launcher_id`, `pushed_at_height == 0`, or a
+    ///   `generation` that is not a parseable launch comment. Nothing is read from the chain.
+    /// - [`RecordRejection::NotYours`], naming the [`OwnershipProof`] that failed, for a record
+    ///   whose coins are not at this profile's puzzle hashes or whose launchers do not descend
+    ///   from its funding coin. A coin the chain has never heard of is NOT this account's — fail
+    ///   closed.
+    /// - [`RecordRejection::Unproven`] when the distributor's launcher coin does not exist on
+    ///   chain yet. See that variant's own docs: this is the honest answer, not a refusal.
     ///
-    /// [`MintError::ChainUnreachable`] if a read FAILS. A read failure is never a refusal: telling
-    /// a user their own record is a forgery because a node was down is a lie about their money.
+    /// [`MintError::ChainUnreachable`] if a read FAILS. A read failure is never a rejection:
+    /// telling a user their own record is a forgery because a node was down is a lie about their
+    /// money.
     ///
-    /// # Both coins are SPENT by now, and that is the expected state
+    /// # Both input coins are SPENT by now, and that is the expected state
     ///
     /// The mint this record describes already spent them — that is the whole point of
     /// `funding_coin_id`'s proof-of-death role (§6BB.8, step 3). The ownership check therefore
@@ -190,100 +211,215 @@ impl RewardDistributorMinter {
         let wallet_puzzle_hash = wallet.puzzle_hash();
         let generation = Self::parse_consistent_record(record)?;
 
-        Self::prove_coin_belongs_to_us(
+        Self::prove_coin_is_ours(
             chain,
             record.funding_coin_id,
             wallet_puzzle_hash,
+            OwnershipProof::FundingCoinIsThisAccounts,
             "the funding coin",
         )?;
-        Self::prove_coin_belongs_to_us(
+        Self::prove_coin_is_ours(
             chain,
             record.reward_cat_coin_id,
             dig_curried_puzzle_hash(wallet_puzzle_hash),
+            OwnershipProof::RewardCatCoinIsThisAccounts,
             "the reward CAT coin",
         )?;
+        Self::prove_launchers_descend_from_the_funding_coin(chain, record)?;
 
         Ok(PendingRewardDistributor::new(
             record.distributor_launcher_id,
             record.manager_launcher_id,
             record.funding_coin_id,
             record.reward_cat_coin_id,
-            record.requested_reserve_base_units,
             generation,
             record.pushed_at_height,
         ))
     }
 
-    /// The INTERNAL-CONSISTENCY half of [`resume`](Self::resume)'s refusal table.
+    /// The INTERNAL-CONSISTENCY half of [`resume`](Self::resume)'s rejection table.
     ///
-    /// Every arm returns a message naming the field that failed, so a host routing rejected
-    /// records can tell a typo from an attack. Returns the parsed generation on success, because
-    /// parsing it IS the last of these checks.
+    /// Every arm names the [`RecordField`] that failed as a VALUE, so a host routing rejected
+    /// records tells a typo from an attack by matching, never by reading prose. Returns the parsed
+    /// generation on success, because parsing it IS the last of these checks.
     fn parse_consistent_record(
         record: &PendingRewardDistributorRecord,
     ) -> MintResult<LaunchComment> {
         const ZERO: Bytes32 = Bytes32::new([0u8; 32]);
 
         for (field, id) in [
-            ("distributor_launcher_id", record.distributor_launcher_id),
-            ("manager_launcher_id", record.manager_launcher_id),
-            ("funding_coin_id", record.funding_coin_id),
-            ("reward_cat_coin_id", record.reward_cat_coin_id),
+            (
+                RecordField::DistributorLauncherId,
+                record.distributor_launcher_id,
+            ),
+            (RecordField::ManagerLauncherId, record.manager_launcher_id),
+            (RecordField::FundingCoinId, record.funding_coin_id),
+            (RecordField::RewardCatCoinId, record.reward_cat_coin_id),
         ] {
             if id == ZERO {
-                return Err(MintError::Refused(format!(
-                    "{field} is all-zero; a resumed record must name real coins"
-                )));
+                return Err(Self::malformed(
+                    field,
+                    "it is all-zero; a resumed record must name real coins",
+                ));
             }
         }
 
         if record.funding_coin_id == record.reward_cat_coin_id {
-            return Err(MintError::Refused(
-                "funding_coin_id equals reward_cat_coin_id; a mint spends two DISTINCT \
-                 pre-existing inputs"
-                    .into(),
+            return Err(Self::malformed(
+                RecordField::RewardCatCoinId,
+                "it equals funding_coin_id; a mint spends two DISTINCT pre-existing inputs",
             ));
         }
         if record.distributor_launcher_id == record.manager_launcher_id {
-            return Err(MintError::Refused(
-                "distributor_launcher_id equals manager_launcher_id; a launch creates two \
-                 DISTINCT singletons"
-                    .into(),
-            ));
-        }
-        if record.requested_reserve_base_units == 0 {
-            return Err(MintError::Refused(
-                "requested_reserve_base_units is zero; no mint requests an empty reserve".into(),
+            return Err(Self::malformed(
+                RecordField::ManagerLauncherId,
+                "it equals distributor_launcher_id; a launch creates two DISTINCT singletons",
             ));
         }
         if record.pushed_at_height == 0 {
-            return Err(MintError::Refused(
-                "pushed_at_height is zero; no bundle is pushed at genesis".into(),
+            return Err(Self::malformed(
+                RecordField::PushedAtHeight,
+                "it is zero; no bundle is pushed at genesis",
             ));
         }
 
         LaunchComment::parse(&record.generation).ok_or_else(|| {
-            MintError::Refused(format!(
-                "generation {:?} is not a parseable launch comment",
-                record.generation
-            ))
+            Self::malformed(
+                RecordField::Generation,
+                &format!("{:?} is not a parseable launch comment", record.generation),
+            )
         })
     }
 
-    /// The OWNERSHIP half: the chain's record of `coin_id` must exist and sit at
+    /// The first OWNERSHIP half: the chain's record of `coin_id` must exist and sit at
     /// `expected_puzzle_hash`.
     ///
-    /// `what` names the coin in the refusal so the two call sites are distinguishable. Fail-closed
-    /// on absence: a coin the chain has never heard of is not this account's. A read FAILURE is
-    /// [`MintError::ChainUnreachable`], never a refusal and never a pass.
+    /// `what` names the coin in the human-readable detail so the two call sites read distinctly;
+    /// `proof` is what a host actually routes on. Fail-closed on absence: a coin the chain has
+    /// never heard of is not this account's. A read FAILURE is [`MintError::ChainUnreachable`],
+    /// never a rejection and never a pass.
     ///
     /// Deliberately no `spent_height` condition — see [`resume`](Self::resume).
-    fn prove_coin_belongs_to_us<C>(
+    fn prove_coin_is_ours<C>(
         chain: &C,
         coin_id: Bytes32,
         expected_puzzle_hash: Bytes32,
+        proof: OwnershipProof,
         what: &str,
     ) -> MintResult<()>
+    where
+        C: ChainSource + ?Sized,
+    {
+        let Some(found) = Self::read_coin(chain, coin_id, what)? else {
+            return Err(Self::not_yours(
+                proof,
+                &format!(
+                    "the chain has no record of {what} {}; a record this account cannot prove \
+                     ownership of is rejected",
+                    hex::encode(coin_id)
+                ),
+            ));
+        };
+
+        if found.coin.puzzle_hash != expected_puzzle_hash {
+            return Err(Self::not_yours(
+                proof,
+                &format!(
+                    "{what} {} is not at this profile's puzzle hash; a distributor is resumed only \
+                     from a mint this account itself funded",
+                    hex::encode(coin_id)
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// The second OWNERSHIP half, and the one that binds the record to THIS mint: both launcher
+    /// ids must descend from `record.funding_coin_id` (`SPEC.md` §6BB.6a rules 9 and 10).
+    ///
+    /// Costs exactly **two** `coin_record` reads, both on the distributor leg. The manager leg is
+    /// a derivation, and the settlement coin at the end of the distributor leg is a derivation too
+    /// — see [`resume`](Self::resume) for the shape of the chain being walked.
+    fn prove_launchers_descend_from_the_funding_coin<C>(
+        chain: &C,
+        record: &PendingRewardDistributorRecord,
+    ) -> MintResult<()>
+    where
+        C: ChainSource + ?Sized,
+    {
+        let funding_coin_id = record.funding_coin_id;
+
+        // The manager leg: a pure derivation, no read at all.
+        let expected_manager = manager_launcher_coin(funding_coin_id).coin_id();
+        if record.manager_launcher_id != expected_manager {
+            return Err(Self::not_yours(
+                OwnershipProof::ManagerLauncherDescendsFromTheFundingCoin,
+                &format!(
+                    "manager_launcher_id {} is not the launcher this funding coin's own spend \
+                     creates ({}); these are not the coins that produced this mint",
+                    hex::encode(record.manager_launcher_id),
+                    hex::encode(expected_manager)
+                ),
+            ));
+        }
+
+        // The distributor leg, read 1: the launcher coin names the security coin as its parent.
+        let launcher_what = "the distributor's launcher coin";
+        let Some(launcher) = Self::read_coin(chain, record.distributor_launcher_id, launcher_what)?
+        else {
+            return Err(MintError::RecordRejected(RecordRejection::Unproven {
+                detail: format!(
+                    "{launcher_what} {} does not exist on chain, so nothing yet ties this \
+                     distributor to this account's funding coin; resume again once the launch \
+                     confirms",
+                    hex::encode(record.distributor_launcher_id)
+                ),
+            }));
+        };
+
+        // Read 2: the security coin names the offered XCH settlement coin as ITS parent.
+        let security_what = "the launch's security coin";
+        let security_coin_id = launcher.coin.parent_coin_info;
+        let Some(security) = Self::read_coin(chain, security_coin_id, security_what)? else {
+            return Err(Self::not_yours(
+                OwnershipProof::DistributorLauncherDescendsFromTheFundingCoin,
+                &format!(
+                    "{security_what} {} — the launcher coin's own parent — has no chain record, \
+                     so the descent to this account's funding coin cannot be walked",
+                    hex::encode(security_coin_id)
+                ),
+            ));
+        };
+
+        // The end of the walk is DERIVED, not read: this seam fixes every input to the settlement
+        // coin's identity, so re-deriving it is stronger than trusting a third chain answer.
+        let expected_settlement = offered_xch_settlement_coin(funding_coin_id).coin_id();
+        if security.coin.parent_coin_info != expected_settlement {
+            return Err(Self::not_yours(
+                OwnershipProof::DistributorLauncherDescendsFromTheFundingCoin,
+                &format!(
+                    "distributor_launcher_id {} traces back to settlement coin {}, not to the one \
+                     this account's funding coin creates ({}); this launch was funded by somebody \
+                     else",
+                    hex::encode(record.distributor_launcher_id),
+                    hex::encode(security.coin.parent_coin_info),
+                    hex::encode(expected_settlement)
+                ),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// One `coin_record` read, with the source's answer checked against the id that was ASKED for.
+    ///
+    /// A `ChainSource` that returns a coin whose `coin_id()` is not the requested one is answering
+    /// a different question, and every check above is a comparison against fields of that coin.
+    /// The id check costs one hash and removes a whole class of "the node said so" from the
+    /// ancestry walk. A transport failure is [`MintError::ChainUnreachable`]; an honest `None` is
+    /// returned as `None`, because absence means a different thing at each call site.
+    fn read_coin<C>(chain: &C, coin_id: Bytes32, what: &str) -> MintResult<Option<CoinRecord>>
     where
         C: ChainSource + ?Sized,
     {
@@ -294,23 +430,35 @@ impl RewardDistributorMinter {
             ))
         })?;
 
-        let Some(found) = found else {
-            return Err(MintError::Refused(format!(
-                "the chain has no record of {what} {}; a record this account cannot prove \
-                 ownership of is refused",
-                hex::encode(coin_id)
-            )));
-        };
-
-        if found.coin.puzzle_hash != expected_puzzle_hash {
-            return Err(MintError::Refused(format!(
-                "{what} {} is not at this profile's puzzle hash; a distributor is resumed only \
-                 from a mint this account itself funded",
-                hex::encode(coin_id)
-            )));
+        if let Some(found) = &found {
+            if found.coin.coin_id() != coin_id {
+                return Err(MintError::ChainUnreachable(format!(
+                    "the chain answered the read of {what} {} with a DIFFERENT coin ({}); a \
+                     source that answers a question it was not asked proves nothing here",
+                    hex::encode(coin_id),
+                    hex::encode(found.coin.coin_id())
+                )));
+            }
         }
 
-        Ok(())
+        Ok(found)
+    }
+
+    /// A [`RecordRejection::Malformed`] as a [`MintError`], so every arm above is one expression.
+    fn malformed(field: RecordField, detail: &str) -> MintError {
+        MintError::RecordRejected(RecordRejection::Malformed {
+            field,
+            detail: detail.to_string(),
+        })
+    }
+
+    /// A [`RecordRejection::NotYours`] as a [`MintError`], for the same reason as
+    /// [`malformed`](Self::malformed).
+    fn not_yours(proof: OwnershipProof, detail: &str) -> MintError {
+        MintError::RecordRejected(RecordRejection::NotYours {
+            proof,
+            detail: detail.to_string(),
+        })
     }
 }
 
@@ -527,10 +675,13 @@ mod tests {
         }
         // Pinned, not a floor: `new` (pub(crate)), `public_key`, `puzzle_hash`, `begin`,
         // `dig_cat_coins` and `resume` are the 6 pub-qualified methods on the inherent impl
-        // today — `live_wallet_key`, `parse_consistent_record` and
-        // `prove_coin_belongs_to_us` are private and exempt. A count drift in either
-        // direction means a method was added, removed, or the scan stopped seeing one that
-        // exists.
+        // today. `live_wallet_key`, `parse_consistent_record`, `prove_coin_is_ours`,
+        // `prove_launchers_descend_from_the_funding_coin`, `read_coin`, `malformed` and
+        // `not_yours` are private and exempt. RE-CHECKED deliberately for the launcher-ancestry
+        // binding and the typed rejection: those additions are all private, and removing
+        // `requested_reserve_base_units` removed no method from THIS type, so the count is
+        // unchanged at 6 rather than loosened. A count drift in either direction means a method
+        // was added, removed, or the scan stopped seeing one that exists.
         assert_eq!(
             checked, 6,
             "expected exactly 6 pub-qualified methods (new, public_key, puzzle_hash, begin, \

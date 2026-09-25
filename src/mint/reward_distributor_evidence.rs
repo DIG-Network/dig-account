@@ -50,9 +50,6 @@ pub struct PendingRewardDistributor {
     funding_coin_id: Bytes32,
     /// The reward CAT coin this mint spent. Same proof-of-death role as `funding_coin_id`.
     reward_cat_coin_id: Bytes32,
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve — a request, not
-    /// an observed reserve.
-    requested_reserve_base_units: u64,
     /// The generation (`store_id:root`) this mint's launch comment advertises.
     generation: LaunchComment,
     /// The chain's peak immediately BEFORE the push. A confirmation cannot predate it.
@@ -68,13 +65,11 @@ impl PendingRewardDistributor {
     /// would make `status` an evidence oracle. A caller supplying ANOTHER distributor's launcher id
     /// and generation would receive a [`ConfirmedRewardDistributor`] for a distributor this account
     /// never funded — proving a record exists is not proving it is yours.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         distributor_launcher_id: Bytes32,
         manager_launcher_id: Bytes32,
         funding_coin_id: Bytes32,
         reward_cat_coin_id: Bytes32,
-        requested_reserve_base_units: u64,
         generation: LaunchComment,
         pushed_at_height: u32,
     ) -> Self {
@@ -83,7 +78,6 @@ impl PendingRewardDistributor {
             manager_launcher_id,
             funding_coin_id,
             reward_cat_coin_id,
-            requested_reserve_base_units,
             generation,
             pushed_at_height,
         }
@@ -111,12 +105,6 @@ impl PendingRewardDistributor {
     #[must_use]
     pub const fn reward_cat_coin_id(&self) -> Bytes32 {
         self.reward_cat_coin_id
-    }
-
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve.
-    #[must_use]
-    pub const fn requested_reserve_base_units(&self) -> u64 {
-        self.requested_reserve_base_units
     }
 
     /// The generation (`store_id:root`) this mint's launch comment advertises.
@@ -166,8 +154,6 @@ pub struct PendingRewardDistributorRecord {
     pub funding_coin_id: Bytes32,
     /// The reward CAT coin the mint spent.
     pub reward_cat_coin_id: Bytes32,
-    /// The $DIG base units the mint REQUESTED go into the reserve.
-    pub requested_reserve_base_units: u64,
     /// The generation in its canonical launch-comment string form (`LaunchComment::to_string`).
     pub generation: String,
     /// The chain's peak immediately BEFORE the push.
@@ -181,7 +167,6 @@ impl From<&PendingRewardDistributor> for PendingRewardDistributorRecord {
             manager_launcher_id: pending.manager_launcher_id(),
             funding_coin_id: pending.funding_coin_id(),
             reward_cat_coin_id: pending.reward_cat_coin_id(),
-            requested_reserve_base_units: pending.requested_reserve_base_units(),
             generation: pending.generation().to_string(),
             pushed_at_height: pending.pushed_at_height(),
         }
@@ -204,9 +189,6 @@ pub struct ConfirmedRewardDistributor {
     confirmed_height: u32,
     /// The generation (`store_id:root`) this distributor pays mirrors of.
     generation: LaunchComment,
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve, carried through
-    /// from `pending`. See `SPEC.md` §6BB.9: this is not proof a live reserve of this size exists.
-    requested_reserve_base_units: u64,
 }
 
 /// Names exactly one of the five rules `from_confirmed` applies (`SPEC.md` §6BB.7), so a `Failed`
@@ -304,7 +286,6 @@ impl ConfirmedRewardDistributor {
                 .confirmed_height
                 .expect("check() returned Ok, which requires confirmed_height to be Some"),
             generation: pending.generation(),
-            requested_reserve_base_units: pending.requested_reserve_base_units(),
         })
     }
 
@@ -330,16 +311,6 @@ impl ConfirmedRewardDistributor {
     #[must_use]
     pub const fn generation(&self) -> LaunchComment {
         self.generation
-    }
-
-    /// The $DIG base units this mint REQUESTED go into the distributor's reserve.
-    ///
-    /// This is not proof a live reserve of this size exists (`SPEC.md` §6BB.9): the distributor's
-    /// live reserve is read through `dig-rewards-coin`'s own state readers, never inferred from
-    /// this evidence.
-    #[must_use]
-    pub const fn requested_reserve_base_units(&self) -> u64 {
-        self.requested_reserve_base_units
     }
 }
 
@@ -410,7 +381,6 @@ mod tests {
             Bytes32::new([0x22; 32]),
             Bytes32::new([0x33; 32]),
             Bytes32::new([0x44; 32]),
-            1_000,
             generation,
             PUSHED_AT,
         )
@@ -453,10 +423,6 @@ mod tests {
         );
         assert_eq!(evidence.confirmed_height(), PUSHED_AT);
         assert_eq!(evidence.generation(), pending.generation());
-        assert_eq!(
-            evidence.requested_reserve_base_units(),
-            pending.requested_reserve_base_units()
-        );
     }
 
     /// An UNCONFIRMED record is a mempool observation. Mutation: turn the `confirmed_height?` early
@@ -512,7 +478,6 @@ mod tests {
             Bytes32::new([0x22; 32]),
             Bytes32::new([0x33; 32]),
             Bytes32::new([0x44; 32]),
-            1_000,
             gen,
             0,
         );

@@ -11,6 +11,131 @@
 /// A mint result.
 pub type MintResult<T> = std::result::Result<T, MintError>;
 
+/// One field of a persisted `PendingRewardDistributorRecord`, named as a VALUE.
+///
+/// Carried by [`RecordRejection::Malformed`] so a host can route on which field is wrong without
+/// reading the prose beside it. A message is a copy-edit away from breaking every caller that
+/// matched on it; a variant is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RecordField {
+    /// `distributor_launcher_id`.
+    DistributorLauncherId,
+    /// `manager_launcher_id`.
+    ManagerLauncherId,
+    /// `funding_coin_id`.
+    FundingCoinId,
+    /// `reward_cat_coin_id`.
+    RewardCatCoinId,
+    /// `generation`.
+    Generation,
+    /// `pushed_at_height`.
+    PushedAtHeight,
+}
+
+impl RecordField {
+    /// The field's name as it is spelled in the record's own source and in its persisted JSON.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DistributorLauncherId => "distributor_launcher_id",
+            Self::ManagerLauncherId => "manager_launcher_id",
+            Self::FundingCoinId => "funding_coin_id",
+            Self::RewardCatCoinId => "reward_cat_coin_id",
+            Self::Generation => "generation",
+            Self::PushedAtHeight => "pushed_at_height",
+        }
+    }
+}
+
+impl std::fmt::Display for RecordField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// WHICH ownership proof a resumed record failed, as a VALUE (`SPEC.md` §6BB.6a).
+///
+/// Each variant names one thing `resume` must establish before a record becomes a
+/// `PendingRewardDistributor`. The two descent proofs are what make ownership a statement about
+/// THIS mint rather than about two unrelated coins the account happens to own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OwnershipProof {
+    /// The funding coin exists on chain and sits at this profile's wallet puzzle hash.
+    FundingCoinIsThisAccounts,
+    /// The reward CAT coin exists on chain and sits at this profile's $DIG-curried puzzle hash.
+    RewardCatCoinIsThisAccounts,
+    /// `manager_launcher_id` is the launcher the funding coin's own spend creates.
+    ManagerLauncherDescendsFromTheFundingCoin,
+    /// `distributor_launcher_id`'s launcher coin traces back, through the launch's security coin
+    /// and the offered XCH settlement coin, to the funding coin.
+    DistributorLauncherDescendsFromTheFundingCoin,
+}
+
+impl std::fmt::Display for OwnershipProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FundingCoinIsThisAccounts => "the funding coin is this account's",
+            Self::RewardCatCoinIsThisAccounts => "the reward CAT coin is this account's",
+            Self::ManagerLauncherDescendsFromTheFundingCoin => {
+                "the manager launcher descends from the funding coin"
+            }
+            Self::DistributorLauncherDescendsFromTheFundingCoin => {
+                "the distributor launcher descends from the funding coin"
+            }
+        })
+    }
+}
+
+/// Why a persisted `PendingRewardDistributorRecord` did not come back as a
+/// `PendingRewardDistributor` — **typed**, because a host routes on it.
+///
+/// dig-app keeps rejected records in a different map from live ones, and the three cases mean
+/// different things to a user: [`Malformed`](Self::Malformed) is a typo or a corrupted store,
+/// [`NotYours`](Self::NotYours) is a record describing somebody else's mint, and
+/// [`Unproven`](Self::Unproven) is "ask again later". A fourth case — the node could not be
+/// reached at all — stays [`MintError::ChainUnreachable`], because nothing about the record is in
+/// question there.
+///
+/// The `detail` strings are for humans and logs ONLY. Nothing may parse them: they are prose and
+/// will be reworded. Every routing decision a host needs is in the variant and in the typed field
+/// beside it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecordRejection {
+    /// A field of the record is internally inconsistent. Nothing was read from the chain.
+    #[error("the record's {field} is malformed: {detail}")]
+    Malformed {
+        /// Which field failed.
+        field: RecordField,
+        /// Human-readable prose. Never parse this.
+        detail: String,
+    },
+
+    /// The record describes a mint this account did not make. This is the attack case.
+    #[error("this record is not this account's — {proof} could not be established: {detail}")]
+    NotYours {
+        /// Which ownership proof failed.
+        proof: OwnershipProof,
+        /// Human-readable prose. Never parse this.
+        detail: String,
+    },
+
+    /// The record MAY be this account's, and the chain cannot yet say either way.
+    ///
+    /// The distributor launcher coin does not exist until the launch bundle is included in a
+    /// block, and without it there is no ancestry to walk back to the funding coin. Accepting the
+    /// record anyway would hand a stranger a pending value that turns into evidence the moment the
+    /// real owner's bundle confirms; refusing it as a forgery would be a false statement about the
+    /// real owner's own money. So it is neither: the host retries once the launch confirms.
+    #[error("this record cannot be proven yet: {detail}")]
+    Unproven {
+        /// Human-readable prose. Never parse this.
+        detail: String,
+    },
+}
+
 /// Why a DID mint did not produce on-chain evidence.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -97,6 +222,16 @@ pub enum MintError {
     /// in progress there, or the entry names a DID-only mint that has no profile seed to resume.
     #[error("the profile registry refused this mint: {0}")]
     Journal(String),
+
+    /// A persisted reward-distributor record was not turned back into a pending mint
+    /// (`SPEC.md` §6BB.6a).
+    ///
+    /// Its own variant, rather than a [`Refused`](Self::Refused) string, because the host's
+    /// standing requirement is to route rejected records to a separate map ON THE RECORD — and a
+    /// host that had to regex a message would break on the next copy-edit. See [`RecordRejection`]
+    /// for the three cases it distinguishes.
+    #[error(transparent)]
+    RecordRejected(#[from] RecordRejection),
 
     /// The mint's own pre-signing gate refused the spend it was about to sign.
     ///
