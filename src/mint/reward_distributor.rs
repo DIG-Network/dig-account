@@ -481,13 +481,16 @@ fn build_and_sign_reward_distributor_launch(
     // compiled-in constant (CLAUDE.md §2.6 clause 2).
     if request.reserve_base_units == 0 {
         return Err(MintError::Refused(
-            "the requested reserve is zero; a distributor whose reserve is empty can pay no              mirror, and launching one would lock the whole reward CAT away to fund nothing"
+            "the requested reserve is zero; a distributor whose reserve is empty can pay no \
+            mirror, and launching one would lock the whole reward CAT away to fund \
+            nothing"
                 .into(),
         ));
     }
     if request.reserve_base_units > request.reward_cat.coin.amount {
         return Err(MintError::Refused(format!(
-            "the requested reserve of {} base units is more than the reward CAT's {}; this seam              splits the ONE coin it was handed and never aggregates a second",
+            "the requested reserve of {} base units is more than the reward CAT's {}; this \
+            seam splits the ONE coin it was handed and never aggregates a second",
             request.reserve_base_units, request.reward_cat.coin.amount
         )));
     }
@@ -1453,6 +1456,7 @@ mod mutation_tests {
                 }),
                 CatInfo::new(asset_id, None, wallet_puzzle_hash),
             ),
+            reserve_base_units: RESERVE_BASE_UNITS,
             manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(wallet.public_key()),
             distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
             first_epoch_start: 1_234,

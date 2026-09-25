@@ -1664,7 +1664,8 @@ ALREADY-SIGNED bundle. The node reads chain and broadcasts; the user's key never
 
 `begin_reward_distributor_mint` is the ONLY path by which this crate signs a DIG reward-distributor
 launch. It builds the whole composition — the manager singleton, the launch offer (the wallet's XCH
-funding coin and the whole $DIG reserve CAT, both locked to the settlement puzzle), the distributor
+funding coin and the requested part of the $DIG reward CAT, both locked to the settlement puzzle,
+with each leg's remainder returned to the wallet as change), the distributor
 launcher, the eve singleton, the reserve CAT and the launch's ephemeral security coin — into ONE
 `SpendContext`, and returns a `SignedRewardDistributorMint` or an error.
 
@@ -1722,6 +1723,17 @@ and the seam MUST state that refusal ITSELF. Today a wrong-asset CAT also fails 
 `chia-sdk-driver`'s offer lookup, so no bundle is built — but that is a transitive crate's internal
 behaviour at a caret range, and it names the driver's problem rather than the caller's.
 
+`RewardDistributorMintRequest::reserve_base_units` names how much of the reward CAT becomes the
+reserve. It MUST be non-zero and MUST NOT exceed the reward CAT coin's own amount, and the seam
+MUST state BOTH refusals ITSELF, in the same pre-build block as the two ownership refusals — before
+a single spend is staged and therefore before any signature exists. Since building and signing are
+one function (§6BB.4), a refusal reached after the signing loop would be refusing a bundle this
+account had already authorized with its own key.
+
+Both bounds MUST be computed from the OBSERVED amount of the coin being spent. Neither the reserve
+nor the remainder may be derived from a denomination table or any compiled-in constant (CLAUDE.md
+§2.6 clause 2).
+
 The request's `distributor_epoch_seconds` MUST be non-zero, and the seam MUST state that
 refusal ITSELF, before anything is staged. A zero epoch length is an epoch that can never
 advance; today `dig-rewards-coin`'s constants builder also refuses it, but that is a transitive
@@ -1743,6 +1755,24 @@ understood by any host building a flow on this seam.
    lifetime.** The manager singleton's launcher id is curried into the distributor's action puzzles
    and can never be rotated. There is deliberately no default: if the key behind that inner puzzle
    is lost, the distributor's entry set freezes forever.
+
+### 6BB.3b The remainder comes home, and it MUST be findable
+
+The reward CAT's spend makes TWO creations: `reserve_base_units` to the settlement puzzle, and the
+remainder — the coin's own amount minus the reserve — back to this wallet. This mirrors the XCH
+funding leg, which already returns its own change.
+
+1. The remainder coin MUST be created at this wallet's p2 puzzle hash, inside the same CAT, and MUST
+   carry a `hint` of that puzzle hash. A CAT change coin without the hint is still the wallet's money
+   and no wallet in the ecosystem will show it again, which is indistinguishable from losing it. The
+   production read that finds it is `wallet::cat_transfer::dig_cat_coins` (§6G), and an acceptance
+   test MUST discover it through that read rather than by finding a coin of the right amount in the
+   bundle.
+2. When the reserve equals the whole coin the spend MUST create NO change coin. A zero-value
+   `CREATE_COIN` is a coin that exists, is the wallet's, and can never be spent for anything.
+
+`begin_reward_distributor_mint`'s signature is unchanged by this: the amount is a field on the
+request, not a new argument.
 
 ### 6BB.4 Building and signing are one function
 
@@ -1789,7 +1819,7 @@ built from, and one peak read — never from a chain answer, so a chain source c
 | `manager_launcher_id` | `Bytes32` | the bundle's own spends (= `predicted_manager_launcher_id()`) |
 | `funding_coin_id` | `Bytes32` | `RewardDistributorMintRequest::funding.coin_id()` |
 | `reward_cat_coin_id` | `Bytes32` | `RewardDistributorMintRequest::reward_cat.coin.coin_id()` |
-| `requested_reserve_base_units` | `u64` | the reward CAT's amount in $DIG base units (1 $DIG = 1,000 base units); a REQUEST, not a reserve |
+| `requested_reserve_base_units` | `u64` | `RewardDistributorMintRequest::reserve_base_units`, in $DIG base units (1 $DIG = 1,000 base units); a REQUEST, not a reserve |
 | `generation` | `LaunchComment` | `RewardDistributorMintRequest::generation` — the `store_id:root` the launch comment advertises |
 | `pushed_at_height` | `u32` | the chain's peak, read immediately BEFORE the push |
 
@@ -1993,7 +2023,7 @@ comment names this generation. A reader MAY NOT conclude:
    comment advertised, carried from the request this crate built the bundle from. The chain proves
    the comment was written, not that any store has that root or that any bytes hash to it.
 3. **That a reserve of `requested_reserve_base_units` exists or is spendable.** The value is the
-   reward CAT's amount echoed from the request, in $DIG base units. The distributor's live reserve,
+   amount the request NAMED, echoed back, in $DIG base units. The distributor's live reserve,
    its entries and its epoch state are read through `dig-rewards-coin`'s own state readers, never
    inferred from this evidence.
 4. **That the manager is reachable.** `manager_launcher_id()` is the id this mint derived; whether
