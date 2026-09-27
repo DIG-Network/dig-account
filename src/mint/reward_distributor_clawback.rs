@@ -168,7 +168,7 @@ impl SignedRewardDistributorClawback {
 /// - [`MintError::Build`] if any spend could not be constructed.
 /// - [`MintError::Refused`] if the gate finds a requirement this account must not sign.
 ///
-/// Every refusal above runs BEFORE a single spend is staged.
+/// Every refusal above runs BEFORE a single signature exists.
 pub fn begin_reward_distributor_clawback(
     wallet: &WalletKey,
     request: RewardDistributorClawbackRequest,

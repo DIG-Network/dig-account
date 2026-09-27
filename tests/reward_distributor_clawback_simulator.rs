@@ -259,8 +259,8 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
 }
 
 /// A stranger cannot claw back a commitment they did not fund. Authority here is a COMPOSITION
-/// invariant, not one layer's job: this door's own check (`:178-181`) and
-/// `dig_rewards_coin::clawback::withdraw_committed_incentives`'s own check (`clawback.rs:191-195`)
+/// invariant, not one layer's job: this door's own check (`:203-206`) and
+/// `dig_rewards_coin::clawback::withdraw_committed_incentives`'s own check (`clawback.rs:198-202`)
 /// fire at the same point, on the same inputs, and map to the same
 /// [`MintError::ClawbackNotAuthority`] — either alone is sufficient, so this test proves authority
 /// is enforced AT ALL, not which of the two layers does it. Removing both would let a stranger's
