@@ -54,12 +54,12 @@ pub use did::{MintNetwork, MintOptions, MAX_MINT_FEE_MOJOS};
 pub use error::{MintError, MintResult, OwnershipProof, RecordField, RecordRejection};
 pub use evidence::{MintedDid, PendingMint, MIN_CONFIRMATION_DEPTH};
 pub use profile::ProfileMintStatus;
+pub use reward_distributor_clawback::{
+    RewardDistributorClawbackRequest, SignedRewardDistributorClawback,
+};
 pub use reward_distributor_evidence::{
     ConfirmedRewardDistributor, PendingRewardDistributor, PendingRewardDistributorRecord,
     RewardDistributorStatus,
-};
-pub use reward_distributor_clawback::{
-    RewardDistributorClawbackRequest, SignedRewardDistributorClawback,
 };
 pub use reward_distributor_refill::{
     RewardDistributorRefillRequest, SignedRewardDistributorRefill,

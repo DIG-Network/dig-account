@@ -334,7 +334,9 @@ pub enum MintError {
     /// The committed distributor epoch has already started, read against chain-current time —
     /// never the local clock. A commitment whose epoch is already live is not this door's to
     /// withdraw.
-    #[error("the committed epoch ({epoch_start}) has already started as of chain time {chain_now}")]
+    #[error(
+        "the committed epoch ({epoch_start}) has already started as of chain time {chain_now}"
+    )]
     ClawbackEpochAlreadyStarted {
         /// The commitment's own recorded epoch boundary.
         epoch_start: u64,

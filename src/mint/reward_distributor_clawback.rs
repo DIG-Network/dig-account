@@ -43,7 +43,9 @@
 use std::collections::HashSet;
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
-use chia_wallet_sdk::driver::{RewardDistributor, Slot, SpendContext, SpendWithConditions, StandardLayer};
+use chia_wallet_sdk::driver::{
+    RewardDistributor, Slot, SpendContext, SpendWithConditions, StandardLayer,
+};
 use chia_wallet_sdk::signer::RequiredSignature;
 use chia_wallet_sdk::types::puzzles::{
     RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
@@ -224,9 +226,11 @@ pub fn begin_reward_distributor_clawback(
     // The clawbacker's own coin delivers the puzzle's required conditions in this same bundle
     // (`dig_rewards_coin::clawback::Clawback`'s own docs) and is recreated at the same amount so
     // nothing is burned carrying the assertion.
-    let conditions = clawback
-        .into_conditions()
-        .create_coin(wallet_puzzle_hash, request.clawback_coin.amount, chia_wallet_sdk::prelude::Memos::None);
+    let conditions = clawback.into_conditions().create_coin(
+        wallet_puzzle_hash,
+        request.clawback_coin.amount,
+        chia_wallet_sdk::prelude::Memos::None,
+    );
 
     let p2_spend = StandardLayer::new(wallet.public_key())
         .spend_with_conditions(&mut ctx, conditions)
@@ -299,7 +303,7 @@ fn map_rewards_error(error: RewardsError) -> MintError {
             withdrawal_share_bps,
         } => MintError::ClawbackDriverShareNotRepresentable {
             rewards_base_units,
-            withdrawal_share_bps: u64::from(withdrawal_share_bps),
+            withdrawal_share_bps,
         },
         RewardsError::DriverShareDisagrees { .. } => MintError::ClawbackDriverShareDisagrees,
         other => MintError::Build(format!("withdraw committed incentives: {other}")),

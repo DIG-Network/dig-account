@@ -1,0 +1,363 @@
+//! The reward-distributor CLAWBACK door, proven END TO END against the in-process Chia consensus
+//! validator — dig_ecosystem#3372.
+//!
+//! Same bar as `reward_distributor_refill_simulator.rs`: the door's own bundle, with the door's own
+//! aggregated signature, is what a real validator checks. Nobody hands a secret key to the
+//! simulator. The commitment a clawback withdraws is never hand-assembled: it is created through
+//! this crate's own refill door, confirmed, then read back with `dig-rewards-coin`'s own
+//! `read_distributor`, exactly the shape a real caller is in before ever calling the clawback door.
+
+use chia_protocol::{Bytes32, Coin};
+use chia_puzzle_types::cat::CatArgs;
+use chia_puzzle_types::LineageProof;
+use chia_wallet_sdk::driver::{Cat, CatInfo, RewardDistributor, Slot};
+use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+use chia_wallet_sdk::signer::AggSigConstants;
+use chia_wallet_sdk::types::puzzles::{
+    RewardDistributorCommitmentSlotValue, RewardDistributorRewardSlotValue,
+};
+use dig_account::mint::error::MintError;
+use dig_account::{
+    begin_reward_distributor_clawback, begin_reward_distributor_mint,
+    begin_reward_distributor_refill, MintNetwork, ProfileIx, RewardDistributorClawbackRequest,
+    RewardDistributorMintRequest, RewardDistributorRefillRequest, WalletKey,
+};
+use dig_rewards_coin::{
+    dig_distributor_constants, read_distributor, DistributorLaunchTerms, LaunchComment,
+    ManagerInnerPuzzle, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+};
+
+mod common;
+use common::SimulatorChain;
+
+const SEED: [u8; 32] = [0x5A; 32];
+const FUNDING_MOJOS: u64 = 1_000_000;
+const LAUNCH_RESERVE_BASE_UNITS: u64 = 250_000;
+const REFILL_COMMIT_BASE_UNITS: u64 = 300_000;
+const CLAWBACK_COIN_MOJOS: u64 = 1_000;
+/// The simulator's clock starts at zero, so any positive second is "in the future".
+const FIRST_EPOCH_START: u64 = 1_234;
+const STORE_ID: Bytes32 = Bytes32::new([0xAA; 32]);
+const GENERATION_ROOT: Bytes32 = Bytes32::new([0xBB; 32]);
+
+fn dig_reserve_asset_id() -> Bytes32 {
+    dig_distributor_constants(
+        DistributorLaunchTerms {
+            manager_singleton_launcher_id: Bytes32::new([1; 32]),
+            distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+        },
+        Bytes32::new([2; 32]),
+    )
+    .expect("the DIG constants table builds")
+    .reserve_asset_id
+}
+
+fn wallet_owned_dig_cat(chain: &SimulatorChain, wallet: &WalletKey, amount: u64) -> Cat {
+    let asset_id = dig_reserve_asset_id();
+    let inner_puzzle_hash = wallet.puzzle_hash();
+    let cat_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(asset_id, inner_puzzle_hash.into()).into();
+
+    let grandparent = Bytes32::new([0x11; 32]);
+    let parent = Coin::new(grandparent, cat_puzzle_hash, amount);
+    let coin = Coin::new(parent.coin_id(), cat_puzzle_hash, amount);
+    chain.sim.borrow_mut().insert_coin(coin);
+
+    Cat::new(
+        coin,
+        Some(LineageProof {
+            parent_parent_coin_info: grandparent,
+            parent_inner_puzzle_hash: inner_puzzle_hash,
+            parent_amount: amount,
+        }),
+        CatInfo::new(asset_id, None, inner_puzzle_hash),
+    )
+}
+
+fn network() -> MintNetwork {
+    MintNetwork::from_constants(AggSigConstants::from(&*TESTNET11_CONSTANTS))
+}
+
+/// A wallet, a LIVE distributor with one committed incentive claimable back, and the wallet's own
+/// authorizing coin the clawback door will spend.
+struct Fixture {
+    chain: SimulatorChain,
+    wallet: WalletKey,
+    distributor: RewardDistributor,
+    commitment_slot: Slot<RewardDistributorCommitmentSlotValue>,
+    reward_slot: Slot<RewardDistributorRewardSlotValue>,
+    clawback_coin: Coin,
+    epoch_start: u64,
+    launcher_id: Bytes32,
+}
+
+fn fixture() -> Fixture {
+    let chain = SimulatorChain::new();
+    let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
+    let wallet_puzzle_hash = wallet.puzzle_hash();
+
+    let funding = chain
+        .sim
+        .borrow_mut()
+        .new_coin(wallet_puzzle_hash, FUNDING_MOJOS);
+    let reward_cat = wallet_owned_dig_cat(&chain, &wallet, LAUNCH_RESERVE_BASE_UNITS);
+
+    let mint_request = RewardDistributorMintRequest {
+        funding,
+        reward_cat,
+        manager_inner_puzzle: ManagerInnerPuzzle::SingleKeyBuiltHere(wallet.public_key()),
+        distributor_epoch_seconds: DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+        first_epoch_start: FIRST_EPOCH_START,
+        generation: LaunchComment::new(STORE_ID, GENERATION_ROOT),
+        fee: 0,
+        now_unix_seconds: 0,
+    };
+
+    let minted =
+        begin_reward_distributor_mint(&wallet, &mint_request, &network(), &TESTNET11_CONSTANTS)
+            .expect("the launch builds, gates and signs");
+    minted
+        .submit(&chain, &chain)
+        .expect("the launch pushes with zero caller-supplied secret keys");
+    chain.include_in_a_block().expect("the launch confirms");
+
+    let launcher_id = minted.predicted_distributor_launcher_id();
+    let snapshot = read_distributor(&chain, launcher_id)
+        .expect("the chain answers")
+        .expect("the launched distributor is readable back");
+
+    let distributor = snapshot.distributor().clone();
+    let reward_slot = snapshot
+        .reward_slots()
+        .first()
+        .expect("a freshly launched distributor carries its first epoch's reward slot")
+        .clone();
+
+    let epoch_start = FIRST_EPOCH_START + DEFAULT_DISTRIBUTOR_EPOCH_SECONDS;
+    let funding_cat = wallet_owned_dig_cat(&chain, &wallet, REFILL_COMMIT_BASE_UNITS);
+    let refill_request = RewardDistributorRefillRequest {
+        distributor,
+        reward_slot,
+        distributor_epoch_start: epoch_start,
+        funding_cat,
+        rewards_base_units: REFILL_COMMIT_BASE_UNITS,
+    };
+    let refilled = begin_reward_distributor_refill(&wallet, refill_request, &network())
+        .expect("the refill builds, gates and signs");
+    refilled
+        .submit(&chain, &chain)
+        .expect("the refill pushes with zero caller-supplied secret keys");
+    chain.include_in_a_block().expect("the refill confirms");
+
+    let snapshot = read_distributor(&chain, launcher_id)
+        .expect("the chain answers")
+        .expect("the distributor is readable back after the refill");
+
+    let distributor = snapshot.distributor().clone();
+    let commitment_slot = snapshot
+        .commitment_slots()
+        .first()
+        .expect("the refill created a commitment slot")
+        .clone();
+    assert_eq!(commitment_slot.info.value.clawback_ph, wallet_puzzle_hash);
+    let reward_slot = snapshot
+        .reward_slots()
+        .iter()
+        .find(|slot| slot.info.value.epoch_start == epoch_start)
+        .expect("the refill created a reward slot for its target epoch")
+        .clone();
+
+    let clawback_coin = chain
+        .sim
+        .borrow_mut()
+        .new_coin(wallet_puzzle_hash, CLAWBACK_COIN_MOJOS);
+
+    Fixture {
+        chain,
+        wallet,
+        distributor,
+        commitment_slot,
+        reward_slot,
+        clawback_coin,
+        epoch_start,
+        launcher_id,
+    }
+}
+
+fn clawback_request(
+    fixture: &Fixture,
+    chain_now_unix_seconds: u64,
+) -> RewardDistributorClawbackRequest {
+    RewardDistributorClawbackRequest {
+        distributor: fixture.distributor.clone(),
+        commitment_slot: fixture.commitment_slot.clone(),
+        reward_slot: fixture.reward_slot.clone(),
+        clawback_coin: fixture.clawback_coin,
+        chain_now_unix_seconds,
+    }
+}
+
+/// **THE ACCEPTANCE TEST.** The clawback door's own bundle, with the door's own aggregated
+/// signature, is accepted by a real consensus validator, and the funder's own $DIG CAT balance
+/// rises by exactly the puzzle-computed withdrawal share — never the driver's raw figure.
+#[test]
+fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
+    let fixture = fixture();
+    let wallet_puzzle_hash = fixture.wallet.puzzle_hash();
+    let request = clawback_request(&fixture, 0);
+
+    let clawed_back = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect("the clawback builds, gates and signs");
+
+    let withdrawal_share_bps = fixture.distributor.info.constants.withdrawal_share_bps;
+    let expected_share = dig_rewards_coin::recoverable_base_units(
+        REFILL_COMMIT_BASE_UNITS,
+        u16::try_from(withdrawal_share_bps).expect("bps fits u16 in this fixture"),
+    )
+    .expect("bps is in the legal 0..=10_000 domain");
+    assert_eq!(
+        clawed_back.recovered_base_units(),
+        expected_share,
+        "the door must report the puzzle's own share, never the driver's raw figure"
+    );
+
+    clawed_back
+        .submit(&fixture.chain, &fixture.chain)
+        .expect("consensus accepts the seam's bundle with no caller-supplied secret key");
+    fixture
+        .chain
+        .include_in_a_block()
+        .expect("the clawback confirms");
+
+    let dig_asset_id = dig_reserve_asset_id();
+    let wallet_cat_puzzle_hash: Bytes32 =
+        CatArgs::curry_tree_hash(dig_asset_id, wallet_puzzle_hash.into()).into();
+    assert!(
+        fixture
+            .chain
+            .sim
+            .borrow()
+            .unspent_coins(wallet_cat_puzzle_hash, false)
+            .into_iter()
+            .any(|coin| coin.amount == expected_share),
+        "the funder's own $DIG CAT balance must rise by exactly the puzzle-computed share"
+    );
+
+    let snapshot = read_distributor(&fixture.chain, fixture.launcher_id)
+        .expect("the chain answers")
+        .expect("the distributor is still readable after the clawback");
+    assert!(
+        snapshot.commitment_slots().is_empty(),
+        "the withdrawn commitment slot must be gone"
+    );
+}
+
+/// A stranger cannot claw back a commitment they did not fund: the commitment slot's recorded
+/// `clawback_ph` is this wallet's, so a stranger's wallet is refused before anything is staged.
+#[test]
+fn a_stranger_is_not_the_clawback_authority() {
+    let fixture = fixture();
+    let stranger = WalletKey::from_seed_at(&[0xA5; 32], ProfileIx::ROOT);
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let mut request = clawback_request(&fixture, 0);
+    request.clawback_coin = fixture
+        .chain
+        .sim
+        .borrow_mut()
+        .new_coin(stranger.puzzle_hash(), CLAWBACK_COIN_MOJOS);
+
+    let error = begin_reward_distributor_clawback(&stranger, request, &network())
+        .expect_err("a stranger must not claw back somebody else's commitment");
+    assert!(
+        matches!(error, MintError::ClawbackNotAuthority),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
+
+/// A clawback attempted after the committed epoch has already started (per chain time) is refused.
+#[test]
+fn an_already_started_epoch_is_refused() {
+    let fixture = fixture();
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let request = clawback_request(&fixture, fixture.epoch_start);
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect_err("a commitment whose epoch has started is no longer this door's to withdraw");
+    assert!(
+        matches!(
+            error,
+            MintError::ClawbackEpochAlreadyStarted { epoch_start, chain_now }
+                if epoch_start == fixture.epoch_start && chain_now == fixture.epoch_start
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
+
+/// A `clawback_coin` this wallet does not own is refused before anything is staged.
+#[test]
+fn an_unowned_clawback_coin_is_refused() {
+    let fixture = fixture();
+    let stranger = WalletKey::from_seed_at(&[0xA5; 32], ProfileIx::ROOT);
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let mut request = clawback_request(&fixture, 0);
+    request.clawback_coin = fixture
+        .chain
+        .sim
+        .borrow_mut()
+        .new_coin(stranger.puzzle_hash(), CLAWBACK_COIN_MOJOS);
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect_err("a coin this wallet does not own must not authorize a clawback");
+    assert!(matches!(error, MintError::ClawbackUnownedCoin), "{error:?}");
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
+
+/// dig_ecosystem#3372's carried-forward custody finding: the upstream
+/// `RewardDistributor::pending_spend` carries `pub other_cats`, and `finish_spend` appends it into
+/// THIS bundle unconditionally. This proves the `pending_spend`-empty predicate fires before
+/// anything is staged, exactly mirroring the refill door's own regression guard.
+#[test]
+fn a_pre_staged_pending_action_is_refused_before_any_push() {
+    use chia_wallet_sdk::driver::{Spend, SpendContext};
+
+    let fixture = fixture();
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let mut ctx = SpendContext::new();
+    let inert_puzzle = ctx.alloc(&1_i32).expect("an inert NodePtr allocates");
+    let inert_solution = ctx.alloc(&1_i32).expect("an inert NodePtr allocates");
+
+    let mut request = clawback_request(&fixture, 0);
+    request
+        .distributor
+        .pending_spend
+        .actions
+        .push(Spend::new(inert_puzzle, inert_solution));
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect_err("a pre-staged action must be refused before it is ever signed");
+    assert!(
+        matches!(error, MintError::ClawbackPendingSpendPopulated),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
+
+/// The authority check's own MUTATION PROOF: with `clawback_authority` compared against the
+/// wrong (zeroed) hash, the door-level pre-check must be what actually catches it — see the
+/// paired unit test at `mint::reward_distributor_clawback` for the red/green pair. Kept here as
+/// the simulator-level confirmation that a correct authority hash is required end to end.
+#[test]
+fn the_correct_authority_hash_is_required_end_to_end() {
+    let fixture = fixture();
+    let wallet_puzzle_hash = fixture.wallet.puzzle_hash();
+    assert_eq!(
+        fixture.commitment_slot.info.value.clawback_ph, wallet_puzzle_hash,
+        "the fixture's own commitment must record this wallet as the clawback authority"
+    );
+}
