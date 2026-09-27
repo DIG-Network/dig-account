@@ -237,3 +237,5 @@ as a refusal, because the wallet may be perfectly funded and the next peer caugh
 
 The same gap is still open in `wallet::transfer::select_input_coins`, which selects from the listing
 alone (dig_ecosystem: the ordinary-transfer spend builder).
+
+<!-- lane #3372 open: refill door -->
