@@ -269,6 +269,54 @@ pub enum MintError {
     /// signed — the account key is never used as a signing oracle.
     #[error("refusing to sign the mint spend: {0}")]
     Refused(String),
+
+    /// A reward-distributor refill's funding CAT coin is not at this wallet's puzzle hash
+    /// (`SPEC.md` §7.4). A refill spends only coins this account controls.
+    #[error("the funding CAT coin is not at this wallet's puzzle hash; a distributor is refilled only from coins this account controls")]
+    RefillUnownedFundingCoin,
+
+    /// A reward-distributor refill named `distributor_epoch_start == 0`.
+    ///
+    /// Zero is never a real epoch boundary — every boundary is `first_epoch_start` plus a
+    /// non-negative multiple of `distributor_epoch_seconds` and `first_epoch_start` is itself
+    /// refused at launch if it is zero, so a caller naming zero here can only be a mistaken value,
+    /// never a distributor's genuine first epoch.
+    #[error("the target distributor epoch start is zero; a refill commits to a specific future epoch boundary, never epoch zero")]
+    RefillZeroEpoch,
+
+    /// A reward-distributor refill's funding CAT is not the asset this distributor's reserve
+    /// accepts.
+    ///
+    /// Named separately from [`Refused`](Self::Refused): this account cannot fund a stranger
+    /// asset into a reserve that will never pay it out, and a caller routing on this should not
+    /// have to parse prose to find "wrong asset" among every other refusal shape.
+    #[error("the funding CAT is not the asset this distributor's reserve accepts; this wallet cannot fund a distributor with a foreign asset")]
+    RefillWrongAsset,
+
+    /// A reward-distributor refill named `rewards_base_units == 0`.
+    #[error("a refill of zero base units funds nothing")]
+    RefillZeroRewardsBaseUnits,
+
+    /// A reward-distributor refill's caller-supplied `distributor` already carried a staged
+    /// action or a staged foreign CAT spend in its `pending_spend`.
+    ///
+    /// The upstream `RewardDistributor::pending_spend` is `pub`, and `finish_spend` appends
+    /// whatever it finds there — `actions` and `other_cats` alike — into THIS bundle
+    /// unconditionally. A caller that reads a distributor fresh, as this seam's own docs require,
+    /// never has anything staged; a distributor that does is either stale or was deliberately
+    /// prepared to smuggle a spend under this wallet's own signature. Refused before a single
+    /// spend of this door's own is staged.
+    #[error("the distributor already carries a staged action or CAT spend; a refill's own build starts from a distributor with nothing pending")]
+    RefillPendingSpendPopulated,
+
+    /// A finished refill bundle spent a pre-existing coin other than the four this door itself
+    /// named — the distributor singleton, its reserve, the reward slot, and the funding CAT.
+    ///
+    /// The count carried is the number of roots the FINISHED bundle actually spent, so a caller
+    /// debugging a refusal sees at a glance whether the bundle spent too few (a build defect) or
+    /// too many (exactly the smuggled-spend shape this refusal exists to catch).
+    #[error("the bundle spends {0} pre-existing coins; a distributor refill spends exactly the four this door named")]
+    RefillUnexpectedRoots(usize),
 }
 
 #[cfg(test)]
