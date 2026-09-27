@@ -245,10 +245,24 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
 }
 
 /// dig_ecosystem#3372 custody finding A: the upstream `RewardDistributor::pending_spend` carries
-/// `pub other_cats`, and `finish_spend` appends it into THIS bundle unconditionally. A caller that
-/// pre-stages a wallet-owned $DIG coin's spend to an arbitrary destination there — never named
-/// anywhere in the request itself — must be refused before anything is signed or pushed, not
-/// merely fail to be caught by a narrower check.
+/// `pub other_cats`, and `finish_spend` appends it into THIS bundle unconditionally. This proves
+/// the `pending_spend`-empty predicate fires on ANY non-empty `other_cats`, refusing by the named
+/// `RefillPendingSpendPopulated` variant before anything is staged.
+///
+/// The staged entry below is deliberately inert, not a working exploit: `Spend { puzzle, solution }`
+/// is a pair of `NodePtr`s — indices into ONE `Allocator` — and this fixture builds its smuggled
+/// spend in its own, throwaway `SpendContext`, never the door's. Even without this guard, the door
+/// builds in a *different* fresh `SpendContext`, so `finish_spend` would dereference a foreign
+/// index and panic long before anything could be signed; the staged entry was never signable. This
+/// is a predicate test, not a demonstration of a working smuggle.
+///
+/// The real, narrower risk this guard closes: the door's `SpendContext` is a deterministic function
+/// of the request plus the public wallet key, so an attacker who can predict it could precompute
+/// the door's OWN funding-CAT `p2_spend` `NodePtr`s in the door's own allocator and stage a second
+/// wallet $DIG coin's `CatSpend` against those pointers — that coin WOULD be spent under the door's
+/// own conditions and signed. Its destination is still the reserve/change puzzle hashes this door
+/// itself derives, never an attacker-chosen one: an unrecoverable donation/burn of a wallet coin,
+/// not theft. This is analysis of what the guard prevents, not something this test executes.
 #[test]
 fn a_pre_staged_other_cats_wallet_spend_is_refused_before_any_push() {
     let fixture = fixture();
