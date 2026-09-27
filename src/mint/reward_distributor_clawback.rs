@@ -28,9 +28,10 @@
 //! # Refuse before the epoch starts, against CHAIN time
 //!
 //! A commitment already inside its own epoch is no longer this door's to withdraw — the money has
-//! become the live epoch's own reward. This door reads chain-current time from the peak block's own
-//! timestamp (never the local clock) and refuses [`MintError::ClawbackEpochAlreadyStarted`] before a
-//! single spend is staged.
+//! become the live epoch's own reward. `chain_now_unix_seconds` is caller-supplied — this door does
+//! not read the chain itself — and refuses [`MintError::ClawbackEpochAlreadyStarted`] before a
+//! single spend is staged; the caller MUST source it from the peak block's own timestamp, never
+//! the local clock.
 //!
 //! # Every root, and only those roots
 //!
@@ -83,8 +84,9 @@ pub struct RewardDistributorClawbackRequest {
     /// Spent WHOLE; its own value returns to this same wallet as a same-amount recreation in this
     /// same bundle, so nothing is burned carrying the assertion.
     pub clawback_coin: Coin,
-    /// The chain's own current time — the peak block's own timestamp, never the local clock —
-    /// checked against the commitment's recorded epoch start.
+    /// Caller-supplied current time, checked against the commitment's recorded epoch start. The
+    /// caller MUST source this from the peak block's own timestamp, never the local clock — this
+    /// door does not read the chain itself and cannot verify what it is handed.
     pub chain_now_unix_seconds: u64,
 }
 

@@ -331,9 +331,10 @@ pub enum MintError {
     #[error("the clawback authorizing coin is not at this wallet's puzzle hash")]
     ClawbackUnownedCoin,
 
-    /// The committed distributor epoch has already started, read against chain-current time —
-    /// never the local clock. A commitment whose epoch is already live is not this door's to
-    /// withdraw.
+    /// The committed distributor epoch has already started, read against a caller-supplied
+    /// current time — the caller MUST source it from the peak block's own timestamp, never the
+    /// local clock; this door does not read the chain itself. A commitment whose epoch is
+    /// already live is not this door's to withdraw.
     #[error(
         "the committed epoch ({epoch_start}) has already started as of chain time {chain_now}"
     )]
