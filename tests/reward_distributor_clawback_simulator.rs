@@ -389,3 +389,91 @@ fn a_reward_slot_from_the_wrong_epoch_is_refused() {
     );
     assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
+
+/// Isolates the epoch guard from the rewards guard: this slot's `epoch_start` disagrees with the
+/// committed epoch, but its `rewards` is left at the committed epoch's own reward slot's value --
+/// sufficient to pay this commitment's share. `a_reward_slot_from_the_wrong_epoch_is_refused`
+/// above cannot tell these two guards apart, because the LAUNCH epoch's reward slot it hands the
+/// door happens to be both the wrong epoch AND short of the required share, and guard ORDERING --
+/// not that test -- decides which error comes back. Deleting the epoch guard alone must let this
+/// request through to a signed bundle (never `ClawbackRewardSlotInsufficientRewards`), because
+/// there is nothing left here for the rewards guard to catch.
+#[test]
+fn a_reward_slot_from_the_wrong_epoch_with_sufficient_rewards_is_refused() {
+    let fixture = fixture();
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let mut wrong_epoch_slot = fixture.reward_slot.clone();
+    wrong_epoch_slot.info.value.epoch_start = fixture.epoch_start + 1;
+    assert!(
+        u128::from(wrong_epoch_slot.info.value.rewards)
+            >= u128::from(fixture.commitment_slot.info.value.rewards)
+                * u128::from(fixture.distributor.info.constants.withdrawal_share_bps)
+                / 10_000,
+        "the fixture must isolate the epoch guard: this slot's rewards must already be sufficient"
+    );
+
+    let mut request = clawback_request(&fixture, 0);
+    request.reward_slot = wrong_epoch_slot.clone();
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect_err("a wrong-epoch reward slot must be refused even with sufficient rewards");
+    assert!(
+        matches!(
+            error,
+            MintError::ClawbackRewardSlotEpochMismatch {
+                reward_slot_epoch_start,
+                commitment_epoch_start,
+            } if reward_slot_epoch_start == wrong_epoch_slot.info.value.epoch_start
+                && commitment_epoch_start == fixture.epoch_start
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
+
+/// Isolates the rewards guard from the epoch guard: this slot carries the committed epoch's own
+/// `epoch_start`, so it cannot trip `ClawbackRewardSlotEpochMismatch`, but its `rewards` is below
+/// this commitment's own withdrawal share. Deleting the rewards guard alone must let this request
+/// through to a signed bundle (never `ClawbackRewardSlotEpochMismatch`), because there is nothing
+/// left here for the epoch guard to catch.
+#[test]
+fn a_reward_slot_with_insufficient_rewards_is_refused() {
+    let fixture = fixture();
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let withdrawal_share_bps = fixture.distributor.info.constants.withdrawal_share_bps;
+    let required_share = u128::from(fixture.commitment_slot.info.value.rewards)
+        * u128::from(withdrawal_share_bps)
+        / 10_000;
+    assert!(
+        required_share > 0,
+        "the fixture must give the rewards guard something to catch"
+    );
+    let insufficient_rewards =
+        u64::try_from(required_share - 1).expect("required_share - 1 fits u64 in this fixture");
+
+    let mut underfunded_slot = fixture.reward_slot.clone();
+    assert_eq!(
+        underfunded_slot.info.value.epoch_start, fixture.epoch_start,
+        "the fixture must isolate the rewards guard: this slot's epoch must already be correct"
+    );
+    underfunded_slot.info.value.rewards = insufficient_rewards;
+
+    let mut request = clawback_request(&fixture, 0);
+    request.reward_slot = underfunded_slot;
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
+        .expect_err("a reward slot short of the required share must be refused");
+    assert!(
+        matches!(
+            error,
+            MintError::ClawbackRewardSlotInsufficientRewards {
+                reward_slot_rewards,
+                required_share: rs,
+            } if reward_slot_rewards == insufficient_rewards && rs == required_share
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
+}
