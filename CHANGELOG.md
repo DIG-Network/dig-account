@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.34.0] - 2026-09-27
+
+### Chores
+- Bump dig-rewards-coin 0.8 -> 0.9 (#76)
+
 ## [0.33.0] - 2026-09-27
 
 ### Features
