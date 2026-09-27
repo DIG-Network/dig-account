@@ -425,6 +425,35 @@ mod tests {
         );
     }
 
+    /// Exactly four roots — the permitted COUNT — but the fourth is a coin never named in
+    /// `permitted_roots`: a substituted root. Pins set-equality, not count-equality: a guard
+    /// weakened to `roots.len() != 4` would wrongly accept this.
+    #[test]
+    fn four_roots_with_one_substituted_is_refused() {
+        let spends: Vec<CoinSpend> = (0..4)
+            .map(|i| {
+                root_spend(
+                    Bytes32::new([0x40 + i; 32]),
+                    Bytes32::new([0x50 + i; 32]),
+                    1,
+                )
+            })
+            .collect();
+        let permitted: [Bytes32; 4] = [
+            spends[0].coin.coin_id(),
+            spends[1].coin.coin_id(),
+            spends[2].coin.coin_id(),
+            Bytes32::new([0xFF; 32]), // not any of this bundle's coins
+        ];
+
+        let error = gate_reward_distributor_refill_roots(&spends, permitted)
+            .expect_err("a substituted root must be refused even though the count is right");
+        assert!(
+            matches!(error, MintError::RefillUnexpectedRoots(4)),
+            "{error:?}"
+        );
+    }
+
     /// The exact four permitted roots, and nothing else: accepted.
     #[test]
     fn the_exact_permitted_four_roots_is_accepted() {
