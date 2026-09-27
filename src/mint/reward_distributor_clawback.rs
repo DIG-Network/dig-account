@@ -153,6 +153,10 @@ impl SignedRewardDistributorClawback {
 ///   action or a staged foreign CAT spend.
 /// - [`MintError::ClawbackNotAuthority`] if this wallet is not the commitment slot's recorded
 ///   `clawback_ph`.
+/// - [`MintError::ClawbackRewardSlotEpochMismatch`] if `request.reward_slot`'s own recorded epoch
+///   is not the commitment's epoch.
+/// - [`MintError::ClawbackRewardSlotInsufficientRewards`] if `request.reward_slot` records fewer
+///   rewards than this commitment's withdrawal share.
 /// - [`MintError::ClawbackDriverShareNotRepresentable`] if the upstream driver's share multiply
 ///   cannot represent this commitment's share at this scale.
 /// - [`MintError::ClawbackDriverShareDisagrees`] if the driver's reported share disagrees with this
@@ -197,6 +201,29 @@ pub fn begin_reward_distributor_clawback(
     let expected_authority = clawback_authority(&request.commitment_slot);
     if expected_authority != wallet_puzzle_hash {
         return Err(MintError::ClawbackNotAuthority);
+    }
+
+    // `reward_slot` is caller-supplied and nothing downstream re-derives or checks it: it is
+    // handed straight into `withdraw_committed_incentives`, which settles the commitment's
+    // withdrawal share against WHATEVER slot it is given. A slot from the wrong epoch (or one
+    // that simply does not carry enough recorded rewards) builds and signs a bundle for the
+    // wrong reward pool — the same "sign what the chain will refuse, with no named refusal"
+    // shape as dig_ecosystem#3357. Refused here, before `SpendContext::new()`, so nothing is
+    // allocated, staged or signed for it.
+    if request.reward_slot.info.value.epoch_start != epoch_start {
+        return Err(MintError::ClawbackRewardSlotEpochMismatch {
+            reward_slot_epoch_start: request.reward_slot.info.value.epoch_start,
+            commitment_epoch_start: epoch_start,
+        });
+    }
+    let required_share = u128::from(request.commitment_slot.info.value.rewards)
+        * u128::from(request.distributor.info.constants.withdrawal_share_bps)
+        / 10_000;
+    if u128::from(request.reward_slot.info.value.rewards) < required_share {
+        return Err(MintError::ClawbackRewardSlotInsufficientRewards {
+            reward_slot_rewards: request.reward_slot.info.value.rewards,
+            required_share,
+        });
     }
 
     let mut ctx = SpendContext::new();

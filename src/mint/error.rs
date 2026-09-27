@@ -376,6 +376,39 @@ pub enum MintError {
     /// the clawback authorizing coin.
     #[error("the bundle spends {0} pre-existing coins; a distributor clawback spends exactly the five this door named")]
     ClawbackUnexpectedRoots(usize),
+
+    /// A reward-distributor clawback's caller-supplied `reward_slot` is not the slot for the
+    /// committed epoch — its own `epoch_start` disagrees with the commitment's recorded
+    /// `epoch_start`. `reward_slot` is caller input like every other object this door builds
+    /// from, and nothing downstream re-derives or checks it: signing over the wrong epoch's
+    /// slot builds a bundle for the wrong reward pool, which either wins a real validator's
+    /// rejection (best case) or, with a mismatched-but-still-present slot, silently settles
+    /// against the wrong epoch's rewards. Refused here, before anything is staged.
+    #[error(
+        "the reward slot's own epoch start ({reward_slot_epoch_start}) is not the committed epoch ({commitment_epoch_start})"
+    )]
+    ClawbackRewardSlotEpochMismatch {
+        /// The `epoch_start` recorded on the caller-supplied `reward_slot`.
+        reward_slot_epoch_start: u64,
+        /// The commitment slot's own recorded `epoch_start` — the epoch this clawback withdraws.
+        commitment_epoch_start: u64,
+    },
+
+    /// A reward-distributor clawback's caller-supplied `reward_slot` records fewer rewards than
+    /// this commitment's own withdrawal share — the slot cannot pay what this clawback would
+    /// withdraw from it. A distinct variant from
+    /// [`ClawbackRewardSlotEpochMismatch`](Self::ClawbackRewardSlotEpochMismatch) because a
+    /// caller needs to tell "wrong epoch" from "right epoch, not enough left in it" apart to
+    /// render a correct message.
+    #[error(
+        "the reward slot records {reward_slot_rewards} base units, less than this commitment's {required_share} base unit share"
+    )]
+    ClawbackRewardSlotInsufficientRewards {
+        /// The `rewards` recorded on the caller-supplied `reward_slot`.
+        reward_slot_rewards: u64,
+        /// The withdrawal share this commitment's clawback would settle against the slot.
+        required_share: u128,
+    },
 }
 
 #[cfg(test)]

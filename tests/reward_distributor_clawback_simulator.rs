@@ -86,6 +86,10 @@ struct Fixture {
     distributor: RewardDistributor,
     commitment_slot: Slot<RewardDistributorCommitmentSlotValue>,
     reward_slot: Slot<RewardDistributorRewardSlotValue>,
+    /// The distributor's LAUNCH-epoch reward slot — a different epoch than `reward_slot` above,
+    /// which is the epoch the refill actually committed to. Kept so a test can hand the door a
+    /// reward slot from the wrong epoch.
+    launch_epoch_reward_slot: Slot<RewardDistributorRewardSlotValue>,
     clawback_coin: Coin,
     epoch_start: u64,
     launcher_id: Bytes32,
@@ -132,6 +136,7 @@ fn fixture() -> Fixture {
         .first()
         .expect("a freshly launched distributor carries its first epoch's reward slot")
         .clone();
+    let launch_epoch_reward_slot = reward_slot.clone();
 
     let epoch_start = FIRST_EPOCH_START + DEFAULT_DISTRIBUTOR_EPOCH_SECONDS;
     let funding_cat = wallet_owned_dig_cat(&chain, &wallet, REFILL_COMMIT_BASE_UNITS);
@@ -178,6 +183,7 @@ fn fixture() -> Fixture {
         distributor,
         commitment_slot,
         reward_slot,
+        launch_epoch_reward_slot,
         clawback_coin,
         epoch_start,
         launcher_id,
@@ -252,8 +258,13 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
     );
 }
 
-/// A stranger cannot claw back a commitment they did not fund: the commitment slot's recorded
-/// `clawback_ph` is this wallet's, so a stranger's wallet is refused before anything is staged.
+/// A stranger cannot claw back a commitment they did not fund. Authority here is a COMPOSITION
+/// invariant, not one layer's job: this door's own check (`:178-181`) and
+/// `dig_rewards_coin::clawback::withdraw_committed_incentives`'s own check (`clawback.rs:191-195`)
+/// fire at the same point, on the same inputs, and map to the same
+/// [`MintError::ClawbackNotAuthority`] — either alone is sufficient, so this test proves authority
+/// is enforced AT ALL, not which of the two layers does it. Removing both would let a stranger's
+/// bundle build and sign under the stranger's own key.
 #[test]
 fn a_stranger_is_not_the_clawback_authority() {
     let fixture = fixture();
@@ -348,16 +359,33 @@ fn a_pre_staged_pending_action_is_refused_before_any_push() {
     assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
 
-/// The authority check's own MUTATION PROOF: with `clawback_authority` compared against the
-/// wrong (zeroed) hash, the door-level pre-check must be what actually catches it — see the
-/// paired unit test at `mint::reward_distributor_clawback` for the red/green pair. Kept here as
-/// the simulator-level confirmation that a correct authority hash is required end to end.
+/// A `reward_slot` from the wrong epoch — here, the distributor's LAUNCH epoch, while the
+/// commitment being clawed back is for the epoch the refill funded — is refused before anything
+/// is staged. Nothing downstream re-derives or checks `reward_slot`; without this guard the door
+/// would build and sign a bundle settling this commitment's withdrawal share against the wrong
+/// epoch's reward pool (dig_ecosystem#3372's carried-forward finding, the #3357-shaped twin of
+/// the fixture bug this same ticket fixed by matching on `epoch_start`).
 #[test]
-fn the_correct_authority_hash_is_required_end_to_end() {
+fn a_reward_slot_from_the_wrong_epoch_is_refused() {
     let fixture = fixture();
-    let wallet_puzzle_hash = fixture.wallet.puzzle_hash();
-    assert_eq!(
-        fixture.commitment_slot.info.value.clawback_ph, wallet_puzzle_hash,
-        "the fixture's own commitment must record this wallet as the clawback authority"
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    let mut request = clawback_request(&fixture, 0);
+    request.reward_slot = fixture.launch_epoch_reward_slot.clone();
+
+    let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network()).expect_err(
+        "a reward slot from a different epoch must not settle this commitment's clawback",
     );
+    assert!(
+        matches!(
+            error,
+            MintError::ClawbackRewardSlotEpochMismatch {
+                reward_slot_epoch_start,
+                commitment_epoch_start,
+            } if reward_slot_epoch_start == fixture.launch_epoch_reward_slot.info.value.epoch_start
+                && commitment_epoch_start == fixture.epoch_start
+        ),
+        "{error:?}"
+    );
+    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
