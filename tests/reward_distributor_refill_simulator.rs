@@ -253,7 +253,7 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
 /// is a pair of `NodePtr`s — indices into ONE `Allocator` — and this fixture builds its smuggled
 /// spend in its own, throwaway `SpendContext`, never the door's. Even without this guard, the door
 /// builds in a *different* fresh `SpendContext`, so `finish_spend` would dereference a foreign
-/// index and panic long before anything could be signed; the staged entry was never signable. This
+/// index and fail long before anything could be signed; the staged entry was never signable. This
 /// is a predicate test, not a demonstration of a working smuggle.
 ///
 /// The real, narrower risk this guard closes: the door's `SpendContext` is a deterministic function
