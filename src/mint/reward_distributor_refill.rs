@@ -342,3 +342,98 @@ fn gate_reward_distributor_refill_roots(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chia_protocol::{Coin, Program};
+
+    /// A synthetic, unexecutable `CoinSpend` — only `coin` is examined by
+    /// `gate_reward_distributor_refill_roots`, so the puzzle reveal and solution are `Program::default()`.
+    fn root_spend(parent: Bytes32, puzzle_hash: Bytes32, amount: u64) -> CoinSpend {
+        CoinSpend::new(
+            Coin::new(parent, puzzle_hash, amount),
+            Program::default(),
+            Program::default(),
+        )
+    }
+
+    /// Five spent coins whose parents are all outside the bundle (five roots), but only four are
+    /// named as permitted: refused by count, naming the actual (wrong) number found.
+    #[test]
+    fn five_roots_with_only_four_permitted_is_refused_by_count() {
+        let spends: Vec<CoinSpend> = (0..5)
+            .map(|i| root_spend(Bytes32::new([i; 32]), Bytes32::new([0x10 + i; 32]), 1))
+            .collect();
+        let permitted: [Bytes32; 4] = std::array::from_fn(|i| spends[i].coin.coin_id());
+
+        let error = gate_reward_distributor_refill_roots(&spends, permitted)
+            .expect_err("a fifth, unnamed root must be refused");
+        assert!(
+            matches!(error, MintError::RefillUnexpectedRoots(5)),
+            "{error:?}"
+        );
+    }
+
+    /// Three spent coins, all roots, but `permitted_roots` names four — one of this door's own
+    /// permitted coins is simply absent from the bundle. Refused by the count actually found (3),
+    /// not the count permitted.
+    #[test]
+    fn three_roots_missing_one_permitted_coin_is_refused_by_count() {
+        let spends: Vec<CoinSpend> = (0..3)
+            .map(|i| root_spend(Bytes32::new([i; 32]), Bytes32::new([0x20 + i; 32]), 1))
+            .collect();
+        let permitted: [Bytes32; 4] = [
+            spends[0].coin.coin_id(),
+            spends[1].coin.coin_id(),
+            spends[2].coin.coin_id(),
+            Bytes32::new([0xEE; 32]), // this door's fourth permitted coin, never spent here
+        ];
+
+        let error = gate_reward_distributor_refill_roots(&spends, permitted)
+            .expect_err("a missing permitted coin must be refused");
+        assert!(
+            matches!(error, MintError::RefillUnexpectedRoots(3)),
+            "{error:?}"
+        );
+    }
+
+    /// A child whose parent is ALSO spent in this same bundle is not a root — the parent is,
+    /// because nothing in the bundle spends the parent's own parent. Pins the root-derivation
+    /// logic itself, not just the count: if the child were wrongly counted as a root, the roots
+    /// set would have five members instead of four and this bundle would be refused.
+    #[test]
+    fn a_child_whose_parent_is_spent_in_the_same_bundle_is_excluded_from_roots() {
+        let parent = root_spend(Bytes32::new([0xA0; 32]), Bytes32::new([0xA1; 32]), 100);
+        let parent_id = parent.coin.coin_id();
+        let child = root_spend(parent_id, Bytes32::new([0xA2; 32]), 40);
+        let extra_a = root_spend(Bytes32::new([0xB0; 32]), Bytes32::new([0xB1; 32]), 1);
+        let extra_b = root_spend(Bytes32::new([0xC0; 32]), Bytes32::new([0xC1; 32]), 1);
+        let extra_c = root_spend(Bytes32::new([0xD0; 32]), Bytes32::new([0xD1; 32]), 1);
+
+        let permitted: [Bytes32; 4] = [
+            parent_id,
+            extra_a.coin.coin_id(),
+            extra_b.coin.coin_id(),
+            extra_c.coin.coin_id(),
+        ];
+        let spends = [parent, child, extra_a, extra_b, extra_c];
+
+        gate_reward_distributor_refill_roots(&spends, permitted).expect(
+            "the child's parent is spent in this same bundle, so only the parent is a root; the \
+             roots set has exactly the four permitted members",
+        );
+    }
+
+    /// The exact four permitted roots, and nothing else: accepted.
+    #[test]
+    fn the_exact_permitted_four_roots_is_accepted() {
+        let spends: Vec<CoinSpend> = (0..4)
+            .map(|i| root_spend(Bytes32::new([i; 32]), Bytes32::new([0x30 + i; 32]), 1))
+            .collect();
+        let permitted: [Bytes32; 4] = std::array::from_fn(|i| spends[i].coin.coin_id());
+
+        gate_reward_distributor_refill_roots(&spends, permitted)
+            .expect("exactly the four permitted roots must be accepted");
+    }
+}
