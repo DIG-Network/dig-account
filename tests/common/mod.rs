@@ -25,6 +25,7 @@ use dig_account::{
 use dig_chainsource_interface::{ChainSource, CoinRecord, SingletonLineage};
 use dig_keystore::MemoryBackend;
 use dig_session::{Password, ENTROPY_LEN};
+use indexmap::indexset;
 
 /// A test double that is a chain source AND a publisher over one in-process simulator.
 ///
@@ -79,6 +80,12 @@ pub struct SimulatorChain {
     /// Distinct from [`pushes`](Self::pushes) on purpose: an ordering bug shows up as a bundle
     /// broadcast a SECOND time, and if the node never answers, an accept-only counter cannot see it.
     pub push_attempts: RefCell<u32>,
+    /// The unix timestamp each buried height actually used, mirrored from `Simulator` (which does
+    /// not expose a per-height reader of its own private `block_timestamps` map) so
+    /// [`ChainSource::block_timestamp`] can answer honestly instead of the constant `None` a first
+    /// cut of this double returned — `dig-rewards-coin::read_distributor` refuses outright without
+    /// one (`"chain source has no timestamp for its own peak"`).
+    pub block_timestamps: RefCell<std::collections::HashMap<u32, u64>>,
 }
 
 impl SimulatorChain {
@@ -98,6 +105,7 @@ impl SimulatorChain {
             pushes: RefCell::new(0),
             accepted: RefCell::new(Vec::new()),
             push_attempts: RefCell::new(0),
+            block_timestamps: RefCell::new(std::collections::HashMap::new()),
         };
         // Leave genesis behind: a real coin is never created in block 0, and a fixture that
         // confirmed there would be indistinguishable from a fabricated height.
@@ -168,15 +176,26 @@ impl SimulatorChain {
             let updates = self.sim.borrow_mut().new_transaction(bundle)?;
             verdicts.extend(updates.keys().copied());
         }
-        self.sim.borrow_mut().create_block();
+        self.record_and_create_block();
         Ok(verdicts)
     }
 
     /// Advance the chain by `blocks` empty blocks.
     pub fn bury(&self, blocks: u32) {
         for _ in 0..blocks {
-            self.sim.borrow_mut().create_block();
+            self.record_and_create_block();
         }
+    }
+
+    /// `Simulator::create_block` stamps the height it is ABOUT to produce with its own current
+    /// `next_timestamp` and has no public getter for that map afterwards — this is the one place
+    /// that reads both before the call and files the pair away, so [`Self::block_timestamp`] can
+    /// answer for any height this double has ever buried.
+    fn record_and_create_block(&self) {
+        let height = self.sim.borrow().height();
+        let timestamp = self.sim.borrow().next_timestamp();
+        self.sim.borrow_mut().create_block();
+        self.block_timestamps.borrow_mut().insert(height, timestamp);
     }
 
     /// How many bundles this node has accepted, ever.
@@ -282,10 +301,15 @@ impl ChainSource for SimulatorChain {
             return self.unavailable();
         }
         let sim = self.sim.borrow();
+        // `Simulator::unspent_coins` DROPS a spent coin before this method ever sees it, so
+        // filtering afterwards on `include_spent` could never actually include one — every
+        // `include_spent = true` caller (a lineage walk looking for an ALREADY-SPENT eve-era coin,
+        // for instance) would silently get the same short answer as `include_spent = false`.
+        // `lookup_puzzle_hashes` is the un-filtered building block underneath `unspent_coins`; doing
+        // our own spent-status filtering over ITS output is what makes `include_spent` honest.
         Ok(sim
-            .unspent_coins(puzzle_hash, false)
+            .lookup_puzzle_hashes(indexset![puzzle_hash], false)
             .into_iter()
-            .filter_map(|coin| sim.coin_state(coin.coin_id()))
             .filter(|state| include_spent || state.spent_height.is_none())
             .map(CoinRecord::from_coin_state)
             .collect())
@@ -359,7 +383,21 @@ impl ChainSource for SimulatorChain {
         Ok(Some(self.sim.borrow().height()))
     }
 
-    fn block_timestamp(&self, _height: u32) -> Result<Option<u64>, Self::Error> {
+    fn block_timestamp(&self, height: u32) -> Result<Option<u64>, Self::Error> {
+        if self.offline {
+            return self.unavailable();
+        }
+        if let Some(timestamp) = self.block_timestamps.borrow().get(&height).copied() {
+            return Ok(Some(timestamp));
+        }
+        // `peak_height` reports `Simulator::height()`, which is the height of the block the
+        // simulator is about to produce next -- one past the last one `record_and_create_block`
+        // ever stamped. A caller asking for THIS height's timestamp is asking about the peak by
+        // this double's own convention, so it is answered from the simulator's pending clock
+        // rather than treated as an unknown block.
+        if height == self.sim.borrow().height() {
+            return Ok(Some(self.sim.borrow().next_timestamp()));
+        }
         Ok(None)
     }
 }

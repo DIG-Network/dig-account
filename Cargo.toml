@@ -1,6 +1,6 @@
 [package]
 name = "dig-account"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2021"
 rust-version = "1.81"
 description = "The DIG Network user Account: the fat, strictly-logical crate for everything an account does — the Account+Profile object model, unlock policy + keystore crypto, the in-process identity+money signer, per-profile key/DEK derivation, DID+dig-store mint/sign, and all wallet ops. Headless (no UI). Consumed by dig-app."
@@ -232,6 +232,12 @@ serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
 chia-sdk-test = "0.36"
+# Test-only: `Simulator::lookup_puzzle_hashes` takes an `IndexSet`, and the shared
+# `tests/common::SimulatorChain` double needs to call it directly (rather than the
+# spent-coin-dropping `unspent_coins` shortcut) to answer `coin_records_by_puzzle_hash` honestly
+# when `include_spent` is true. Pinned to the version already in the lock via chia-sdk-test so this
+# resolves to the SAME `indexmap` instance rather than a second copy with an incompatible `IndexSet`.
+indexmap = "2.14"
 # The schema crate, in TESTS only: the edit seam's acceptance is that the root it commits equals the
 # one dig-social-profile computes from the same slots, and only a direct call can state that
 # independently of the wrapper under test.

@@ -26,6 +26,9 @@ use crate::mint::reward_distributor::{
 use crate::mint::reward_distributor_evidence::{
     PendingRewardDistributor, PendingRewardDistributorRecord,
 };
+use crate::mint::reward_distributor_refill::{
+    begin_reward_distributor_refill, RewardDistributorRefillRequest, SignedRewardDistributorRefill,
+};
 use crate::mint::{MintNetwork, MIN_CONFIRMATION_DEPTH};
 use crate::session_residency::Residency;
 use crate::wallet::cat_transfer::{
@@ -121,6 +124,27 @@ impl RewardDistributorMinter {
     ) -> MintResult<SignedRewardDistributorMint> {
         let wallet = self.live_wallet_key()?;
         begin_reward_distributor_mint(&wallet, request, network, consensus_constants)
+    }
+
+    /// Build, gate and sign a reward-distributor REFILL from `request` — the sole construction
+    /// site of a commit-incentives request (`SPEC.md` §7.4), spending this profile's own $DIG CAT
+    /// coin into a distributor's reserve.
+    ///
+    /// A pure pass-through to [`begin_reward_distributor_refill`] once the live key is in hand,
+    /// the same shape [`begin`](Self::begin) already has: this method adds no refusal and removes
+    /// none. Every named refusal (an unowned funding coin, a zero epoch, a distributor this wallet
+    /// does not fund, a zero clawback puzzle hash, a zero commitment, insufficient funds) reaches
+    /// the caller unchanged. The one thing this layer adds is ahead of all of them —
+    /// [`MintError::Locked`] if the account relocked before a key could even be derived.
+    ///
+    /// See [`begin_reward_distributor_refill`] for the full error contract.
+    pub fn refill(
+        &self,
+        request: RewardDistributorRefillRequest,
+        network: &MintNetwork,
+    ) -> MintResult<SignedRewardDistributorRefill> {
+        let wallet = self.live_wallet_key()?;
+        begin_reward_distributor_refill(&wallet, request, network)
     }
 
     /// This profile's unspent, lineage-proven $DIG coins — [`cat_transfer::dig_cat_coins`] at this
@@ -738,6 +762,11 @@ mod tests {
             "MintResult<PublicKey>",
             "MintResult<Bytes32>",
             "MintResult<SignedRewardDistributorMint>",
+            // `refill`'s own return type — the SAME pass-through shape as `begin` above, over
+            // `begin_reward_distributor_refill` rather than `begin_reward_distributor_mint`. It
+            // hands out no key material for the same reason `SignedRewardDistributorMint` does not:
+            // the signing already happened inside the door, under the wallet's own key.
+            "MintResult<SignedRewardDistributorRefill>",
             "CatTransferResult<CatCoinListing>",
             // Added deliberately with `resume` (#66): the resume door returns the SAME
             // `PendingRewardDistributor` `begin`/`submit` already produce, and only after proving
@@ -876,21 +905,20 @@ mod tests {
                 );
             }
         }
-        // Pinned, not a floor: `new` (pub(crate)), `public_key`, `puzzle_hash`, `begin`,
-        // `dig_cat_coins` and `resume` are the 6 pub-qualified methods on the inherent impl
+        // Pinned, not a floor: `new` (pub(crate)), `public_key`, `puzzle_hash`, `begin`, `refill`,
+        // `dig_cat_coins` and `resume` are the 7 pub-qualified methods on the inherent impl
         // today. `live_wallet_key`, `parse_consistent_record`, `prove_coin_is_ours`,
         // `prove_launchers_descend_from_the_funding_coin`, `read_coin`, `launcher_absent`,
-        // `malformed`, `not_yours` and `unusable_spend_height` are private and exempt. RE-CHECKED deliberately for the
-        // launcher-ancestry binding, the typed rejection, and the confirmed-launcher /
-        // dead-launch split: every one of those additions is a private associated fn, and
-        // removing `requested_reserve_base_units` removed no method from THIS type, so the count
-        // is unchanged at 6 rather than loosened. A count drift in either direction means a
-        // method was added, removed, or the scan stopped seeing one that exists.
+        // `malformed`, `not_yours` and `unusable_spend_height` are private and exempt. RE-CHECKED
+        // deliberately for `refill` (#3372): the count moved from 6 to 7 in the SAME diff that
+        // added the method and widened `ALLOWED_RETURN_TYPES`, not independently of either. A
+        // count drift in either direction means a method was added, removed, or the scan stopped
+        // seeing one that exists.
         assert_eq!(
-            checked, 6,
-            "expected exactly 6 pub-qualified methods (new, public_key, puzzle_hash, begin, \
-             dig_cat_coins, resume) to be checked — the scan saw a different number, which \
-             means either a method was added/removed or the scan itself stopped seeing one"
+            checked, 7,
+            "expected exactly 7 pub-qualified methods (new, public_key, puzzle_hash, begin, \
+             refill, dig_cat_coins, resume) to be checked — the scan saw a different number, \
+             which means either a method was added/removed or the scan itself stopped seeing one"
         );
     }
 }
