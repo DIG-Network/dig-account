@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.33.0] - 2026-09-27
+
+### Features
+- **mint:** Reward-distributor refill door (#75)
+
 ## [0.32.0] - 2026-09-25
 
 ### Features
