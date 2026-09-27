@@ -133,9 +133,14 @@ impl RewardDistributorMinter {
     /// A pure pass-through to [`begin_reward_distributor_refill`] once the live key is in hand,
     /// the same shape [`begin`](Self::begin) already has: this method adds no refusal and removes
     /// none. Every named refusal (an unowned funding coin, a zero epoch, a wrong reserve asset, a
-    /// zero commitment, insufficient funds) reaches the caller unchanged. The one thing this layer
-    /// adds is ahead of all of them — [`MintError::Locked`] if the account relocked before a key
-    /// could even be derived.
+    /// zero commitment, a pre-staged pending spend, an unexpected root, insufficient funds) reaches
+    /// the caller unchanged. The one thing this layer adds is ahead of all of them —
+    /// [`MintError::Locked`] if the account relocked before a key could even be derived.
+    ///
+    /// There is deliberately **no** "a distributor this wallet does not fund" refusal: refilling is
+    /// domain-permissionless (any $DIG holder may commit to any live distributor's reserve) and the
+    /// primitive itself takes no ownership key over the distributor, only over the funding CAT this
+    /// wallet supplies — which the unowned-funding-coin refusal above already covers.
     ///
     /// See [`begin_reward_distributor_refill`] for the full error contract.
     pub fn refill(

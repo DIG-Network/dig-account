@@ -296,6 +296,27 @@ pub enum MintError {
     /// A reward-distributor refill named `rewards_base_units == 0`.
     #[error("a refill of zero base units funds nothing")]
     RefillZeroRewardsBaseUnits,
+
+    /// A reward-distributor refill's caller-supplied `distributor` already carried a staged
+    /// action or a staged foreign CAT spend in its `pending_spend`.
+    ///
+    /// The upstream `RewardDistributor::pending_spend` is `pub`, and `finish_spend` appends
+    /// whatever it finds there — `actions` and `other_cats` alike — into THIS bundle
+    /// unconditionally. A caller that reads a distributor fresh, as this seam's own docs require,
+    /// never has anything staged; a distributor that does is either stale or was deliberately
+    /// prepared to smuggle a spend under this wallet's own signature. Refused before a single
+    /// spend of this door's own is staged.
+    #[error("the distributor already carries a staged action or CAT spend; a refill's own build starts from a distributor with nothing pending")]
+    RefillPendingSpendPopulated,
+
+    /// A finished refill bundle spent a pre-existing coin other than the four this door itself
+    /// named — the distributor singleton, its reserve, the reward slot, and the funding CAT.
+    ///
+    /// The count carried is the number of roots the FINISHED bundle actually spent, so a caller
+    /// debugging a refusal sees at a glance whether the bundle spent too few (a build defect) or
+    /// too many (exactly the smuggled-spend shape this refusal exists to catch).
+    #[error("the bundle spends {0} pre-existing coins; a distributor refill spends exactly the four this door named")]
+    RefillUnexpectedRoots(usize),
 }
 
 #[cfg(test)]

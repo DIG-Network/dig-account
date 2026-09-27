@@ -33,8 +33,20 @@
 //! authority: a UI, an RPC layer or a misconfigured value can hand a commitment to somebody who is
 //! not this wallet, unrecoverably, and this door has no way to distinguish that from the legitimate
 //! case. A non-wallet clawback authority is a different, differently-named request, not a knob here.
+//!
+//! # Every root, and only those roots
+//!
+//! `request.distributor` is caller input, and the upstream `RewardDistributor` carries a `pub`
+//! `pending_spend` whose `actions` and `other_cats` are appended to this bundle unconditionally by
+//! `finish_spend` — a distributor handed in with either already populated could smuggle a spend
+//! this door never built into a bundle this door signs. This door refuses that before staging
+//! anything, and separately enumerates the finished bundle's roots — the coins spent whose parent
+//! is not also spent in the same bundle — against exactly the four pre-existing coins it itself
+//! named: the distributor singleton, its reserve, the reward slot, and the funding CAT.
 
-use chia_protocol::{Bytes32, SpendBundle};
+use std::collections::HashSet;
+
+use chia_protocol::{Bytes32, CoinSpend, SpendBundle};
 use chia_wallet_sdk::driver::{
     Cat, CatSpend, RewardDistributor, Slot, SpendContext, SpendWithConditions, StandardLayer,
 };
@@ -154,6 +166,11 @@ impl SignedRewardDistributorRefill {
 ///   own reserve asset id.
 /// - [`MintError::RefillZeroRewardsBaseUnits`] if `request.rewards_base_units` is zero.
 /// - [`MintError::InsufficientFunds`] if the funding CAT cannot cover `rewards_base_units`.
+/// - [`MintError::RefillPendingSpendPopulated`] if `request.distributor` already carries a
+///   staged action or a staged foreign CAT spend — see the module's own docs on why this door
+///   never signs over a distributor it did not read fresh.
+/// - [`MintError::RefillUnexpectedRoots`] if the finished bundle spends a pre-existing coin other
+///   than the four this door itself named.
 /// - [`MintError::Build`] if any spend could not be constructed, including a refusal
 ///   `dig-rewards-coin` itself raises.
 /// - [`MintError::Refused`] if the gate finds a requirement this account must not sign.
@@ -184,10 +201,31 @@ pub fn begin_reward_distributor_refill(
             available: request.funding_cat.coin.amount,
         });
     }
+    // A caller-supplied `distributor` can carry an already-staged `pending_spend` — its `actions`
+    // and `other_cats` are both `pub` on the upstream type, and `finish_spend` appends whatever it
+    // finds there to THIS bundle unconditionally. Left unchecked, a staged `other_cats` entry lets
+    // a caller smuggle an arbitrary wallet-owned CAT spend under this refill's own signature: the
+    // spend's `AGG_SIG_ME` matches this wallet's key, so the signing loop below has no way to tell
+    // it apart from the spend this door itself built. Refused here, before a single spend is
+    // staged, so there is nothing later that could sign it.
+    if !request.distributor.pending_spend.actions.is_empty()
+        || !request.distributor.pending_spend.other_cats.is_empty()
+    {
+        return Err(MintError::RefillPendingSpendPopulated);
+    }
 
     let mut ctx = SpendContext::new();
     let mut distributor = request.distributor;
     let funding_cat_coin_id = request.funding_cat.coin.coin_id();
+    // The exact roots this door itself may spend — captured before anything below consumes
+    // `distributor` or `request.reward_slot` by value. Checked against the finished bundle further
+    // down; see [`MintError::RefillUnexpectedRoots`].
+    let permitted_roots: [Bytes32; 4] = [
+        distributor.coin.coin_id(),
+        distributor.reserve.coin.coin_id(),
+        request.reward_slot.coin.coin_id(),
+        funding_cat_coin_id,
+    ];
 
     let secure_conditions = commit_incentives_for_distributor_epoch(
         &mut ctx,
@@ -220,6 +258,8 @@ pub fn begin_reward_distributor_refill(
         .map_err(|e| MintError::Build(format!("distributor spend: {e}")))?;
 
     let coin_spends = ctx.take();
+
+    gate_reward_distributor_refill_roots(&coin_spends, permitted_roots)?;
 
     let required_signatures = dig_merkle::required_signatures(&coin_spends, network.constants())
         .map_err(|e| MintError::Build(format!("required signatures: {e}")))?;
@@ -271,4 +311,34 @@ pub fn begin_reward_distributor_refill(
         distributor_epoch_start: request.distributor_epoch_start,
         rewards_base_units: request.rewards_base_units,
     })
+}
+
+/// Enumerate what a refill bundle spends, mirroring
+/// [`gate_reward_distributor_launch`](super::reward_distributor::gate_reward_distributor_launch)'s
+/// own root check: a **root** here is a spent coin whose parent is not ALSO spent in this same
+/// bundle, and a refill's finished bundle must spend exactly the four pre-existing coins this door
+/// itself named — `permitted_roots` — never a fifth. This is what closes the gap
+/// [`MintError::RefillPendingSpendPopulated`] alone cannot: even a distributor with an EMPTY
+/// `pending_spend` could in principle have its build widened later to reach another coin, and this
+/// check would still refuse it, because it says nothing about how the roots got there.
+fn gate_reward_distributor_refill_roots(
+    coin_spends: &[CoinSpend],
+    permitted_roots: [Bytes32; 4],
+) -> MintResult<()> {
+    let spent: HashSet<Bytes32> = coin_spends
+        .iter()
+        .map(|spend| spend.coin.coin_id())
+        .collect();
+    let roots: HashSet<Bytes32> = coin_spends
+        .iter()
+        .filter(|spend| !spent.contains(&spend.coin.parent_coin_info))
+        .map(|spend| spend.coin.coin_id())
+        .collect();
+
+    let permitted: HashSet<Bytes32> = permitted_roots.into_iter().collect();
+    if roots != permitted {
+        return Err(MintError::RefillUnexpectedRoots(roots.len()));
+    }
+
+    Ok(())
 }

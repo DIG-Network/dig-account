@@ -9,9 +9,12 @@
 
 use chia_protocol::{Bytes32, Coin};
 use chia_puzzle_types::cat::CatArgs;
-use chia_puzzle_types::LineageProof;
-use chia_wallet_sdk::driver::{Cat, CatInfo, RewardDistributor, Slot};
-use chia_wallet_sdk::prelude::TESTNET11_CONSTANTS;
+use chia_puzzle_types::{LineageProof, Memos};
+use chia_wallet_sdk::driver::{
+    Cat, CatInfo, CatSpend, RewardDistributor, Slot, SpendContext, SpendWithConditions,
+    StandardLayer,
+};
+use chia_wallet_sdk::prelude::{Conditions, TESTNET11_CONSTANTS};
 use chia_wallet_sdk::signer::AggSigConstants;
 use chia_wallet_sdk::types::puzzles::RewardDistributorRewardSlotValue;
 use dig_account::mint::error::MintError;
@@ -238,6 +241,49 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
             .into_iter()
             .any(|coin| coin.amount == change),
         "the change coin is what the funding CAT did not commit"
+    );
+}
+
+/// dig_ecosystem#3372 custody finding A: the upstream `RewardDistributor::pending_spend` carries
+/// `pub other_cats`, and `finish_spend` appends it into THIS bundle unconditionally. A caller that
+/// pre-stages a wallet-owned $DIG coin's spend to an arbitrary destination there — never named
+/// anywhere in the request itself — must be refused before anything is signed or pushed, not
+/// merely fail to be caught by a narrower check.
+#[test]
+fn a_pre_staged_other_cats_wallet_spend_is_refused_before_any_push() {
+    let fixture = fixture();
+    let pushes_before = fixture.chain.pushed_bundles();
+
+    // A wallet-owned $DIG coin the request never names anywhere — the coin an attacker wants
+    // smuggled out under this door's own signature.
+    let smuggled = wallet_owned_dig_cat(&fixture.chain, &fixture.wallet, 1);
+    let attacker_puzzle_hash = Bytes32::new([0x99; 32]);
+
+    let mut ctx = SpendContext::new();
+    let smuggled_spend = StandardLayer::new(fixture.wallet.public_key())
+        .spend_with_conditions(
+            &mut ctx,
+            Conditions::new().create_coin(attacker_puzzle_hash, 1, Memos::None),
+        )
+        .expect("the smuggled spend's own puzzle and solution build");
+
+    let mut request = refill_request(&fixture);
+    request
+        .distributor
+        .pending_spend
+        .other_cats
+        .push(CatSpend::new(smuggled, smuggled_spend));
+
+    let error = begin_reward_distributor_refill(&fixture.wallet, request, &network())
+        .expect_err("a pre-staged foreign CAT spend must be refused before it is ever signed");
+    assert!(
+        matches!(error, MintError::RefillPendingSpendPopulated),
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture.chain.pushed_bundles(),
+        pushes_before,
+        "a refused refill must broadcast nothing"
     );
 }
 
