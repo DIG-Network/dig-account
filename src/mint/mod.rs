@@ -24,6 +24,7 @@ pub mod error;
 pub mod evidence;
 pub mod profile;
 pub mod reward_distributor;
+pub mod reward_distributor_clawback;
 pub mod reward_distributor_evidence;
 pub mod reward_distributor_refill;
 pub mod seed;
@@ -56,6 +57,9 @@ pub use profile::ProfileMintStatus;
 pub use reward_distributor_evidence::{
     ConfirmedRewardDistributor, PendingRewardDistributor, PendingRewardDistributorRecord,
     RewardDistributorStatus,
+};
+pub use reward_distributor_clawback::{
+    RewardDistributorClawbackRequest, SignedRewardDistributorClawback,
 };
 pub use reward_distributor_refill::{
     RewardDistributorRefillRequest, SignedRewardDistributorRefill,

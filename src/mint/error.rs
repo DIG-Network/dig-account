@@ -317,6 +317,63 @@ pub enum MintError {
     /// too many (exactly the smuggled-spend shape this refusal exists to catch).
     #[error("the bundle spends {0} pre-existing coins; a distributor refill spends exactly the four this door named")]
     RefillUnexpectedRoots(usize),
+
+    /// This wallet is not the commitment slot's recorded `clawback_ph` — `dig-rewards-coin`'s own
+    /// [`RewardsError::NotTheClawbackAuthority`](dig_rewards_coin::RewardsError::NotTheClawbackAuthority).
+    ///
+    /// Authority is the slot's own recorded hash and nothing else — not the manager, not the
+    /// launcher, not the distributor's operator.
+    #[error("this wallet is not the commitment slot's recorded clawback authority")]
+    ClawbackNotAuthority,
+
+    /// A reward-distributor clawback's caller-supplied `clawback_coin` is not at this wallet's
+    /// puzzle hash. A clawback door authorizes only with coins this account controls.
+    #[error("the clawback authorizing coin is not at this wallet's puzzle hash")]
+    ClawbackUnownedCoin,
+
+    /// The committed distributor epoch has already started, read against chain-current time —
+    /// never the local clock. A commitment whose epoch is already live is not this door's to
+    /// withdraw.
+    #[error("the committed epoch ({epoch_start}) has already started as of chain time {chain_now}")]
+    ClawbackEpochAlreadyStarted {
+        /// The commitment's own recorded epoch boundary.
+        epoch_start: u64,
+        /// Chain-current time this was checked against.
+        chain_now: u64,
+    },
+
+    /// `chia-sdk-driver` 0.36.0's own share multiply cannot represent this commitment's share at
+    /// this scale (#3286) — `dig-rewards-coin`'s own
+    /// [`RewardsError::DriverShareNotRepresentable`](dig_rewards_coin::RewardsError::DriverShareNotRepresentable).
+    /// Refused before the upstream driver is called; the puzzle itself would still pay correctly,
+    /// but this account will not sign over a Rust-side figure it cannot trust.
+    #[error("the withdrawal share is not representable at this scale ({rewards_base_units} base units, {withdrawal_share_bps} bps)")]
+    ClawbackDriverShareNotRepresentable {
+        /// The full committed amount the share would be computed from.
+        rewards_base_units: u64,
+        /// The distributor's own withdrawal-share basis points.
+        withdrawal_share_bps: u64,
+    },
+
+    /// The upstream driver's returned share disagrees with this crate's own independent
+    /// restatement — `dig-rewards-coin`'s own
+    /// [`RewardsError::DriverShareDisagrees`](dig_rewards_coin::RewardsError::DriverShareDisagrees).
+    /// A disagreement makes the whole returned figure untrustworthy, not just the share.
+    #[error("the driver-reported withdrawal share disagrees with this account's own restatement")]
+    ClawbackDriverShareDisagrees,
+
+    /// A reward-distributor clawback's caller-supplied `distributor` already carried a staged
+    /// action or a staged foreign CAT spend in its `pending_spend` — the same smuggling vector
+    /// [`RefillPendingSpendPopulated`](Self::RefillPendingSpendPopulated) closes for the refill
+    /// door. Refused before a single spend of this door's own is staged.
+    #[error("the distributor already carries a staged action or CAT spend; a clawback's own build starts from a distributor with nothing pending")]
+    ClawbackPendingSpendPopulated,
+
+    /// A finished clawback bundle spent a pre-existing coin other than the five this door itself
+    /// named — the distributor singleton, its reserve, the commitment slot, the reward slot, and
+    /// the clawback authorizing coin.
+    #[error("the bundle spends {0} pre-existing coins; a distributor clawback spends exactly the five this door named")]
+    ClawbackUnexpectedRoots(usize),
 }
 
 #[cfg(test)]

@@ -88,6 +88,10 @@ pub use mint::reward_distributor::{
     begin_reward_distributor_mint, RewardDistributorMintRequest, SignedRewardDistributorMint,
     OFFER_XCH_AMOUNT,
 };
+pub use mint::reward_distributor_clawback::{
+    begin_reward_distributor_clawback, RewardDistributorClawbackRequest,
+    SignedRewardDistributorClawback,
+};
 pub use mint::reward_distributor_refill::{
     begin_reward_distributor_refill, RewardDistributorRefillRequest, SignedRewardDistributorRefill,
 };
