@@ -24,6 +24,15 @@
 //! no OTHER amount field: a naming that implies sizing the reserve as a durable property (rather
 //! than naming this one spend's own contribution) was withdrawn on dig-app#412 and must not
 //! reappear here under a different name.
+//!
+//! # The clawback authority is derived, never accepted
+//!
+//! A commitment's `clawback_ph` is the ONLY authority that can later withdraw it. This door always
+//! derives it as `wallet.puzzle_hash()` — there is no `clawback_puzzle_hash` field on
+//! [`RewardDistributorRefillRequest`] — because a caller-suppliable hash is a caller-suppliable
+//! authority: a UI, an RPC layer or a misconfigured value can hand a commitment to somebody who is
+//! not this wallet, unrecoverably, and this door has no way to distinguish that from the legitimate
+//! case. A non-wallet clawback authority is a different, differently-named request, not a knob here.
 
 use chia_protocol::{Bytes32, SpendBundle};
 use chia_wallet_sdk::driver::{
@@ -60,9 +69,6 @@ pub struct RewardDistributorRefillRequest {
     /// boundary (`dig_rewards_coin::fund::plan_commitment_epochs` derives one) and strictly
     /// nonzero.
     pub distributor_epoch_start: u64,
-    /// The puzzle hash that alone may later withdraw this commitment (`SPEC.md` §7.5). MUST NOT
-    /// be the zero hash — see [`MintError::RefillZeroClawbackHash`].
-    pub clawback_puzzle_hash: Bytes32,
     /// This wallet's own $DIG CAT coin funding the refill. Spent WHOLE; any amount above
     /// `rewards_base_units` returns to this same wallet as change in this same bundle.
     pub funding_cat: Cat,
@@ -146,7 +152,6 @@ impl SignedRewardDistributorRefill {
 /// - [`MintError::RefillZeroEpoch`] if `request.distributor_epoch_start` is zero.
 /// - [`MintError::RefillWrongAsset`] if `request.funding_cat`'s asset id is not the distributor's
 ///   own reserve asset id.
-/// - [`MintError::RefillZeroClawbackHash`] if `request.clawback_puzzle_hash` is the zero hash.
 /// - [`MintError::RefillZeroRewardsBaseUnits`] if `request.rewards_base_units` is zero.
 /// - [`MintError::InsufficientFunds`] if the funding CAT cannot cover `rewards_base_units`.
 /// - [`MintError::Build`] if any spend could not be constructed, including a refusal
@@ -170,9 +175,6 @@ pub fn begin_reward_distributor_refill(
     if request.funding_cat.info.asset_id != request.distributor.info.constants.reserve_asset_id {
         return Err(MintError::RefillWrongAsset);
     }
-    if request.clawback_puzzle_hash == Bytes32::default() {
-        return Err(MintError::RefillZeroClawbackHash);
-    }
     if request.rewards_base_units == 0 {
         return Err(MintError::RefillZeroRewardsBaseUnits);
     }
@@ -192,7 +194,7 @@ pub fn begin_reward_distributor_refill(
         &mut distributor,
         request.reward_slot,
         request.distributor_epoch_start,
-        request.clawback_puzzle_hash,
+        wallet_puzzle_hash,
         request.rewards_base_units,
     )
     .map_err(|e| MintError::Build(format!("commit incentives: {e}")))?;

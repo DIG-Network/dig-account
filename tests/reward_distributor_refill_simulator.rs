@@ -164,7 +164,6 @@ fn refill_request(fixture: &Fixture) -> RewardDistributorRefillRequest {
         distributor: fixture.distributor.clone(),
         reward_slot: fixture.reward_slot.clone(),
         distributor_epoch_start: FIRST_EPOCH_START + DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
-        clawback_puzzle_hash: fixture.wallet.puzzle_hash(),
         funding_cat: fixture.funding_cat,
         rewards_base_units: REFILL_COMMIT_BASE_UNITS,
     }
@@ -208,6 +207,19 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
         snapshot.reserve_base_units(),
         REFILL_COMMIT_BASE_UNITS,
         "a launch's reserve starts at zero and this refill is the only thing that has funded it"
+    );
+
+    // `clawback_puzzle_hash` is not a caller-suppliable field: this door derives it as the
+    // wallet's own puzzle hash. The commitment slot the refill created must actually carry that
+    // hash on chain — the regression guard for dig_ecosystem#3372's custody finding C.
+    assert!(
+        snapshot
+            .commitment_slots()
+            .iter()
+            .any(|slot| slot.info.value.clawback_ph == wallet_puzzle_hash
+                && slot.info.value.rewards == REFILL_COMMIT_BASE_UNITS),
+        "the committed slot's clawback authority must be this wallet's own puzzle hash, never a \
+         caller-supplied one"
     );
 
     // The change coin is a CAT, not bare XCH: its on-chain puzzle hash is the CAT-wrapped one
@@ -286,24 +298,6 @@ fn a_non_dig_funding_cat_is_refused() {
     let error = begin_reward_distributor_refill(&fixture.wallet, request, &network())
         .expect_err("a non-$DIG CAT must not fund this distributor's reserve");
     assert!(matches!(error, MintError::RefillWrongAsset), "{error:?}");
-    assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
-}
-
-/// A zero `clawback_puzzle_hash` is refused: it would make the commitment unrecoverable.
-#[test]
-fn a_zero_clawback_hash_is_refused() {
-    let fixture = fixture();
-    let pushes_before = fixture.chain.pushed_bundles();
-
-    let mut request = refill_request(&fixture);
-    request.clawback_puzzle_hash = Bytes32::default();
-
-    let error = begin_reward_distributor_refill(&fixture.wallet, request, &network())
-        .expect_err("a zero clawback hash must not be accepted");
-    assert!(
-        matches!(error, MintError::RefillZeroClawbackHash),
-        "{error:?}"
-    );
     assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
 

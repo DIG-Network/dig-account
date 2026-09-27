@@ -132,10 +132,10 @@ impl RewardDistributorMinter {
     ///
     /// A pure pass-through to [`begin_reward_distributor_refill`] once the live key is in hand,
     /// the same shape [`begin`](Self::begin) already has: this method adds no refusal and removes
-    /// none. Every named refusal (an unowned funding coin, a zero epoch, a distributor this wallet
-    /// does not fund, a zero clawback puzzle hash, a zero commitment, insufficient funds) reaches
-    /// the caller unchanged. The one thing this layer adds is ahead of all of them —
-    /// [`MintError::Locked`] if the account relocked before a key could even be derived.
+    /// none. Every named refusal (an unowned funding coin, a zero epoch, a wrong reserve asset, a
+    /// zero commitment, insufficient funds) reaches the caller unchanged. The one thing this layer
+    /// adds is ahead of all of them — [`MintError::Locked`] if the account relocked before a key
+    /// could even be derived.
     ///
     /// See [`begin_reward_distributor_refill`] for the full error contract.
     pub fn refill(

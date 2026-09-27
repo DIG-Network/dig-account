@@ -293,16 +293,6 @@ pub enum MintError {
     #[error("the funding CAT is not the asset this distributor's reserve accepts; this wallet cannot fund a distributor with a foreign asset")]
     RefillWrongAsset,
 
-    /// A reward-distributor refill named the zero hash as `clawback_puzzle_hash`.
-    ///
-    /// `dig-rewards-coin` 0.8.0's own docs are explicit: a zero hash makes the commitment
-    /// unrecoverable, silently turning the default REVOCABLE path into an irrevocable one without
-    /// saying so. Refused here, before any spend is staged, in this seam's own terms — the same
-    /// reason the zero-epoch-length refusal on the mint door is stated locally rather than left to
-    /// a transitive crate's internal check.
-    #[error("the clawback puzzle hash is zero; a zero hash makes the commitment unrecoverable and would silently turn the default revocable refill into an irrevocable one")]
-    RefillZeroClawbackHash,
-
     /// A reward-distributor refill named `rewards_base_units == 0`.
     #[error("a refill of zero base units funds nothing")]
     RefillZeroRewardsBaseUnits,
