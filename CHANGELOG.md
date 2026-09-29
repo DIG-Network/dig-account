@@ -4,14 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.35.0] - 2026-09-27
+## [0.35.0] - 2026-09-29
 
 ### Features
-- **mint:** Reward-distributor clawback door — withdraws a commitment's unstarted-epoch
-  incentives back to the recorded clawback authority, refusing a stranger, an already-started
-  epoch, a populated pending spend, a wrong-epoch or under-funded caller-supplied reward slot,
-  an unrepresentable or disagreeing driver share, and an unexpected spent root, before ever
-  building or signing a bundle (#3372)
+- **mint:** Reward-distributor clawback door (v0.35.0) (#77)
 
 ## [0.34.0] - 2026-09-27
 
@@ -225,4 +221,5 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Chores
 - Scaffold dig-account crate (#1497)
+
 
