@@ -333,6 +333,15 @@ fn map_rewards_error(error: RewardsError) -> MintError {
             withdrawal_share_bps,
         },
         RewardsError::DriverShareDisagrees { .. } => MintError::ClawbackDriverShareDisagrees,
+        // Raised by the dependency itself, before anything is built: the chain clock in the
+        // request's observation has reached the commitment's epoch start.
+        RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        } => MintError::ClawbackEpochAlreadyStarted {
+            epoch_start: distributor_epoch_start,
+            chain_now: peak_timestamp,
+        },
         other => MintError::Build(format!("withdraw committed incentives: {other}")),
     }
 }
