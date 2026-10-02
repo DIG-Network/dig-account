@@ -55,8 +55,8 @@ note: associated function defined here
    |                   ^^^
 help: provide the arguments
    |
-22 |     PendingRewardDistributor::new(/* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* chia_protocol::bytes::BytesImpl<32> */, /* dig_rewards_coin::comment::LaunchComment */, /* u32 */);
-   |                                   +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+22 |     PendingRewardDistributor::new(/* BytesImpl<32> */, /* BytesImpl<32> */, /* BytesImpl<32> */, /* BytesImpl<32> */, /* LaunchComment */, /* u32 */);
+   |                                   ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 error[E0624]: associated function `from_confirmed` is private
   --> tests/compile_fail/a_distributor_needs_chain_evidence.rs:23:33
@@ -87,5 +87,5 @@ note: associated function defined here
    |                   ^^^^^^^^^^^^^^
 help: provide the arguments
    |
-23 |     ConfirmedRewardDistributor::from_confirmed(/* &PendingRewardDistributor */, /* &dig_chainsource_interface::record::CoinRecord */, /* &dig_rewards_coin::discovery::DiscoveredDistributor */, /* u32 */);
-   |                                                +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+23 |     ConfirmedRewardDistributor::from_confirmed(/* &PendingRewardDistributor */, /* &CoinRecord */, /* &DiscoveredDistributor */, /* u32 */);
+   |                                                +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
