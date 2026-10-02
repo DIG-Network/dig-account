@@ -23,8 +23,8 @@ use dig_account::{
     RewardDistributorMintRequest, RewardDistributorRefillRequest, WalletKey,
 };
 use dig_rewards_coin::{
-    dig_distributor_constants, read_distributor, ChainObservation, DistributorLaunchTerms, LaunchComment,
-    ManagerInnerPuzzle, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+    dig_distributor_constants, read_distributor, ChainObservation, DistributorLaunchTerms,
+    LaunchComment, ManagerInnerPuzzle, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
 };
 
 mod common;
