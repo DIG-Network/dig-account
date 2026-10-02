@@ -184,7 +184,7 @@ ureq = { version = "2", optional = true }
 # `DECODE_MAX_SERIALIZED_BYTES` (measured against the index) — and this crate's reward-distributor
 # publish/confirm half (`discover_distributor`, `DiscoveredDistributor`) is new code, so there is no
 # existing call site to adapt.
-dig-rewards-coin = "0.9"
+dig-rewards-coin = "0.11"
 
 [dev-dependencies]
 # Test-only: the INDEPENDENT BIP-39 expansion used as the reference for the account root, so a
