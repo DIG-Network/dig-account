@@ -475,9 +475,9 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.24.1"
+version = "0.24.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d82677c6aba0319eafe8808f253bc0aa34539bfcef8b82c9eb35339bfe71dfcc"
+checksum = "79770ff86342fba33d9a9384090d4f3f770e769427cd09d442bf1114d924df32"
 dependencies = [
  "async-trait",
  "chia-bls 0.36.1",

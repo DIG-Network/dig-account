@@ -45,8 +45,8 @@ dig-wallet-backend = { version = "0.31", default-features = false, features = ["
 dig-session = "0.9"
 # The single dig-identity line in this tree. Every other dig-* edge here now resolves ^0.7 too, so
 # no dig-identity type can meet a different one across a seam.
-dig-identity = "0.7.1"
-dig-keystore = "0.13"
+dig-identity = "0.7.2"
+dig-keystore = "0.13.2"
 # Bumped to ^0.13 (§2.4b, #3341): the hold recorded below stopped applying the moment
 # dig-rewards-coin adopted `dig-constants ^0.13.1` (every published 0.4.x-0.7.x line does) — a
 # SECOND dig-constants line was already resolving through that edge regardless of what this line
@@ -69,7 +69,7 @@ dig-constants = "0.13"
 # newtypes), so no chia-bls type ever crossed it, but the identity signer VERIFIES with whichever
 # chia-bls line this crate resolves. Keeping that the same line as the money signer's is what stops
 # one set of bytes being verifiable by one signer and not the other.
-dig-ipc-protocol = "0.3.1"
+dig-ipc-protocol = "0.3.2"
 # The canonical Chia DID expert crate: it builds every DID coin spend and reports the exact
 # signatures required (INV-2/INV-3 — key-free, unsigned output). dig-account NEVER hand-rolls a DID
 # spend bundle; it supplies the funding coin, signs what dig-did reports, and broadcasts.
@@ -227,7 +227,7 @@ tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 # The graph guard in `tests/one_chia_line_in_the_lock.rs` would catch a future 0.24.x that re-split
 # the dependency graph. It would NOT catch another #59-class runtime wedge, which is why the floor
 # carries that half rather than the caret being trusted alone.
-chia-query = "0.24.1"
+chia-query = "0.24.3"
 serde_json = "1"
 # The in-process Chia Simulator: the mint's spend bundle is proven against a real consensus
 # validator (CLVM + signature verification) before any mainnet broadcast is contemplated.
