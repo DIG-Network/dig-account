@@ -1,5 +1,5 @@
 //! The money-path signing seam for a **DIG reward-distributor clawback** —
-//! `withdraw_committed_incentives` (`SPEC.md` §7.4 clauses 3-5, §7.5, `dig-rewards-coin` 0.9.x).
+//! `withdraw_committed_incentives` (`SPEC.md` §7.4 clauses 3-5, §7.5, `dig-rewards-coin` 0.11.x).
 //!
 //! A funder who committed $DIG to a future distributor epoch
 //! ([`begin_reward_distributor_refill`](super::reward_distributor_refill::begin_reward_distributor_refill))
@@ -28,10 +28,11 @@
 //! # Refuse before the epoch starts, against CHAIN time
 //!
 //! A commitment already inside its own epoch is no longer this door's to withdraw — the money has
-//! become the live epoch's own reward. `chain_now_unix_seconds` is caller-supplied — this door does
-//! not read the chain itself — and refuses [`MintError::ClawbackEpochAlreadyStarted`] before a
-//! single spend is staged; the caller MUST source it from the peak block's own timestamp, never
-//! the local clock.
+//! become the live epoch's own reward. The request carries the [`ChainObservation`] of the very
+//! read that supplied the distributor; `dig_rewards_coin::withdraw_committed_incentives` checks
+//! its `peak_timestamp` against the commitment's epoch start before staging anything, and this
+//! door surfaces that refusal as [`MintError::ClawbackEpochAlreadyStarted`]. There is no local
+//! clock and no local copy of the predicate.
 //!
 //! # Every root, and only those roots
 //!
@@ -54,6 +55,7 @@ use chia_wallet_sdk::types::puzzles::{
 use dig_rewards_coin::clawback::{
     clawback_authority, commitment_distributor_epoch_start, withdraw_committed_incentives,
 };
+use dig_rewards_coin::state::ChainObservation;
 use dig_rewards_coin::RewardsError;
 
 use crate::keys::wallet_key::WalletKey;
@@ -73,7 +75,7 @@ pub struct RewardDistributorClawbackRequest {
     /// own docs on why a caller MUST re-read rather than reuse a held snapshot.
     pub distributor: RewardDistributor,
     /// The commitment slot this clawback withdraws, taken from the SAME read as `distributor`
-    /// (`dig_rewards_coin::state::DistributorSnapshot::commitment_slots`), never reconstructed from
+    /// (`dig_rewards_coin::state::Commitment::slot`), never reconstructed from
     /// a chain-rebuilt distributor's own slot-derivation helper — that path can fabricate a phantom
     /// `LineageProof` (dig_ecosystem#3357).
     pub commitment_slot: Slot<RewardDistributorCommitmentSlotValue>,
@@ -84,10 +86,11 @@ pub struct RewardDistributorClawbackRequest {
     /// Spent WHOLE; its own value returns to this same wallet as a same-amount recreation in this
     /// same bundle, so nothing is burned carrying the assertion.
     pub clawback_coin: Coin,
-    /// Caller-supplied current time, checked against the commitment's recorded epoch start. The
-    /// caller MUST source this from the peak block's own timestamp, never the local clock — this
-    /// door does not read the chain itself and cannot verify what it is handed.
-    pub chain_now_unix_seconds: u64,
+    /// The chain observation of the SAME `read_distributor` read that supplied `distributor` and
+    /// both slots (`DistributorSnapshot::observed`), never a second read. `dig-rewards-coin`
+    /// refuses the clawback against ITS `peak_timestamp`; there is no constructor, so a caller
+    /// cannot hand in a clock of its own.
+    pub observed: ChainObservation,
 }
 
 /// A **fully signed, not yet submitted** reward-distributor clawback bundle.
@@ -99,7 +102,7 @@ pub struct SignedRewardDistributorClawback {
     /// evidence record.
     commitment_slot_coin_id: Bytes32,
     /// The $DIG base units this clawback recovers, cross-checked against the puzzle's own
-    /// arithmetic — see [`dig_rewards_coin::clawback::recoverable_base_units`].
+    /// arithmetic — see `dig_rewards_coin::state::Commitment::recoverable_base_units`.
     recovered_base_units: u64,
 }
 
@@ -149,8 +152,8 @@ impl SignedRewardDistributorClawback {
 ///
 /// - [`MintError::ClawbackUnownedCoin`] if `request.clawback_coin` is not at this wallet's puzzle
 ///   hash.
-/// - [`MintError::ClawbackEpochAlreadyStarted`] if the commitment's recorded epoch start is at or
-///   before `request.chain_now_unix_seconds`.
+/// - [`MintError::ClawbackEpochAlreadyStarted`] if the commitment's epoch start is at or before
+///   `request.observed`'s peak timestamp (raised by `dig-rewards-coin`, before anything is built).
 /// - [`MintError::ClawbackPendingSpendPopulated`] if `request.distributor` already carries a staged
 ///   action or a staged foreign CAT spend.
 /// - [`MintError::ClawbackNotAuthority`] if this wallet is not the commitment slot's recorded
@@ -181,12 +184,6 @@ pub fn begin_reward_distributor_clawback(
     }
 
     let epoch_start = commitment_distributor_epoch_start(&request.commitment_slot);
-    if request.chain_now_unix_seconds >= epoch_start {
-        return Err(MintError::ClawbackEpochAlreadyStarted {
-            epoch_start,
-            chain_now: request.chain_now_unix_seconds,
-        });
-    }
 
     // The same smuggling vector as the refill door's own `RefillPendingSpendPopulated`: a
     // caller-supplied `distributor` can carry an already-staged `pending_spend`, and `finish_spend`
@@ -247,6 +244,7 @@ pub fn begin_reward_distributor_clawback(
         request.commitment_slot,
         request.reward_slot,
         wallet_puzzle_hash,
+        &request.observed,
     )
     .map_err(map_rewards_error)?;
 
@@ -335,6 +333,15 @@ fn map_rewards_error(error: RewardsError) -> MintError {
             withdrawal_share_bps,
         },
         RewardsError::DriverShareDisagrees { .. } => MintError::ClawbackDriverShareDisagrees,
+        // Raised by the dependency itself, before anything is built: the chain clock in the
+        // request's observation has reached the commitment's epoch start.
+        RewardsError::CommitmentEpochStarted {
+            distributor_epoch_start,
+            peak_timestamp,
+        } => MintError::ClawbackEpochAlreadyStarted {
+            epoch_start: distributor_epoch_start,
+            chain_now: peak_timestamp,
+        },
         other => MintError::Build(format!("withdraw committed incentives: {other}")),
     }
 }

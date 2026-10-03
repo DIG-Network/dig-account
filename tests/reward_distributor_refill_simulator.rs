@@ -217,8 +217,9 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
     // hash on chain — the regression guard for dig_ecosystem#3372's custody finding C.
     assert!(
         snapshot
-            .commitment_slots()
+            .commitments()
             .iter()
+            .map(dig_rewards_coin::state::Commitment::slot)
             .any(|slot| slot.info.value.clawback_ph == wallet_puzzle_hash
                 && slot.info.value.rewards == REFILL_COMMIT_BASE_UNITS),
         "the committed slot's clawback authority must be this wallet's own puzzle hash, never a \

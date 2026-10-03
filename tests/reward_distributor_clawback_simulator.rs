@@ -23,8 +23,8 @@ use dig_account::{
     RewardDistributorMintRequest, RewardDistributorRefillRequest, WalletKey,
 };
 use dig_rewards_coin::{
-    dig_distributor_constants, read_distributor, DistributorLaunchTerms, LaunchComment,
-    ManagerInnerPuzzle, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
+    dig_distributor_constants, read_distributor, ChainObservation, DistributorLaunchTerms,
+    LaunchComment, ManagerInnerPuzzle, DEFAULT_DISTRIBUTOR_EPOCH_SECONDS,
 };
 
 mod common;
@@ -91,11 +91,22 @@ struct Fixture {
     /// reward slot from the wrong epoch.
     launch_epoch_reward_slot: Slot<RewardDistributorRewardSlotValue>,
     clawback_coin: Coin,
+    /// The chain observation of the SAME read that supplied `distributor` and the slots.
+    observed: ChainObservation,
+    /// The share the commitment itself reports as recoverable, read before the clawback; `None` when the epoch has already started.
+    expected_share: Option<u64>,
     epoch_start: u64,
     launcher_id: Bytes32,
 }
 
 fn fixture() -> Fixture {
+    fixture_with_peak(|epoch_start| epoch_start - 1)
+}
+
+/// Same fixture, but the clawback's chain observation is read when the chain clock stands at
+/// `peak_for(epoch_start)` -- the only way to move `ChainObservation::peak_timestamp`, since a
+/// caller cannot construct an observation.
+fn fixture_with_peak(peak_for: impl FnOnce(u64) -> u64) -> Fixture {
     let chain = SimulatorChain::new();
     let wallet = WalletKey::from_seed_at(&SEED, ProfileIx::ROOT);
     let wallet_puzzle_hash = wallet.puzzle_hash();
@@ -154,16 +165,24 @@ fn fixture() -> Fixture {
         .expect("the refill pushes with zero caller-supplied secret keys");
     chain.include_in_a_block().expect("the refill confirms");
 
+    chain
+        .sim
+        .borrow_mut()
+        .set_next_timestamp(peak_for(epoch_start))
+        .expect("the chain clock may move forward");
     let snapshot = read_distributor(&chain, launcher_id)
         .expect("the chain answers")
         .expect("the distributor is readable back after the refill");
 
+    let observed = *snapshot.observed();
     let distributor = snapshot.distributor().clone();
-    let commitment_slot = snapshot
-        .commitment_slots()
+    let commitment = snapshot
+        .commitments()
         .first()
-        .expect("the refill created a commitment slot")
-        .clone();
+        .expect("the refill created a commitment slot");
+    let commitment_slot = commitment.slot().clone();
+    // `None` once the chain clock has reached the epoch: the share is no longer recoverable.
+    let expected_share = commitment.recoverable_base_units();
     assert_eq!(commitment_slot.info.value.clawback_ph, wallet_puzzle_hash);
     let reward_slot = snapshot
         .reward_slots()
@@ -185,21 +204,20 @@ fn fixture() -> Fixture {
         reward_slot,
         launch_epoch_reward_slot,
         clawback_coin,
+        observed,
+        expected_share,
         epoch_start,
         launcher_id,
     }
 }
 
-fn clawback_request(
-    fixture: &Fixture,
-    chain_now_unix_seconds: u64,
-) -> RewardDistributorClawbackRequest {
+fn clawback_request(fixture: &Fixture) -> RewardDistributorClawbackRequest {
     RewardDistributorClawbackRequest {
         distributor: fixture.distributor.clone(),
         commitment_slot: fixture.commitment_slot.clone(),
         reward_slot: fixture.reward_slot.clone(),
         clawback_coin: fixture.clawback_coin,
-        chain_now_unix_seconds,
+        observed: fixture.observed,
     }
 }
 
@@ -210,17 +228,14 @@ fn clawback_request(
 fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
     let fixture = fixture();
     let wallet_puzzle_hash = fixture.wallet.puzzle_hash();
-    let request = clawback_request(&fixture, 0);
+    let request = clawback_request(&fixture);
 
     let clawed_back = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
         .expect("the clawback builds, gates and signs");
 
-    let withdrawal_share_bps = fixture.distributor.info.constants.withdrawal_share_bps;
-    let expected_share = dig_rewards_coin::recoverable_base_units(
-        REFILL_COMMIT_BASE_UNITS,
-        u16::try_from(withdrawal_share_bps).expect("bps fits u16 in this fixture"),
-    )
-    .expect("bps is in the legal 0..=10_000 domain");
+    let expected_share = fixture
+        .expected_share
+        .expect("the epoch has not started, so the share is recoverable");
     assert_eq!(
         clawed_back.recovered_base_units(),
         expected_share,
@@ -253,7 +268,7 @@ fn the_seams_own_bundle_submits_with_zero_caller_supplied_keys() {
         .expect("the chain answers")
         .expect("the distributor is still readable after the clawback");
     assert!(
-        snapshot.commitment_slots().is_empty(),
+        snapshot.commitments().is_empty(),
         "the withdrawn commitment slot must be gone"
     );
 }
@@ -271,7 +286,7 @@ fn a_stranger_is_not_the_clawback_authority() {
     let stranger = WalletKey::from_seed_at(&[0xA5; 32], ProfileIx::ROOT);
     let pushes_before = fixture.chain.pushed_bundles();
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request.clawback_coin = fixture
         .chain
         .sim
@@ -287,13 +302,16 @@ fn a_stranger_is_not_the_clawback_authority() {
     assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
 
-/// A clawback attempted after the committed epoch has already started (per chain time) is refused.
+/// A clawback attempted once the chain clock has reached the committed epoch's start is refused,
+/// and the refusal is the NAMED one -- `dig-rewards-coin`'s `CommitmentEpochStarted` must not
+/// collapse into the generic [`MintError::Build`]. The boundary is inclusive: `peak_timestamp ==
+/// epoch_start` already counts as started.
 #[test]
 fn an_already_started_epoch_is_refused() {
-    let fixture = fixture();
+    let fixture = fixture_with_peak(|epoch_start| epoch_start);
     let pushes_before = fixture.chain.pushed_bundles();
 
-    let request = clawback_request(&fixture, fixture.epoch_start);
+    let request = clawback_request(&fixture);
 
     let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
         .expect_err("a commitment whose epoch has started is no longer this door's to withdraw");
@@ -308,6 +326,24 @@ fn an_already_started_epoch_is_refused() {
     assert_eq!(fixture.chain.pushed_bundles(), pushes_before);
 }
 
+/// One second before the epoch starts the clawback is still the funder's to take: it builds, is
+/// accepted by consensus and pays the commitment's share.
+#[test]
+fn one_second_before_the_epoch_starts_the_clawback_pays() {
+    let fixture = fixture_with_peak(|epoch_start| epoch_start - 1);
+
+    let clawed_back =
+        begin_reward_distributor_clawback(&fixture.wallet, clawback_request(&fixture), &network())
+            .expect("one second before the epoch the clawback builds, gates and signs");
+    assert_eq!(
+        Some(clawed_back.recovered_base_units()),
+        fixture.expected_share
+    );
+    clawed_back
+        .submit(&fixture.chain, &fixture.chain)
+        .expect("consensus accepts the bundle");
+}
+
 /// A `clawback_coin` this wallet does not own is refused before anything is staged.
 #[test]
 fn an_unowned_clawback_coin_is_refused() {
@@ -315,7 +351,7 @@ fn an_unowned_clawback_coin_is_refused() {
     let stranger = WalletKey::from_seed_at(&[0xA5; 32], ProfileIx::ROOT);
     let pushes_before = fixture.chain.pushed_bundles();
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request.clawback_coin = fixture
         .chain
         .sim
@@ -343,7 +379,7 @@ fn a_pre_staged_pending_action_is_refused_before_any_push() {
     let inert_puzzle = ctx.alloc(&1_i32).expect("an inert NodePtr allocates");
     let inert_solution = ctx.alloc(&1_i32).expect("an inert NodePtr allocates");
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request
         .distributor
         .pending_spend
@@ -370,7 +406,7 @@ fn a_reward_slot_from_the_wrong_epoch_is_refused() {
     let fixture = fixture();
     let pushes_before = fixture.chain.pushed_bundles();
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request.reward_slot = fixture.launch_epoch_reward_slot.clone();
 
     let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network()).expect_err(
@@ -413,7 +449,7 @@ fn a_reward_slot_from_the_wrong_epoch_with_sufficient_rewards_is_refused() {
         "the fixture must isolate the epoch guard: this slot's rewards must already be sufficient"
     );
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request.reward_slot = wrong_epoch_slot.clone();
 
     let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
@@ -460,7 +496,7 @@ fn a_reward_slot_with_insufficient_rewards_is_refused() {
     );
     underfunded_slot.info.value.rewards = insufficient_rewards;
 
-    let mut request = clawback_request(&fixture, 0);
+    let mut request = clawback_request(&fixture);
     request.reward_slot = underfunded_slot;
 
     let error = begin_reward_distributor_clawback(&fixture.wallet, request, &network())
