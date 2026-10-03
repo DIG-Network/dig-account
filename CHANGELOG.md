@@ -4,22 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.36.0] - 2026-10-02
+## [0.36.0] - 2026-10-03
 
-### Breaking
-- **mint:** `RewardDistributorClawbackRequest::chain_now_unix_seconds` is replaced by
-  `observed: ChainObservation`, taken from `DistributorSnapshot::observed()` of the SAME
-  `read_distributor` read that supplied the distributor and slots. The door's local epoch guard is
-  gone; `dig-rewards-coin` 0.11 checks the chain's `peak_timestamp` itself.
-
-### Fixes
-- **mint:** `RewardsError::CommitmentEpochStarted` now maps to `MintError::ClawbackEpochAlreadyStarted`
-  (`epoch_start` = the commitment's epoch start, `chain_now` = the observation's peak timestamp)
-  instead of collapsing into `MintError::Build`.
-
-### Chores
-- Bump dig-rewards-coin 0.9 -> 0.11; raise dig-identity, dig-keystore, dig-ipc-protocol and
-  chia-query floors to their latest.
+### Bug Fixes
+- **clawback:** Adopt dig-rewards-coin 0.11 chain-observation guard (#78)
 
 ## [0.35.0] - 2026-09-29
 
